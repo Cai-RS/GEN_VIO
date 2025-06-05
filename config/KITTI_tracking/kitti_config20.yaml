@@ -1,0 +1,139 @@
+%YAML:1.0
+---
+
+#common parameters
+imu: 1
+num_of_cam: 2  
+
+imu_topic: ""
+image0_topic: "/leftImage"
+image1_topic: "/rightImage"
+dataset: "KITTI_tracking"
+output_path: "/home/crs/GEN_VIO/output/KITTI_tracking/sequences"
+output_path_objs: "/home/crs/GEN_VIO/output/KITTI_tracking/sequences"
+
+image0_warm_up: "/home/crs/GEN_VIO/data/KITTI_tracking/warm_up/20/000000"
+image1_warm_up: "/home/crs/GEN_VIO/data/KITTI_tracking/warm_up/20/000001"
+image2_warm_up: "/home/crs/GEN_VIO/data/KITTI_tracking/warm_up/20/000002"
+image3_warm_up: "/home/crs/GEN_VIO/data/KITTI_tracking/warm_up/20/000003"
+
+cam0_calib: "cam20.yaml"
+cam1_calib: "cam20.yaml"
+image_width: 1241
+image_height: 376
+
+focal_length_x: 718.8560
+focal_length_y: 718.8560
+shift_x: 607.1928     # 注意，KITTI校正后的所取的image2图像在成像平面上并不是上下或左右对称的，左边和上边偏短，右边和下边偏长
+shift_y: 185.2157     # cu和cv都分别小于图像的W/2和H/2
+
+has_stereo_rectified: 1    # 输入的图像对是否已进行立体校正，或者需要在代码中进行立体校正
+
+# 相机3的光心在竖直方向上比相机2的高2.4821个像素（即相同的3D点在相机3中的成像像素的纵坐标值v会比相机2中的值大2.4821）
+# 需要调整左右图像，只需裁减或添加相应像素差值的行即可！
+Camera_bf: 382.6700   # IR projector baseline times fx (aprox.)
+
+Y_shift_image_1: 2.4821 # the camera 3 projection plane has y shift (>0) with respect to that of camera 2, which result in larger v coordinate of image3 than image2
+                        # image3的点比image2的对应点 低出的像素坐标(越低则v坐标越大)，取决于该点在相机坐标系下的深度值，即Y_shift_image_1/Z，这里当Z为2(m)时，左右图像同一点的v坐标值会相差大约1个像素！！点的深度值越大，v坐标会相差越小！
+
+# Extrinsic parameter between IMU and Camera.
+estimate_extrinsic: 0   # 0  Have an accurate extrinsic parameters. We will trust the following imu^R_cam, imu^T_cam, don't change it.
+                        # 1  Have an initial guess about extrinsic parameters. We will optimize around your initial guess.
+
+# This is pose matrix which transform point in IMU coodinate to point in left camera coordinate
+body_T_cam0: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [1.196690e-03, -9.999766e-01, 6.738037e-03, -2.622793e-01,
+          -9.241243e-03, -6.748808e-03, -9.999345e-01, 7.538925e-01,
+          9.999565e-01, 1.134343e-03, -9.249103e-03, -1.091153e+00,
+          0, 0, 0, 1]
+
+body_T_cam1: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [1.196690e-03, -9.999766e-01, 6.738037e-03, -7.946112e-01,
+          -9.241243e-03, -6.748808e-03, -9.999345e-01, 7.573454e-01,
+          9.999565e-01, 1.134343e-03, -9.249103e-03, -1.090018e+00,
+          0, 0, 0, 1]
+
+#Multiple thread support
+multiple_thread: 0
+
+#feature traker paprameters
+max_cnt: 120            # max feature number in feature tracking
+#min_dist: 20            # min distance between two features 
+min_dist_bg: 20         # min distance between two FAST features in bg
+min_dist_obj: 8        # min distance between two FAST features of an object
+freq: 10                # frequence (Hz) of publish tracking result. At least 10Hz for good estimation. If set 0, the frequence will be same as raw image 
+F_threshold: 3.5        # ransac threshold (pixel)
+show_track: 0           # publish tracking image as topic
+flow_back: 1            # perform forward and backward optical flow to improve feature tracking accuracy
+
+# added by CRS
+max_cnt_pts_obj: 18        # max number of points (including matching and new detected) of one object in one frame
+max_cnt_pts_bg: 120         # max num of points (including matching and new detected) in background in one frame (actual num of static point matching can be more than this number)
+min_cnt_pts_track_bg: 40    # min num of point matching of bg in a frame
+min_cnt_pts_track_obj: 14   # min num of point matching of one obj in a frame  
+max_cnt_pts_track_bg: 90    # max num of point matching of bg in a frame (for pose estimation)
+max_cnt_pts_track_obj: 35   # max num of point matching of one obj in a frame (for pose estimation)
+
+ave_dist_3d_pts_thres: 0.25  # threshold of average reprojection error (meter) between matching 3d pts and predicted 3d pts with constant velocity model 
+
+ThDepthBG: 25.0         # Depth threshold of static background points
+ThDepthOBJ: 25.0        # Depth threshold of dynamic object points
+MinDepthPt: 2           # Min depth of a point
+
+DepthMapFactor: 1000.0  # Depthmap values factor. (from mm to m). only used for RGB-D camera!
+
+Border_width:  10       # the length of border in width to be ignored for feature points
+Border_height: 10       # the length of border in height to be ignored for feature points
+
+Min_SIFT_bg: 50         # minimal number of vaild (with depth within threshold) static sift point in the background. Is this necessary?
+
+init_depth: -1.0        # 1.0  10.0
+
+min_dist_flow: 8.0      # minmal distance of a flow estimation that can be valid in the upper half of image.
+
+th_epipolar_con: 25      # Threshold of dist (fea to predicted epipolar line)
+
+th_score: 5.0            # threshold of score (measured by epipolar constraint or homography) of tracking fea
+
+min_num_bg_track_with_dep_prev: 20  # minmal num of bg tracking fea that has depth in prev frame
+
+limit_num_static_track: 1    # limit the minmal num of static tracking fea (with depth) in a frame
+
+#optimization parameters
+window_size: 5           # num of frame in slide window
+th_num_frame_for_LBA: 3  # min num of measured frame of fea that will be used in LBA
+thres_num_track_cur: 40  # min num of inliers tracking fea in cur frame (before LBA)
+
+max_solver_time: 0.06    # max solver itration time (s), to guarantee real time
+max_num_iterations: 30   # max solver itrations, to guarantee real time
+keyframe_parallax: 15    # keyframe selection threshold (pixel)
+
+use_marg: 0    # use margnalization or not 
+
+#CudaSift parameters
+thres_ambiguity_flow: 0.89
+thres_ambiguity_stereo: 0.88
+
+use_motion_to_pred_fea_pos: 1   # if set 1, use const-velocity model to give predict position of fea for every frame; if set 0, use flow_map instead
+use_motion_to_pred_fea_dep: 0   # if set 1, use const-velocity model to give predict depth of fea for every frame (>0); if set 0, use depth_map instead
+
+use_pnp_after_imu_init: 0   # if use PnP to get initial estimation of pose of cam after IMU-Stereo initialization
+pnp_per_frame: 1            # if use PnP to get initial estimation of pose of cam for every frame (This is param only for pure stereo setup)
+
+#imu parameters       The more accurate parameters you provide, the better performance
+acc_n: 2.0e-3          # accelerometer measurement noise standard deviation. #0.2   0.04
+gyr_n: 1.0e-4         # gyroscope measurement noise standard deviation.     #0.05  0.004
+acc_w: 3.0e-4         # accelerometer bias random work noise standard deviation.  #0.02
+gyr_w: 2.0e-5       # gyroscope bias random work noise standard deviation.     #4.0e-5
+g_norm: 9.81007     # gravity magnitude
+
+#unsynchronization parameters
+estimate_td: 0                      # online estimate time offset between camera and imu
+td: 0.0                             # initial value of time offset. unit: s. readed image clock + td = real image clock (IMU clock)
+

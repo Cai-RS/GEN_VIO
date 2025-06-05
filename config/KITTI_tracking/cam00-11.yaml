@@ -1,0 +1,16 @@
+%YAML:1.0
+---
+model_type: PINHOLE
+camera_name: camera
+image_width: 1242
+image_height: 375
+distortion_parameters:
+   k1: 0
+   k2: 0
+   p1: 0
+   p2: 0
+projection_parameters:
+   fx: 721.5377
+   fy: 721.5377
+   cx: 609.5593      # 标定文件给的是609.5593和172.8540，但是在没有畸变的情况下，这俩值应该分别为图像的宽和高的一半？
+   cy: 172.8540    # 标定文件应该是还对校正后的图像进一步裁减了，只取某个深度范围内的且左右图像均能看见的？

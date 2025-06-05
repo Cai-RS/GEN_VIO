@@ -1,0 +1,1 @@
+  -L"/usr/local/opencv-4.6.0/lib/cmake/opencv4/lib"  -L/home/crs/GEN_VIO/camera_models/build   -lcuda -lcublas -lcudart -lcudnn -lcudadevrt -lpthread -lcudart_static -lrt -ldl 

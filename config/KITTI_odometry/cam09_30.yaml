@@ -1,0 +1,16 @@
+%YAML:1.0
+---
+model_type: PINHOLE
+camera_name: camera
+image_width: 1241
+image_height: 376
+distortion_parameters:
+   k1: 0
+   k2: 0
+   p1: 0
+   p2: 0
+projection_parameters:
+   fx: 707.0912
+   fy: 707.0912
+   cx: 601.8873      # 标定文件给的是600.3891和181.5122
+   cy: 183.1104      # 181.5122

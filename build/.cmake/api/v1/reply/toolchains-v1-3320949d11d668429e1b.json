@@ -1,0 +1,150 @@
+{
+	"kind" : "toolchains",
+	"toolchains" : 
+	[
+		{
+			"compiler" : 
+			{
+				"id" : "NVIDIA",
+				"implicit" : 
+				{
+					"includeDirectories" : 
+					[
+						"/usr/local/TensorRT/TensorRT-8.5.3.1/include",
+						"/usr/include/c++/9",
+						"/usr/include/x86_64-linux-gnu/c++/9",
+						"/usr/include/c++/9/backward",
+						"/usr/lib/gcc/x86_64-linux-gnu/9/include",
+						"/usr/local/include",
+						"/usr/include/x86_64-linux-gnu",
+						"/usr/include"
+					],
+					"linkDirectories" : 
+					[
+						"/usr/local/cuda-11.6/targets/x86_64-linux/lib/stubs",
+						"/usr/local/cuda-11.6/targets/x86_64-linux/lib",
+						"/home/crs/anaconda3/lib",
+						"/home/crs/.local/lib",
+						"/usr/local/lib",
+						"/usr/lib",
+						"/lib",
+						"/usr/local/TensorRT/TensorRT-8.5.3.1/lib",
+						"/usr/lib/gcc/x86_64-linux-gnu/9",
+						"/usr/lib/x86_64-linux-gnu",
+						"/lib/x86_64-linux-gnu",
+						"/home/crs/anaconda3/bin",
+						"/home/crs/anaconda3/condabin",
+						"/usr/local/cuda-11.6/bin",
+						"/home/crs/.local/bin",
+						"/usr/local/sbin",
+						"/usr/local/bin",
+						"/usr/sbin",
+						"/usr/bin",
+						"/sbin",
+						"/bin",
+						"/usr/games",
+						"/usr/local/games",
+						"/snap/bin"
+					],
+					"linkFrameworkDirectories" : [],
+					"linkLibraries" : 
+					[
+						"stdc++",
+						"m",
+						"gcc_s",
+						"gcc",
+						"c",
+						"gcc_s",
+						"gcc"
+					]
+				},
+				"path" : "/usr/local/cuda-11.6/bin/nvcc",
+				"version" : "11.6.124"
+			},
+			"language" : "CUDA",
+			"sourceFileExtensions" : 
+			[
+				"cu"
+			]
+		},
+		{
+			"compiler" : 
+			{
+				"id" : "GNU",
+				"implicit" : 
+				{
+					"includeDirectories" : 
+					[
+						"/usr/local/TensorRT/TensorRT-8.5.3.1/include",
+						"/usr/include/c++/9",
+						"/usr/include/x86_64-linux-gnu/c++/9",
+						"/usr/include/c++/9/backward",
+						"/usr/lib/gcc/x86_64-linux-gnu/9/include",
+						"/usr/local/include",
+						"/usr/include/x86_64-linux-gnu",
+						"/usr/include"
+					],
+					"linkDirectories" : 
+					[
+						"/home/crs/anaconda3/lib",
+						"/home/crs/.local/lib",
+						"/usr/local/lib",
+						"/usr/lib",
+						"/lib",
+						"/usr/local/TensorRT/TensorRT-8.5.3.1/lib",
+						"/usr/lib/gcc/x86_64-linux-gnu/9",
+						"/usr/lib/x86_64-linux-gnu",
+						"/lib/x86_64-linux-gnu",
+						"/home/crs/anaconda3/bin",
+						"/home/crs/anaconda3/condabin",
+						"/usr/local/cuda-11.6/bin",
+						"/home/crs/.local/bin",
+						"/usr/local/sbin",
+						"/usr/local/bin",
+						"/usr/sbin",
+						"/usr/bin",
+						"/sbin",
+						"/bin",
+						"/usr/games",
+						"/usr/local/games",
+						"/snap/bin"
+					],
+					"linkFrameworkDirectories" : [],
+					"linkLibraries" : 
+					[
+						"stdc++",
+						"m",
+						"gcc_s",
+						"gcc",
+						"c",
+						"gcc_s",
+						"gcc"
+					]
+				},
+				"path" : "/usr/bin/c++",
+				"version" : "9.4.0"
+			},
+			"language" : "CXX",
+			"sourceFileExtensions" : 
+			[
+				"C",
+				"M",
+				"c++",
+				"cc",
+				"cpp",
+				"cxx",
+				"m",
+				"mm",
+				"mpp",
+				"CPP",
+				"ixx",
+				"cppm"
+			]
+		}
+	],
+	"version" : 
+	{
+		"major" : 1,
+		"minor" : 0
+	}
+}

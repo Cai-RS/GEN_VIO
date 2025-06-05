@@ -1,0 +1,1 @@
+/usr/bin/g++ -fPIC -shared -Wl,-soname,libplugin_list.so -o libplugin_list.so @CMakeFiles/plugin_list.dir/objects1 CMakeFiles/plugin_list.dir/cmake_device_link.o @CMakeFiles/plugin_list.dir/linkLibs.rsp -L"/usr/local/cuda-11.6/targets/x86_64-linux/lib/stubs" -L"/usr/local/cuda-11.6/targets/x86_64-linux/lib"
