@@ -1,4 +1,5 @@
 #include "evaluate_odometry.h"
+#include "parameters.h"
 
 vector<MatriX> loadPoses(string file_name) {
   vector<MatriX> poses;
@@ -115,21 +116,34 @@ void saveSequenceErrors (vector<errors> &err,string file_name) {
   fclose(fp);
 }
 
-void savePathPlot (vector<MatriX> &poses_gt,vector<MatriX> &poses_result,vector<MatriX> &poses_result_imu,string file_name, bool plot_three_line) {
+void savePathPlot (vector<MatriX> &poses_gt,vector<MatriX> &poses_result,vector<MatriX> &poses_result_imu,string file_name, bool plot_more_line, const vector<MatriX> &poses_result_VINS) {
 
   // parameters
-  int32_t step_size = 3;
+  // 2 or 3
+  int32_t step_size = 2;
 
   // open file  
   FILE *fp = fopen(file_name.c_str(),"w");
 
-  if(plot_three_line)
+  if(plot_more_line)
   {
-    // save x/z coordinates of all frames to file
-    for (int32_t i=0; i<poses_gt.size(); i+=step_size)
-      fprintf(fp,"%f %f %f %f %f %f\n",poses_gt[i].val[0][3],poses_gt[i].val[2][3],
-                                poses_result_imu[i].val[0][3],poses_result_imu[i].val[2][3],
-                                poses_result[i].val[0][3],poses_result[i].val[2][3]);
+    if(poses_result_VINS.empty())
+    {
+      // save x/z coordinates of all frames to file
+      for (int32_t i=0; i<poses_gt.size(); i+=step_size)
+        fprintf(fp,"%f %f %f %f %f %f\n",poses_gt[i].val[0][3],poses_gt[i].val[2][3],
+                                  poses_result[i].val[0][3],poses_result[i].val[2][3],
+                                  poses_result_imu[i].val[0][3],poses_result_imu[i].val[2][3]);
+    }
+    else
+    {
+      // 认为最多只画4条线？
+      for (int32_t i=0; i<poses_gt.size(); i+=step_size)
+        fprintf(fp,"%f %f %f %f %f %f %f %f\n",poses_gt[i].val[0][3],poses_gt[i].val[2][3],
+                                  poses_result[i].val[0][3],poses_result[i].val[2][3],
+                                  poses_result_imu[i].val[0][3],poses_result_imu[i].val[2][3],
+                                  poses_result_VINS[i].val[0][3],poses_result_VINS[i].val[2][3]);
+    }
   }
   else
   {
@@ -177,7 +191,7 @@ vector<int32_t> computeRoi (vector<MatriX> &poses_gt,vector<MatriX> &poses_resul
   return roi;
 }
 
-void plotPathPlot (string dir,vector<int32_t> &roi,int32_t idx, bool plot_three_line) {
+void plotPathPlot (string dir,vector<int32_t> &roi,int32_t idx, bool plot_more_line, int num_line) {
 
   // gnuplot file name
   char command[1024];
@@ -206,10 +220,15 @@ void plotPathPlot (string dir,vector<int32_t> &roi,int32_t idx, bool plot_three_
     fprintf(fp,"set xlabel \"x [m]\"\n");
     fprintf(fp,"set ylabel \"z [m]\"\n");
     fprintf(fp,"plot \"%02d.txt\" using 1:2 lc rgb \"#FF0000\" title 'Ground Truth' w lines,",idx);
-    if(plot_three_line)
+    if(plot_more_line)
     {
-      fprintf(fp,"\"%02d.txt\" using 3:4 lc rgb \"#00FF00\" title 'Odometry(cam+IMU)' w lines,",idx);
-      fprintf(fp,"\"%02d.txt\" using 5:6 lc rgb \"#0000FF\" title 'Odometry(cam only)' w lines,",idx);
+      // fprintf(fp,"\"%02d.txt\" using 3:4 lc rgb \"#00FF00\" title 'RVIO(cam only)' w lines,",idx);
+      // fprintf(fp,"\"%02d.txt\" using 5:6 lc rgb \"#0000FF\" title 'RVIO(cam+IMU)' w lines,",idx);
+      fprintf(fp,"\"%02d.txt\" using 3:4 lc rgb \"#00FF00\" title 'RVIO(cam+IMU)' w lines,",idx);
+      fprintf(fp,"\"%02d.txt\" using 5:6 lc rgb \"#0000FF\" title 'MVIO(cam+IMU)' w lines,",idx);
+      // 默认最多只同时画4条线？如何自适用任意数量？
+      if(num_line > 3)
+        fprintf(fp,"\"%02d.txt\" using 7:8 lc rgb \"#FF00FF\" title 'VINS-FUSION(cam+IMU)' w lines,",idx);
     }
     else
     {
@@ -400,10 +419,11 @@ void saveStats (vector<errors> err,string dir) {
 }
 
 //bool eval (string result_sha,Mail* mail)
-bool eval (string result_sha) {
+bool eval (string Dataset, string sequence) {
 
   // ground truth and result directories
-  string gt_dir         = "/home/crs/GEN_VIO/src/evaluate/data/odometry/poses";  // "/home/crs/GEN_VIO/src/evaluate/data/tracking/poses"
+  string result_sha = Dataset + "/" + sequence;
+  string gt_dir         = "/home/crs/GEN_VIO/src/evaluate/data/" + Dataset + "/poses";  // "/home/crs/GEN_VIO/src/evaluate/data/KITTI_tracking/poses"
   string result_dir     = "/home/crs/GEN_VIO/src/evaluate/results/" + result_sha;
   string error_dir      = result_dir + "/errors";
   string plot_path_dir  = result_dir + "/plot_path";
@@ -421,24 +441,39 @@ bool eval (string result_sha) {
   // for (int32_t i=11; i<22; i++) {
    
     // file name
-    char file_name[256];
-    char file_name_est[256];
-    int i = 7;
-    sprintf(file_name,"%02d.txt",i);
+    // char file_name[256];
+    // char file_name_est[256];
+    // int i = 7;
+    // sprintf(file_name,"%02d.txt",i);
+
+    // 取sequence字符串前N个字符之后的子字符串
+    string file_name = sequence.substr(sequence.length()-2) + ".txt";
     
     // read ground truth and result poses
     vector<MatriX> poses_gt     = loadPoses(gt_dir + "/" + file_name);
     // sprintf(file_name_est,"%04d.txt",i);
-    vector<MatriX> poses_result = loadPoses(result_dir + "/data/vio.txt");
+    vector<MatriX> poses_result = loadPoses(result_dir + "/data/vio_no_IMU.txt");
 
     // 读取之前保存的有IMU的估计结果，一起画图
-    vector<MatriX> poses_result_imu;
-    bool plot_three_line = false;
+    vector<MatriX> poses_result_imu, pose_result_VINS;
 
     vector<errors> seq_err;
-    if(plot_three_line)
+    int num_line = 2;
+    // 是仅画 gt / pure_stereo / stereo+IMU 三种设置下的结果图，还是 画gt和其中某种设置下的两种结果图并给出误差分析
+    if(plot_line == 1)
     {
-      poses_result_imu = loadPoses(result_dir + "/data/vio_IMU.txt");
+      poses_result_imu = loadPoses(result_dir + "/data/vio_with_IMU.txt");
+      if(!poses_result_imu.empty()) 
+        ++num_line;
+      else
+      {
+        cout << "Please provide result of Vision-IMU-based system!" << endl;
+        exit(-1);
+      }
+      
+      pose_result_VINS = loadPoses(result_dir + "/data/vio_VINS_Fusion.txt");
+      if(!pose_result_VINS.empty()) 
+        ++num_line;
     }
     else
     {
@@ -463,11 +498,12 @@ bool eval (string result_sha) {
     // if (i<=15) 
     {
       // save + plot bird's eye view trajectories
-      savePathPlot(poses_gt,poses_result,poses_result_imu,plot_path_dir + "/" + file_name,plot_three_line);
+      savePathPlot(poses_gt,poses_result,poses_result_imu,plot_path_dir + "/" + file_name, (plot_line == 1), pose_result_VINS);
       vector<int32_t> roi = computeRoi(poses_gt,poses_result);
-      plotPathPlot(plot_path_dir,roi,i,plot_three_line);  
+      int i = atoi(sequence.c_str());
+      plotPathPlot(plot_path_dir,roi,i,plot_line,num_line);  
       
-      if(!plot_three_line)
+      if(!plot_line)
       {
         // save + plot individual errors
         char prefix[16];
@@ -477,7 +513,7 @@ bool eval (string result_sha) {
       }
     }
 
-    if(!plot_three_line)
+    if(!plot_line)
     {
       // save + plot total errors + summary statistics
       if (total_err.size()>0) {

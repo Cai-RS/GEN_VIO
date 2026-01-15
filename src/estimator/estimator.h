@@ -77,22 +77,29 @@ class Estimator
     void changeSensorType(int use_imu, int use_stereo);
 
     // add by CRS
-    void Fea_Obj_Extract_Track(double &t_vio, bool &init_succ, double t, cv::Mat &left_img, cv::Mat &right_img, cv::Mat &l_gray_img, cv::Mat &r_gray_img);
+    void Fea_Obj_Extract_Track(double &t_vio, bool &init_succ, double t, cv::Mat &left_img, cv::Mat &right_img, cv::Mat &l_gray_img, 
+                                cv::Mat &r_gray_img, Matrix3d &gt_motion_R, Vector3d &gt_motion_P, set<int> spec_frame_to_show = set<int>());
+    
     void set_mask_objs_prev(double cur_time);
     
     void build_seg_map(const int &width, const int &height);
     void assign_sift_FAST(double &dt);
-    void objs_matching(double dt, const vector<Vector3d> &Ps = vector<Vector3d>(), const vector<Matrix3d> &Rs = vector<Matrix3d>());
-
-    // __attribute__((no_sanitize("address")))
-    void sample_pixel_objs();
+    void objs_matching(const vector<Vector3d> &Ps = vector<Vector3d>(), const vector<Matrix3d> &Rs = vector<Matrix3d>());
 
     // __attribute__((no_sanitize("address")))
     void GPUProcesImage(float &time_calcu);
-
     void CPU_Track_FAST(double _cur_time);
-    
-    void parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCam_1, Vector3d PCam_1, Matrix3d RCam_2, Vector3d PCam_2, int num_inliers_PnP, bool initial_succ_prev = false);
+
+    // __attribute__((no_sanitize("address")))
+    void sample_pixel_objs();
+    // 当GPU上采样了检测物体的像素点后，使用MAD对这些像素点的深度进行异常值滤除
+    void filter_outlier_pixel_objs();
+    // 计算和保存当前帧完全漏检的被跟踪物体的像素采样点
+    Vector3f sample_pixel_for_lost_obj(int prev_obj_id, float* ptr_pix_prev, float* ptr_pix_cur, int &num_pixel, Vector3d &delta_P, Matrix3d &delta_R, bool cal_ave_3d_pts = false);
+
+    bool SolveObjPoseTransByPnP(const FeaFrame &fea_tracked_obj, Vector3d &delta_P, Matrix3d &delta_R, vector<float*> &pixel_lost_objs, const int &valid_objs, Vector3f &ave_3D_pts_obj, int gl_obj_id = 0);
+    // 物体的运动估计
+    void parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCam_1, Vector3d PCam_1, Matrix3d RCam_2, Vector3d PCam_2, int &num_inliers_PnP, bool initial_succ_prev = false);
     
     void intepolate_pose(int index_frame, double t1, double t2, double t_new, Matrix3d &R_new, Vector3d &P_new);
     void velocity_from_poses(const Matrix3d &R1, const Vector3d &p1, const Matrix3d &R2, const Vector3d &p2, const Matrix3d &gl_trans_R, const Vector3d &gl_trans_P, double &t, Eigen::Vector3d &l_vel, Eigen::Vector3d &ang_vel);
@@ -105,13 +112,11 @@ class Estimator
     bool visualInitialAlign(bool ForStereo = false);
     bool relativePose(Matrix3d &relative_R, Vector3d &relative_T, int &l);
     void get_dyn_objs_initial_pose_trans(vector<Vector3d> &delta_P, vector<Matrix3d> &delta_R);
-    bool SolveObjPoseTransByPnP(const FeaFrame &fea_tracked_obj, Vector3d &delta_P, Matrix3d &delta_R, vector<float*> &pixel_lost_objs, const int &valid_objs, Vector3f &ave_3D_pts_obj, int gl_obj_id = 0);
-    Vector3f sample_pixel_for_lost_obj(float* ptr_pix_prev, float* ptr_pix_cur, int &num_pixel, Vector3d &delta_P, Matrix3d &delta_R, bool cal_ave_3d_pts = false);
     
     void slideWindow();
     void slideWindowNew();
     void slideWindowOld();
-    void optimization();
+    bool optimization();
     void vector2double();
     void double2vector();
     bool failureDetection();
@@ -121,9 +126,10 @@ class Estimator
     void getPoseInWorldFrame(int index, Eigen::Matrix4d &T, bool pose_cam = false);
     void predictPtsInNextFrame();
     void outliersRejection(set<int> &removeIndex);
-    double reprojectionError(Matrix3d &Ri, Vector3d &Pi, Matrix3d &rici, Vector3d &tici,
-                                     Matrix3d &Rj, Vector3d &Pj, Matrix3d &ricj, Vector3d &ticj, 
-                                     double depth, Vector3d &uvi, Vector3d &uvj);
+    // 函数声明和定义放到utils文件
+    // double reprojectionError(Matrix3d &Ri, Vector3d &Pi, Matrix3d &rici, Vector3d &tici,
+    //                                  Matrix3d &Rj, Vector3d &Pj, Matrix3d &ricj, Vector3d &ticj, 
+    //                                  double depth, Vector3d &uvi, Vector3d &uvj);
     void updateLatestStates();
     void fastPredictIMU(double t, Eigen::Vector3d linear_acceleration, Eigen::Vector3d angular_velocity);
     bool IMUAvailable(double t);
@@ -154,6 +160,7 @@ class Estimator
     bool pred_cam_pose_with_IMU;
     bool can_change_seneor_type;
     bool done_cam_motion_pred;
+    bool show_spec_frame;
 
     // 所有与跟踪相关的CPU线程上使用变量的设置 都需要对 mProcess加锁
     std::mutex mProcess;
@@ -173,7 +180,8 @@ class Estimator
     // trigger time points for camera
     double prevTime_cam, curTime_cam;
     bool openExEstimation;
-
+    bool LBA_succ = false;
+    
     std::thread trackThread;
     std::thread processThread;
 
@@ -202,12 +210,14 @@ class Estimator
     bool end_stereo_post;
     bool end_FAST_track;
     bool done_sample;
+    bool tria_2d2d_track_done;
     
     std::vector<int> ID_valid_match_stereo;
     std::vector<int> ID_valid_match_flow;
-    // 上一帧和当前帧左图像中的各个对象的局部id，以及它们的bbox信息以及其small_mask_map
+    // 当前帧左图像中的各个对象的局部id，以及它们的bbox信息以及其small_mask_map
     std::map<int, YoloV8::Box> bbox_mask;
-    Mat full_seg_map, full_seg_map_prev;
+    
+    Mat full_seg_map, full_seg_map_prev;    
     Mat cls_map, id_map;
     int num_objs_frame, num_objs_prev_frame, num_solid_obj_frame, num_solid_obj_prev_frame;
     // 上一帧和当前帧的立体图像对的视差图
@@ -224,6 +234,8 @@ class Estimator
 
     Matrix3d ric[2];
     Vector3d tic[2];
+
+    double Headers[(WINDOW_SIZE + 1)];
     
     Vector3d        Ps[(WINDOW_SIZE + 1)];
     Vector3d        Vs[(WINDOW_SIZE + 1)];
@@ -238,7 +250,6 @@ class Estimator
 
     Matrix3d back_R0, last_R, last_R0;
     Vector3d back_P0, last_P, last_P0;
-    double Headers[(WINDOW_SIZE + 1)];
 
     // 保存上一帧中图像所对应的真实时间戳的相机估计位姿，因为上一帧的一开始td和滑窗估计的TD是不同的，因此认为上一帧估计出Rs对应的IMU时刻与图像时刻不是一致的，其时间差就是优化前后TD值的变化
     Matrix3d prev_cam_R, cur_cam_R;
@@ -249,6 +260,9 @@ class Estimator
 
     Vector3d prev_cam_P_using_imu[2];
     Matrix3d prev_cam_R_using_imu[2];
+
+    vector<Vector3d> P_cam;
+    vector<Matrix3d> R_cam;
     
     // 这里定义的是速度变量，只是普通的李代数而已，所以用3维向量来存放即可
     Vector3d const_l_vel, const_ang_vel;
@@ -277,14 +291,15 @@ class Estimator
 
     std::thread obj_motion_esti;
     // std::mutex fea_map_mutex;
-    bool map_fea_optimized, map_fea_writen, tracker_pts_updated;
+    bool map_fea_optimized, map_fea_writen, tracker_pts_updated, tracker_vars_updated;
 
     //ObjFeaFrame Vec_Ptr_FeaObjFrame;
     SiftFrame siftfeaFrame;
     FASTFrame FastFeaFrame;
     
+    float ave_epi_dist_inliers;
+    
     bool first_imu;
-    bool is_valid, is_key;
     bool failure_occur;
 
     vector<Vector3d> point_cloud;

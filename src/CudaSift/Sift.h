@@ -55,8 +55,9 @@ class Sift
         void select_stereo_matching(float max_disp_y);
 
         // 形参为二维数组时，必须给定第2维的大小，而第一维可以不用给定（有可能在索引时超出实际该数组的行数）
-        void select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const Mat &seg_map_cur, Mat &mask_bg_prev, int num_flow_pt_in_bloc[][6], int num_temp_flow_pt_in_bloc[][6], int num_long_track_FAST_in_bloc[][6], 
-                                vector<Point2f> &FAST_prev, const vector<int> &cnt_tracked, vector<int> &temp_flow_pt_id, const Mat &prev_l_img = cv::Mat(), bool use_masked_img = true);
+        void select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const Mat &seg_map_cur, Mat &mask_bg_prev, int num_flow_pt_in_bloc[][6], int num_temp_flow_pt_in_bloc[][6],  
+                                    int num_long_track_FAST_in_bloc[][6], vector<Point2f> &FAST_prev, vector<pair<uchar,int>> &obj_cls_id_FAST, const vector<int> &cnt_tracked, 
+                                    vector<int> &temp_flow_pt_id, bool add_FAST_from_sift, const Mat &prev_l_img = cv::Mat(), bool use_masked_img = true);
         
         void Postprocess();
         

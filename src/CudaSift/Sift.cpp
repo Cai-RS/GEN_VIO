@@ -226,14 +226,14 @@ void Sift::detect_match_sift(bool first_frame, bool use_masked_img)
   for(int i=0; i<iter; i++) 
   {
     //cout << "start extract sift in image!" << endl;
-    ExtractSift(siftData2, img2, 5, sift_config_.initBlur, sift_config_.thres_extract_flow, 0.0f, false, memoryTmp);
+    ExtractSift(siftData2, img2, 3, sift_config_.initBlur, sift_config_.thres_extract_flow, 0.0f, false, memoryTmp);
     //cout << "succeeded extract sift in left image!" << endl;
-    ExtractSift(siftData3, img3, 5, sift_config_.initBlur, sift_config_.thres_extract_stereo, 0.0f, false, memoryTmp);
+    ExtractSift(siftData3, img3, 3, sift_config_.initBlur, sift_config_.thres_extract_stereo, 0.0f, false, memoryTmp);
     //cout << "succeeded extract sift in right image!" << endl;
 
     if(use_mask_img_for_sift_)
     {
-      ExtractSift(siftData5, img5, 5, sift_config_.initBlur, sift_config_.thres_extract_stereo, 0.0f, false, memoryTmp);
+      ExtractSift(siftData5, img5, 3, sift_config_.initBlur, sift_config_.thres_extract_stereo, 0.0f, false, memoryTmp);
     }
   }
   // FreeSiftTempMemory(memoryTmp);
@@ -543,14 +543,16 @@ void Sift::select_stereo_matching(float max_disp_y)
 
 // 注意，这里提供的seg_map是上一帧左图像的！！
 // todo: use_masked_img
-void Sift::select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const Mat &seg_map_cur, Mat &mask_bg_prev, int num_flow_pt_in_bloc[][6], int num_temp_flow_pt_in_bloc[][6], 
-                            int num_long_track_FAST_in_bloc[][6], vector<Point2f> &FAST_prev, const vector<int> &cnt_tracked, vector<int> &temp_flow_pt_id, const Mat &prev_l_img, bool use_masked_img)
+void Sift::select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const Mat &seg_map_cur, Mat &mask_bg_prev, int num_flow_pt_in_bloc[][6], 
+                                int num_temp_flow_pt_in_bloc[][6], int num_long_track_FAST_in_bloc[][6], vector<Point2f> &FAST_prev, vector<pair<uchar,int>> &obj_cls_id_FAST, 
+                                const vector<int> &cnt_tracked, vector<int> &temp_flow_pt_id, bool add_FAST_from_sift, const Mat &prev_l_img, bool use_masked_img)
 {
   Mat mask(raw_img_H, raw_img_W, CV_8UC1);
   mask.setTo(255);
 
   int numPts = 0;
   float maxAmbiguity = 0.0;
+  float maxAmbi_ste = 0.0;
   float thres_dist_match = 0.0;
   float thres_dist_match_x = 0.0;
   float thres_dist_match_y = 0.0;
@@ -567,6 +569,7 @@ void Sift::select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const
 
   validPts = img1.h_matching_pts_flow;
   maxAmbiguity = sift_config_.thres_Ambiguity_flow;
+  maxAmbi_ste = sift_config_.thres_Ambiguity_stereo;
   thres_dist_match = sift_config_.thres_dist_match_flow;
   thres_dist_match_x = sift_config_.thres_dist_match_x_flow;
   thres_dist_match_y = sift_config_.thres_dist_match_y_flow;
@@ -590,14 +593,14 @@ void Sift::select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const
   float min_disp_x_stereo = mbf/mThDepthBg;
   float min_disp_x_stereo_obj = mbf/mThDepthObj;
   float min_disp_x;
-  // ORB-SLAM2中说，40倍基线以内的深度都属于是近点。KITTI的基线大约是0.54m，因此近点的阈值是21m。这里取18m以内的点属于近点
+  // ORB-SLAM2中说，40倍基线以内的深度都属于是近点。KITTI的基线大约是0.54m，因此近点的阈值是21m。
   float disp_x_close_pt = mbf/20.0;
-  // 超近点是12倍基线以内
-  float disp_x_very_close = mbf/6.0;
+  // 超近点是10倍基线以内
+  float disp_x_very_close = mbf/5.0;
 
   float thres_stereo_match_disp_x = 256;
 
-  float border = 5;
+  float border = 10;
 
   float match_xpos_r, match_ypos_r, disp_match_x_stereo, disp_match_y_stereo;
 
@@ -609,12 +612,14 @@ void Sift::select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const
   }
   
   // 限制图像上半部分的 没有立体匹配 或者 较远 的点的数量上限
-  int num_far_pt_up_half_img = 20;
+  int num_far_pt_up_half_img = 18;
   // 限制图像上半部分的 有立体匹配 且 较近 的点的数量上限
-  int num_close_pt_up_half_img = 15;
+  int num_close_pt_up_half_img = 12;
+  int total_max_pt_up_half_img = num_far_pt_up_half_img + num_close_pt_up_half_img;
 
   bool is_far_pt = false;
   bool is_bg_track = false;
+  
   // 特征点需要尽可能均匀分布
   for(int i = 0; i < num_pt_flow; ++i)
   {
@@ -674,7 +679,7 @@ void Sift::select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const
       
       int radi = 20;
 
-      // 其实上一帧seg_map中检测cls为0的点不一定就是背景点，其在上一帧可能是被确定为漏检的物体点，后续要如何更改？
+      // todo:其实上一帧seg_map中检测cls为0的点不一定就是背景点，其在上一帧可能是被确定为漏检的物体点，后续要如何更改？
       if(cls_prev == 0 && cls_cur == 0)
       {
         min_disp_x = min_disp_x_stereo;
@@ -694,7 +699,8 @@ void Sift::select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const
         disp_match_x_stereo = x_pos - match_xpos_r;
         disp_match_y_stereo = y_pos - match_ypos_r;
         // 置信度不高的立体匹配
-        if(abs(disp_match_y_stereo) > fmax(0.6, max_disp_y) || prev_stereo_ptr[1] > 0.88)
+        // if(abs(disp_match_y_stereo) > fmax(0.6, max_disp_y) || prev_stereo_ptr[1] > 0.88)
+        if(abs(disp_match_y_stereo) > 2.0 || prev_stereo_ptr[1] > maxAmbi_ste)
           invalid_stereo_match.insert(id);
         else if(disp_match_x_stereo <= min_disp_x || disp_match_x_stereo > thres_stereo_match_disp_x)
         {
@@ -711,15 +717,26 @@ void Sift::select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const
       // 背景跟踪点
       if(is_bg_track)
       {
-        // 对图像顶部1/2区域的背景点提高要求
-        if(id_row_block < 3)
+        // 对图像顶部1/3（或1/2）区域的背景点提高要求
+        if(id_row_block < start_row_bloc)
         {
           // 提高匹配阈值
-          if(ambi > 0.85) continue;
-          // 图像上半部分中不允许出现距离太小的光流匹配。当然有可能当前相机静止，则光流小的匹配留到图像下半部分中提取
-          if(dist_flow <= Min_dist_flow * Min_dist_flow) continue;
-          // 最上面一行只要最左和最右两列的点
-          if(id_row_block == 0 && (id_col_block == 0 || id_col_block == 5))
+          if(ambi > 0.83) continue;
+
+          // todo:图像上1/3部分的中间2列或4列区域不允许出现长度太小的光流匹配。当然有可能当前相机静止，则光流小的匹配留到图像下半部分中提取
+          // 通常在旋转时该部分区域可能出现特征明显的物体，且点的光流会较大
+          if(id_row_block == 0 && (id_col_block > 0 && id_col_block < 5))
+          {
+            if(dist_flow <= Min_dist_flow * Min_dist_flow) continue;
+          }
+          else if(id_row_block == 1 && (id_col_block > 1 && id_col_block < 4))
+          {
+            if(dist_flow <= Min_dist_flow * Min_dist_flow) continue;
+          }
+          
+          // 最上面一行只要最左和最右两列的点?
+          // if(id_row_block == 0 && (id_col_block == 0 || id_col_block == 5))
+          if(id_row_block == 0)
           {
             // 远处的背景跟踪点，如果没有有效深度，则不保留；对于远处的物体跟踪点，是否要保留？也不保留。仅保留近处的点
             if(!has_valid_dep)
@@ -753,8 +770,9 @@ void Sift::select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const
               }
             }
           }
-          // 第二和第三行 去除中间2列的点，大概率是地面点
-          else if((id_row_block == 1 || id_row_block == 2) && (id_col_block != 2 && id_col_block != 3))
+          // 第二和第三行 去除中间2列的点，大概率是地面点?
+          // else if((id_row_block == 1 || id_row_block == 2) && (id_col_block != 2 && id_col_block != 3))
+          else
           {
             if(!has_valid_dep)
             {
@@ -785,32 +803,27 @@ void Sift::select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const
               }
             }
           }
-          else
-          {
-            continue;
-          }
 
           if(has_valid_dep && disp_match_x_stereo > disp_x_very_close)
-            radi = 8;
+            radi = 9;
           if(has_valid_dep && disp_match_x_stereo >= disp_x_close_pt) 
-            radi = 15;
+            radi = 16;
           else
             radi = 30 - 2*id_row_block;
         }
         else
         {
-          // 图像下半部分
+          // 图像下2/3（或1/2）部分
           radi -= (id_row_block * 2);
-          // 对于第4行的背景点也限制其光流跟踪的大小
-          if(id_row_block == 3)
+          
+          if(id_row_block < 3)
           {
+            // 对于第(3-)4行的背景点也限制其光流跟踪的大小?
             // if(dist_flow <= Min_dist_flow * Min_dist_flow) 
             //   continue;
 
-            if(has_valid_dep && disp_match_x_stereo > disp_x_close_pt) radi = 15;
+            if(has_valid_dep && disp_match_x_stereo > disp_x_very_close) radi = 12;
           }
-
-          if(has_valid_dep && disp_match_x_stereo > disp_x_very_close) radi = 10;
         }
       }
       
@@ -829,22 +842,23 @@ void Sift::select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const
           int num_pt = num_flow_pt_in_bloc[id_row_block][id_col_block];
 
           int num_thres = NUM_FEA_IN_BLOC;
-          if(id_row_block < 3)
+          if(id_row_block < start_row_bloc)
           {
-            num_thres = 5;
+            num_thres = 6;
+            // 根据该区域所检测点的深度值来自动调整该区域最多允许接受的点数？
             if(has_valid_dep && disp_match_x_stereo > disp_x_very_close)
-              num_thres = (num_far_pt_up_half_img + num_close_pt_up_half_img)/3;
+              num_thres = total_max_pt_up_half_img/3.5;
             else if(has_valid_dep && disp_match_x_stereo > disp_x_close_pt)
-              num_thres = (num_far_pt_up_half_img + num_close_pt_up_half_img)/4;
+              num_thres = total_max_pt_up_half_img/5;
           }
-          else if (id_row_block == 3)
-            num_thres = 7;
+          else if(id_row_block <= 3)
+            num_thres = 10;
           
           if(num_pt >= num_thres) continue;
 
           num_flow_pt_in_bloc[id_row_block][id_col_block] += 1;
 
-          if(id_row_block < 3)
+          if(id_row_block < start_row_bloc)
           {
             if(is_far_pt)
               --num_far_pt_up_half_img;
@@ -883,21 +897,19 @@ void Sift::select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const
     }
   }
   validPts[0] = numValid;
-
+  
   // 在mask_bg_prev中标注上一帧就已经被跟踪的FAST点，这些点可以形成多帧跟踪。
-  // FAST点只会在图像的下2/3区域，保证点不会太远
   if(!FAST_prev.empty())
   {
     for(int i = 0; i < FAST_prev.size(); ++i)
     {
-      // 上一帧的新点
+      // 上一帧的新点(是物体点)
       if(cnt_tracked[i] == 1) continue;
+
       Point2f &pt = FAST_prev[i];
       x_pos = pt.x;
       y_pos = pt.y;
-      // 只会标注背景点，和背景区域中未被sift跟踪点占据的区域
-      if(mask_bg_prev.at<uchar>(y_pos, x_pos) == 0) continue;
-
+      
       int id_row_block = y_pos/60;
       // 图像顶部的点需要仔细挑选，因为一般距离比较远，且容易是树叶之类的区域，会存在密集的特征点和匹配，需要减小ambi的值且增大点之间的距离
       // 可以越往下的图像区域，点之间的间隔越小
@@ -905,6 +917,17 @@ void Sift::select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const
       int radi = 8;
       if(id_col_block == 6) id_col_block = 5;
       if(id_row_block == 6) id_row_block = 5;
+
+      // 如果后续不考虑将上一帧有立体匹配的sift点转为新FAST点，则这里只统计上一帧保留的背景跟踪点
+      if(!add_FAST_from_sift)
+      {
+        if(obj_cls_id_FAST[i].first == 0) num_long_track_FAST_in_bloc[id_row_block][id_col_block] += 1;
+
+        continue;
+      }
+
+      // 只会标注背景点，和背景区域中未被sift跟踪点占据的区域
+      if(mask_bg_prev.at<uchar>(y_pos, x_pos) == 0) continue;
 
       // Vec2b info_pt_prev = seg_map_prev.at<uchar>(y_pos, x_pos);
 
@@ -916,14 +939,16 @@ void Sift::select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const
       int num_flow = num_flow_pt_in_bloc[id_row_block][id_col_block];
       int num_pt = num_flow + num_long_track_FAST_in_bloc[id_row_block][id_col_block];
 
-      int num_thres = (NUM_FEA_IN_BLOC-2);
-      if(id_row_block < 3)
+      // 因为FAST在跟踪时可能有损耗，因此适当减小这里的阈值，方便后面添加该区域的立体匹配点
+      int num_thres = (NUM_FEA_IN_BLOC-3);
+      if(id_row_block < start_row_bloc)
       {
-        num_thres = (num_far_pt_up_half_img + num_close_pt_up_half_img)/5;
+        num_thres = total_max_pt_up_half_img/5;
       }
-      else if (id_row_block == 3)
-        num_thres = 5;
+      else if (id_row_block <= 3)
+        num_thres = 8;
       
+      // 该区域所规定的点数已满
       if(num_pt >= num_thres) continue;
 
       num_long_track_FAST_in_bloc[id_row_block][id_col_block] += 1;
@@ -941,193 +966,198 @@ void Sift::select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const
       }
     }
   }
-
-  // 对于没有sift跟踪的上一帧背景点，限制其最大深度为20m
-  min_disp_x_stereo = mbf/20.0;
-  // 这个边界值要不小于下面画的点的最大半径
-  border = 20;
   
-  // 遍历上一帧的左右匹配点。如果是上面flow跟踪的点，则一律保留；剩下的则根据ambi从小到大保留，并且要均匀分布
-  validPts = img1.h_matching_pts_stereo;
-  maxAmbiguity = sift_config_.thres_Ambiguity_stereo;
-  thres_dist_match = sift_config_.thres_dist_match_stereo;
-  thres_dist_match_x = sift_config_.thres_dist_match_x_stereo;
-  thres_dist_match_y = sift_config_.thres_dist_match_y_stereo;
-
-  int num_stereo_prev = prev_stereo_sort_pt_id.size();
-  assert(num_stereo_prev == num_pt_flow && "something wrong here!");
-
-  for(int i = 0; i < num_stereo_prev; ++i)
+  if(add_FAST_from_sift)
   {
-    is_far_pt = false;
-    int id = prev_stereo_sort_pt_id[i];
-    // 属于有效的跟踪点的立体匹配，不作为待跟踪点
-    if(prev_flow_pt_with_stereo.find(id) != prev_flow_pt_with_stereo.end()) continue;
-    // 属于无效的立体匹配（太远或太近），也不作为待跟踪点（因为认为光流金字塔的跟踪精度没有sift高）
-    if(invalid_stereo_match.find(id) != invalid_stereo_match.end()) continue;
+    // 对于没有sift跟踪的上一帧背景点，限制其最大深度为18m
+    min_disp_x_stereo = mbf/18.0;
+    // 这个边界值要不小于下面画的点的最大半径
+    border = 20;
+    
+    // 遍历上一帧的左右匹配点。如果是上面flow跟踪的点，则一律保留；剩下的则根据ambi从小到大保留，并且要均匀分布
+    validPts = img1.h_matching_pts_stereo;
+    maxAmbiguity = sift_config_.thres_Ambiguity_stereo;
+    thres_dist_match = sift_config_.thres_dist_match_stereo;
+    thres_dist_match_x = sift_config_.thres_dist_match_x_stereo;
+    thres_dist_match_y = sift_config_.thres_dist_match_y_stereo;
 
-    x_pos = siftData1.h_data[id].xpos;
-    y_pos = siftData1.h_data[id].ypos;
+    int num_stereo_prev = prev_stereo_sort_pt_id.size();
+    assert(num_stereo_prev == num_pt_flow && "something wrong here!");
 
-    if(x_pos > raw_img_W-border || y_pos > raw_img_H-border) continue;
-    if(x_pos < border || y_pos < border) continue;
-
-    // 只要背景区域，且没被占用的点。对于物体点，只要那些有前后2帧跟踪的点，有立体匹配的新物体点在上一帧时已经保存，这里不必再次保存
-    if(mask_bg_prev.at<uchar>(y_pos, x_pos) == 0) continue;
-
-    Vec2b info_pt_prev = seg_map_prev.at<uchar>(y_pos, x_pos);
-    uchar cls_prev = info_pt_prev(0);
-    if(cls_prev == 0)
-      min_disp_x = min_disp_x_stereo;
-    else
+    for(int i = 0; i < num_stereo_prev; ++i)
     {
-      // 上一帧的物体点不要
-      continue;
-      // min_disp_x = min_disp_x_stereo_obj;
-    }
+      is_far_pt = false;
+      int id = prev_stereo_sort_pt_id[i];
+      // 属于有效的跟踪点的立体匹配，不作为待跟踪点
+      if(prev_flow_pt_with_stereo.find(id) != prev_flow_pt_with_stereo.end()) continue;
+      // 属于无效的立体匹配（太远或太近），也不作为待跟踪点（因为认为光流金字塔的跟踪精度没有sift高）
+      if(invalid_stereo_match.find(id) != invalid_stereo_match.end()) continue;
 
-    float *prev_info_ptr = prev_stereo_match_info + 5 * id;
+      x_pos = siftData1.h_data[id].xpos;
+      y_pos = siftData1.h_data[id].ypos;
 
-    score = prev_info_ptr[0];
-    if(score <= minScore) continue;
+      if(x_pos > raw_img_W-border || y_pos > raw_img_H-border) continue;
+      if(x_pos < border || y_pos < border) continue;
 
-    match_xpos = prev_info_ptr[3]; 
-    match_ypos = prev_info_ptr[4];
+      // 只要背景区域，且没被占用的点。对于物体点，只要那些有前后2帧跟踪的点，有立体匹配的新物体点在上一帧时已经保存，这里不必再次保存
+      if(mask_bg_prev.at<uchar>(y_pos, x_pos) == 0) continue;
 
-    disp_match_x = x_pos - match_xpos;
-    disp_match_y = y_pos - match_ypos;
-
-    // 只保留大于最小深度阈值，且小于18m的点作为待跟踪点
-    if(disp_match_x <= min_disp_x || disp_match_x > thres_dist_match_x || abs(disp_match_y) > fmax(0.6, max_disp_y)) 
-      continue;
-
-    // dist_stereo = disp_match_x * disp_match_x + disp_match_y * disp_match_y;
-
-    int id_row_block = y_pos/60;
-    // 图像顶部的点需要仔细挑选，因为一般距离比较远，且容易是树叶之类的区域，会存在密集的特征点和匹配，需要减小ambi的值且增大点之间的距离
-    // 可以越往下的图像区域，点之间的间隔越小
-    int id_col_block = x_pos/200;
-    int radi = 20;
-    ambi = prev_stereo_sort_pt_ambi[i];
-
-    if(id_col_block == 6) id_col_block = 5;
-
-    // if(id_row_block == 0)
-    // {
-    //   // 虽然上面已经限制了点的深度值，但是为防止立体匹配错误（尤其是树叶处及其影子）的影响，还是将这部分最可能出现远点的区域去除
-    //   // 仅针对背景点
-    //   // if(id_col_block != 0 && id_col_block != 5)
-    //   {
-    //     // 大于近点阈值的则放弃
-    //     if(disp_match_x < disp_x_close_pt)
-    //       continue;
-    //   }
-    //   // 提高阈值.stereo一般可以匹配的比较准
-    //   if(ambi > 0.82) continue;
-
-    //   radi = 6;
-    // }
-    // else if((id_row_block == 1 && (id_col_block == 2 || id_col_block == 3)) || id_row_block == 2)
-    // {
-    //   // 大于近点阈值的则放弃
-    //   if(disp_match_x < disp_x_close_pt)
-    //     continue;
-
-    //   // 提高阈值.stereo一般可以匹配的比较准
-    //   if(ambi > 0.83) continue;
-
-    //   radi = 6;
-    // }
-
-    if(id_row_block < 3)
-    {
-      if(ambi >= 0.85) continue;
-
-      if(id_row_block == 0) 
+      Vec2b info_pt_prev = seg_map_prev.at<uchar>(y_pos, x_pos);
+      uchar cls_prev = info_pt_prev(0);
+      if(cls_prev == 0)
+        min_disp_x = min_disp_x_stereo;
+      else
       {
-        if(id_col_block != 0 && id_col_block != 5)
-          continue;
+        // 上一帧的物体点不要
+        continue;
+        // min_disp_x = min_disp_x_stereo_obj;
       }
-      else if(id_col_block == 2 || id_col_block == 3) 
+
+      float *prev_info_ptr = prev_stereo_match_info + 5 * id;
+
+      score = prev_info_ptr[0];
+      if(score <= minScore) continue;
+
+      match_xpos = prev_info_ptr[3]; 
+      match_ypos = prev_info_ptr[4];
+
+      disp_match_x = x_pos - match_xpos;
+      disp_match_y = y_pos - match_ypos;
+
+      // 只保留大于最小深度阈值，且小于18m的点作为待跟踪点
+      // if(disp_match_x <= min_disp_x || disp_match_x > thres_dist_match_x || abs(disp_match_y) > fmax(0.6, max_disp_y)) 
+      if(disp_match_x <= min_disp_x || disp_match_x > thres_dist_match_x || abs(disp_match_y) > 2.0) 
         continue;
 
-      radi -= (2 * id_row_block);
-      if(disp_match_x < disp_x_close_pt)
+      // dist_stereo = disp_match_x * disp_match_x + disp_match_y * disp_match_y;
+
+      int id_row_block = y_pos/60;
+      // 图像顶部的点需要仔细挑选，因为一般距离比较远，且容易是树叶之类的区域，会存在密集的特征点和匹配，需要减小ambi的值且增大点之间的距离
+      // 可以越往下的图像区域，点之间的间隔越小
+      int id_col_block = x_pos/200;
+      if(id_col_block == 6) id_col_block = 5;
+
+      int radi = 23;
+      ambi = prev_stereo_sort_pt_ambi[i];
+
+      // if(id_row_block == 0)
+      // {
+      //   // 虽然上面已经限制了点的深度值，但是为防止立体匹配错误（尤其是树叶处及其影子）的影响，还是将这部分最可能出现远点的区域去除
+      //   // 仅针对背景点
+      //   // if(id_col_block != 0 && id_col_block != 5)
+      //   {
+      //     // 大于近点阈值的则放弃
+      //     if(disp_match_x < disp_x_close_pt)
+      //       continue;
+      //   }
+      //   // 提高阈值.stereo一般可以匹配的比较准
+      //   if(ambi > 0.82) continue;
+
+      //   radi = 6;
+      // }
+      // else if((id_row_block == 1 && (id_col_block == 2 || id_col_block == 3)) || id_row_block == 2)
+      // {
+      //   // 大于近点阈值的则放弃
+      //   if(disp_match_x < disp_x_close_pt)
+      //     continue;
+
+      //   // 提高阈值.stereo一般可以匹配的比较准
+      //   if(ambi > 0.83) continue;
+
+      //   radi = 6;
+      // }
+
+      if(id_row_block < start_row_bloc)
       {
-        if(num_far_pt_up_half_img <= 0)
-          continue;
+        if(ambi > 0.82) continue;
+
+        // 是否要限制在上半图像的中间区域选取立体匹配点？
+        // if(id_row_block == 0) 
+        // {
+        //   if(id_col_block != 0 && id_col_block != 5)
+        //     continue;
+        // }
+        // else if(id_col_block == 2 || id_col_block == 3) 
+        //   continue;
+
+        radi -= (2 * id_row_block);
+        if(disp_match_x < disp_x_close_pt)
+        {
+          if(num_far_pt_up_half_img <= 0)
+            continue;
+          else
+          {
+            is_far_pt = true;
+          }
+        }
         else
         {
-          is_far_pt = true;
+          if(num_close_pt_up_half_img <= 0) continue;
+          radi = 15;
+          if(disp_match_x > disp_x_very_close) radi = 9;
         }
       }
       else
       {
-        if(num_close_pt_up_half_img <= 0) continue;
-        radi = 13;
-        if(disp_match_x > disp_x_very_close) radi = 8;
+        // 立体匹配点最大的ambi不超过阈值。所有立体匹配已经根据ambi排序过了
+        if(ambi > maxAmbiguity) break;
+
+        if(id_row_block == 6) id_row_block = 5;
+
+        radi -= (2 * id_row_block);
+
+        if(disp_match_x > disp_x_very_close) radi = 10;
       }
-    }
-    else
-    {
-      // 立体匹配点最大的ambi不能超过0.88。所有立体匹配已经根据ambi排序过了
-      if(ambi > maxAmbiguity) break;
-      // 底部多出的部分全都归到第6行的框内
-      if(id_row_block == 6) id_row_block = 5;
 
-      radi = 25;
-      radi -= (2 * id_row_block);
-
-      if(disp_match_x > disp_x_very_close) radi = 10;
-    }
-
-    if(cls_prev != 0) 
-      radi = 7;
-    else
-    {
-      int num_flow = num_flow_pt_in_bloc[id_row_block][id_col_block];
-      int num_long_track = num_long_track_FAST_in_bloc[id_row_block][id_col_block];
-      int num_pt = num_flow + num_long_track + num_temp_flow_pt_in_bloc[id_row_block][id_col_block];
-      
-      int num_thres = NUM_FEA_IN_BLOC;
-      if(id_row_block < 3)
+      if(cls_prev != 0) 
+        radi = 7;
+      else
       {
-        num_thres = 5;
-        if(disp_match_x > disp_x_very_close)
-          num_thres = (num_far_pt_up_half_img + num_close_pt_up_half_img)/3;
-        else if(disp_match_x > disp_x_close_pt)
-          num_thres = (num_far_pt_up_half_img + num_close_pt_up_half_img)/4;
+        int num_flow = num_flow_pt_in_bloc[id_row_block][id_col_block];
+        int num_long_track = num_long_track_FAST_in_bloc[id_row_block][id_col_block];
+        int num_pt = num_flow + num_long_track + num_temp_flow_pt_in_bloc[id_row_block][id_col_block];
+        
+        int num_thres = NUM_FEA_IN_BLOC;
+        if(id_row_block < start_row_bloc)
+        {
+          num_thres = 6;
+
+          if(disp_match_x > disp_x_very_close)
+            num_thres = total_max_pt_up_half_img/3.5;
+          else if(disp_match_x > disp_x_close_pt)
+            num_thres = total_max_pt_up_half_img/6;
+        }
+        else if (id_row_block <= 3)
+          num_thres = 9;
+        
+        if(num_pt >= num_thres) continue;
+        num_temp_flow_pt_in_bloc[id_row_block][id_col_block] += 1;
+
+        if(id_row_block < start_row_bloc)
+        {
+          if(is_far_pt)
+            --num_far_pt_up_half_img;
+          else
+            --num_close_pt_up_half_img;
+        }
       }
-      else if (id_row_block == 3)
-        num_thres = 8;
       
-      if(num_pt >= num_thres) continue;
-      num_temp_flow_pt_in_bloc[id_row_block][id_col_block] += 1;
+      // 有立体匹配但是还没有跟踪的上一帧背景点，需要在后续用光流金字塔寻找前后帧匹配
+      temp_flow_pt_id.push_back(id);
+      
+      Point2f pt(x_pos, y_pos);
+      circle(mask_bg_prev, pt, radi, 0, -1);
 
-      if(id_row_block < 3)
+      if(draw_tracked_fea)
       {
-        if(is_far_pt)
-          --num_far_pt_up_half_img;
-        else
-          --num_close_pt_up_half_img;
+        // BGR. 蓝色，代表的是待跟踪的sift点
+        circle(tracked_fea_prev_img, pt, 4, Scalar(255,0,0), 1, 16);
+        // 绿色代表仅有立体匹配的sift点
+        circle(stereo_fea_prev_img, pt, 4, Scalar(0,255,0), 1, 16);
       }
-    }
-    
-    // 有立体匹配但是还没有跟踪的上一帧背景点，需要在后续用光流金字塔寻找前后帧匹配
-    temp_flow_pt_id.push_back(id);
-    
-    Point2f pt(x_pos, y_pos);
-    circle(mask_bg_prev, pt, radi, 0, -1);
-
-    if(draw_tracked_fea)
-    {
-      // BGR. 蓝色，代表的是待跟踪的sift点
-      circle(tracked_fea_prev_img, pt, 4, Scalar(255,0,0), 1, 16);
-      // 绿色代表仅有立体匹配的sift点
-      circle(stereo_fea_prev_img, pt, 4, Scalar(0,255,0), 1, 16);
     }
   }
-
+  
   if(draw_tracked_fea)
   {
     while(true)
@@ -1140,15 +1170,19 @@ void Sift::select_flow_matching(float max_disp_y, const Mat &seg_map_prev, const
       }
     }
     
-    while(true)
+    if(add_FAST_from_sift)
     {
-      cv::imshow("original fea with stereo match in prev left image", stereo_fea_prev_img);
-      // 一直等待用户按下ESC键（ASCI码为27）
-      if(waitKey(0) == 27)
+      while(true)
       {
-          break;
+        cv::imshow("original fea with stereo match in prev left image", stereo_fea_prev_img);
+        // 一直等待用户按下ESC键（ASCI码为27）
+        if(waitKey(0) == 27)
+        {
+            break;
+        }
       }
     }
+
   }
 }
 
@@ -1169,7 +1203,7 @@ void Sift::Postprocess()
   prev_stereo_sort_pt_ambi = stereo_sort_pt_ambi;
 }
 
-// 需要对图像进行填充，以便可以被64整除
+// 需要对图像进行填充，以便可以被32整除
 void Sift::pad(const cv::Mat &raw_img, cv::Mat &padded_img, int* Padder, const string mode)
 {
     int h_raw  = raw_img.rows;
@@ -1184,9 +1218,10 @@ void Sift::pad(const cv::Mat &raw_img, cv::Mat &padded_img, int* Padder, const s
     Padder[2]  = 0;
     Padder[3]  = pad_wd;
     
-    if (mode == "constant"){
+    if(mode == "constant"){
         int borderType = cv::BORDER_CONSTANT;
         // cv::Scalar color = Scalar(0, 0, 0);
+        // 这是灰度图像，因此只用给float值
         float color = 0.0;
         copyMakeBorder(raw_img, padded_img, Padder[0], Padder[1], Padder[2], Padder[3], borderType, color);
     }

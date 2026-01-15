@@ -23,8 +23,8 @@ struct SiftConfig {
   float thres_dist_match_flow = 220;
   float thres_dist_match_x_flow = 200;
   float thres_dist_match_y_flow = 80;
-
-  float thres_Ambiguity_stereo = 0.86; // 0.85 - 0.88
+  
+  float thres_Ambiguity_stereo = 0.85; // 0.85 - 0.88
   float thres_dist_match_stereo = 192;
   // 考虑范围内最大视差为mbf/minDepth，约为192像素. 双目立体匹配的最大disp也是设置为192（大约是2m深度）。但是sift匹配或许允许较大视差的匹配（那就得提高匹配的置信度）？
   float thres_dist_match_x_stereo = 256;  // 192

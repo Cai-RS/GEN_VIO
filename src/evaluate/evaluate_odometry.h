@@ -35,19 +35,19 @@ struct errors {
 
   void saveSequenceErrors (vector<errors> &err,string file_name);
 
-  void savePathPlot (vector<MatriX> &poses_gt,vector<MatriX> &poses_result,vector<MatriX> &poses_result_imu,string file_name, bool plot_three_line);
+  void savePathPlot (vector<MatriX> &poses_gt,vector<MatriX> &poses_result,vector<MatriX> &poses_result_imu,string file_name, bool plot_more_line, const vector<MatriX> &poses_result_VINS = vector<MatriX>());
 
   vector<int32_t> computeRoi (vector<MatriX> &poses_gt,vector<MatriX> &poses_result);
 
-  void plotPathPlot (string dir,vector<int32_t> &roi,int32_t idx, bool plot_three_line);
-
+  void plotPathPlot (string dir,vector<int32_t> &roi,int32_t idx, bool plot_three_line = false, int num_line = 2);
+  
   void saveErrorPlots(vector<errors> &seq_err,string plot_error_dir,char* prefix);
 
-  void plotErrorPlots (string dir,char* prefix);
+  void plotErrorPlots (string dir, char* prefix);
 
   void saveStats (vector<errors> err,string dir);
 
-  bool eval (string result_sha);
+  bool eval (string Dataset, string sequence);
 
   
 

@@ -69,11 +69,15 @@ void Estimator::clearState()
     initial_succ_first_win = false;
     map_fea_optimized = false;
     map_fea_writen = false;
-    tracker_pts_updated = true;
+    tracker_pts_updated = false;
+    tracker_vars_updated = false;
+    tria_2d2d_track_done = false;
+    ave_epi_dist_inliers = 0;
     prevTime = -1;
     curTime = 0;
     // 不估计外参
     openExEstimation = 0;
+    LBA_succ = false;
     initP = Eigen::Vector3d(0, 0, 0);
     initR = Eigen::Matrix3d::Identity();
     inputImageCnt = 0;
@@ -84,6 +88,7 @@ void Estimator::clearState()
     
     can_change_seneor_type = false;
     done_cam_motion_pred = false;
+    show_spec_frame = false;
 
     delta_T_cam_new = 0;
     curTime_cam  = 0;
@@ -149,7 +154,7 @@ void Estimator::clearState()
     // 清空保存特征地图点的list
     f_manager.clearState();
     
-    featureTracker.clear_var();
+    // featureTracker.clear_var();
     failure_occur = 0;
 
     mProcess.unlock();
@@ -167,7 +172,7 @@ void Estimator::GPU_init_build(std::string &img0_for_gpu_build, std::string &img
     end_sift_post   = false;
     end_stereo_post = false;
     end_FAST_track  = false;
-    done_sample     = true;
+    done_sample     = false;
     checkCudaRuntime(cudaStreamCreateWithFlags(&common_infer_stream, cudaStreamNonBlocking));
     checkCudaRuntime(cudaStreamCreateWithFlags(&cpy_post_stream, cudaStreamNonBlocking));
 
@@ -450,7 +455,6 @@ void Estimator::inputImage(double t, const cv::Mat &_img, const cv::Mat &_img1)
 }
 
 // 设置上一帧物体特征点的mask，并且计算上一帧所有已知运动模型的物体上的特征点在当前帧中的预计位置
-
 void Estimator::set_mask_objs_prev(double cur_time)
 {
     // 如果每一帧的所有待跟踪FAST点已经在上一帧确定了，则标注它们在上一帧中的mask中的位置
@@ -494,31 +498,33 @@ void Estimator::set_mask_objs_prev(double cur_time)
             }
         }
         
-        if(!change_state)
-        {
-            RCam_1 = prev_cam_R_using_imu[0];
-            PCam_1 = prev_cam_P_using_imu[0];
-            RCam_2 = prev_cam_R_using_imu[1];
-            PCam_2 = prev_cam_P_using_imu[1];
-        }
+        
     }
     
     // if((!USE_IMU && STEREO) || (USE_IMU && STEREO && NEED_ESTI_G && solver_flag == INITIAL))
-    if((!USE_IMU && STEREO) || (USE_IMU && solver_flag == INITIAL))
+    // if((!USE_IMU && STEREO) || (USE_IMU && solver_flag == INITIAL))
+    // {
+    //     if(frame_count > 1)
+    //     {
+    //         // cout << "Ps[frame_count-2]: " << Ps[frame_count-2].transpose() << endl;
+    //         // cout << "Ps[frame_count-1]: " << Ps[frame_count-1].transpose() << endl;
+            
+    //         // Rs和Ps中的值是经过视觉估计的结果影响的
+    //         RCam_1 = Rs[frame_count-2] * ric[0];
+    //         PCam_1 = Rs[frame_count-2] * tic[0] + Ps[frame_count-2];
+    //         RCam_2 = prev_cam_R;
+    //         PCam_2 = prev_cam_P;
+            
+    //         // Vector3d P = Rs[frame_count-1] * tic[0] + Ps[frame_count-1];
+    //     }
+    // }
+
+    if(frame_count > 1)
     {
-        if(frame_count > 1)
-        {
-            // cout << "Ps[frame_count-2]: " << Ps[frame_count-2].transpose() << endl;
-            // cout << "Ps[frame_count-1]: " << Ps[frame_count-1].transpose() << endl;
-            
-            // Rs和Ps中的值是经过视觉估计的结果影响的
-            RCam_1 = Rs[frame_count-2] * ric[0];
-            PCam_1 = Rs[frame_count-2] * tic[0] + Ps[frame_count-2];
-            RCam_2 = prev_cam_R;
-            PCam_2 = prev_cam_P;
-            
-            // Vector3d P = Rs[frame_count-1] * tic[0] + Ps[frame_count-1];
-        }
+        RCam_1 = prev_cam_R_using_imu[0];
+        PCam_1 = prev_cam_P_using_imu[0];
+        RCam_2 = prev_cam_R_using_imu[1];
+        PCam_2 = prev_cam_P_using_imu[1];
     }
     
     // 如果使用IMU
@@ -551,6 +557,12 @@ void Estimator::set_mask_objs_prev(double cur_time)
             // cur_cam_P = R_cam_motion_pred_w * prev_cam_P + P_cam_motion_pred_w;
 
             pred_pose_with_vel(prev_cam_R, prev_cam_P, const_ang_vel, const_l_vel, delta_t, cur_cam_R, cur_cam_P);
+
+            // 世界坐标系下的预测的两帧间位移，后续如果通过估计F/H得到更准确的R预测，则可更新两帧间相机位移的预测值
+            featureTracker.prev_cam_R = prev_cam_R;
+            featureTracker.prev_cam_P = prev_cam_P;
+            featureTracker.P_cam_motion_w = const_l_vel * delta_t;
+            
             // 无论如何，保持当前帧都有IMU坐标系全局位姿的预测
             Rs[frame_count] = cur_cam_R * ric[0].transpose();
             Ps[frame_count] = cur_cam_P - Rs[frame_count] * tic[0];
@@ -593,40 +605,94 @@ void Estimator::set_mask_objs_prev(double cur_time)
             iter.second.second = cur_cam_R.transpose() * (P_pred + R_pred * prev_cam_P - cur_cam_P);
         }
     }
-
+    
     // 如果每一帧的所有待跟踪FAST点已经在上一帧确定了，则在这里给定它们在当前帧图像的预测位置
-    if(!featureTracker.add_new_sift_in_next_frame)
-    {
-        // 如何设置当前帧跟踪点的预测位置，是使用恒速运动模型 还是 等待并使用flow_map
-        if(use_motion_to_pred_fea_pos)
-        {
-            // 系统第二帧也进入该函数
-            // 系统第二帧中对上一帧的新点使用光流网络的结果来作为预测值（假设IMU不需要初始化，则第2帧静态点的预测可以有由IMU积分得到的相机运动来计算，但是动态物体就无法进行，所以还是需要用flow_map）
-            if (frame_count <= 1)
-                featureTracker.Ptspredict_motion(frame_count, prev_cam_R, prev_cam_P, cur_cam_R, cur_cam_P, false);
-            else
-                // 之后的帧中对上一帧的新物体点也选择使用相机的运动模型来来计算点的预测位置
-                // featureTracker.Ptspredict_motion(frame_count, prev_cam_R, prev_cam_P, cur_cam_R, cur_cam_P);
-                featureTracker.Ptspredict_motion(frame_count, prev_cam_R, prev_cam_P, cur_cam_R, cur_cam_P, false);
-        }
-        else
-        {
-            featureTracker.Ptspredict_motion(frame_count, prev_cam_R, prev_cam_P, cur_cam_R, cur_cam_P, false);
-        }
-    }
-    cout << "finish set_mask_objs_prev and set predict for fea!" << endl;
+    // if(!featureTracker.add_new_fea_in_next_frame)
+    // {
+    //     // 如何设置当前帧跟踪点的预测位置，是使用恒速运动模型 还是 等待并使用flow_map
+    //     if(use_motion_to_pred_fea_pos)
+    //     {
+    //         // 系统第二帧也进入该函数
+    //         // 系统第二帧中对上一帧的新点使用光流网络的结果来作为预测值（假设IMU不需要初始化，则第2帧静态点的预测可以有由IMU积分得到的相机运动来计算，但是动态物体就无法进行，所以还是需要用flow_map）
+    //         if (frame_count <= 1)
+    //             featureTracker.Ptspredict_motion(prev_cam_R, prev_cam_P, cur_cam_R, cur_cam_P, false);
+    //         else
+    //             // 之后的帧中对上一帧的新物体点也选择使用相机的运动模型来来计算点的预测位置
+    //             // featureTracker.Ptspredict_motion(prev_cam_R, prev_cam_P, cur_cam_R, cur_cam_P);
+    //             featureTracker.Ptspredict_motion(prev_cam_R, prev_cam_P, cur_cam_R, cur_cam_P, false);
+    //     }
+    //     else
+    //     {
+    //         featureTracker.Ptspredict_motion(prev_cam_R, prev_cam_P, cur_cam_R, cur_cam_P, false);
+    //     }
+    // }
+    // cout << "finish set_mask_objs_prev and set predict for fea!" << endl;
 }
 
 // 将yolo_seg的full_seg_map所指的host内存上的数据转化为CV_8UC3的Mat,然后再取前2通道的数据作为最终的seg_map
 void Estimator::build_seg_map(const int &raw_img_width, const int &raw_img_height)
 {
+    if(frame_count == 0)
+    {
+        // todo: bloc的大小应该要根据数据集图像的尺寸来自适应调整！
+        int rest_col = raw_img_width - 600;
+        int rest_row = raw_img_height - 180;
+        vector<int> para_rec = {0, 0, 600, 180,
+                                600, 0, rest_col, 180,
+                                0, 180, 600, rest_row,
+                                600, 180, rest_col, rest_row};
+        
+        for(int i = 0; i < 4; ++i)
+        {
+            Mat &mask_bloc = featureTracker.mask_for_cover_big_bloc[i];
+            
+            mask_bloc.create(raw_img_height, raw_img_width, CV_8UC1);
+            mask_bloc.setTo(255);
+
+            int start = i * 4;
+            // 仅将各个要保留的大bloc区域的mask设为0
+            cv::Rect targetRectBloc(para_rec[(start)], para_rec[(start+1)], para_rec[(start+2)], para_rec[(start+3)]);
+            Mat allZeorZoneBloc(para_rec[(start+3)], para_rec[(start+2)], CV_8UC1, Scalar(0));
+            Mat dest_zone_bloc = mask_bloc(targetRectBloc);
+            allZeorZoneBloc.copyTo(dest_zone_bloc);
+        }
+
+        featureTracker.mask_up_half_img.create(raw_img_height, raw_img_width, CV_8UC1);
+        featureTracker.mask_up_half_img.setTo(255);
+        {
+            // 遮掉下半幅图像
+            cv::Rect targetRectBloc(0, 0, raw_img_width, rest_row);
+            Mat allZeorZoneBloc(rest_row, raw_img_width, CV_8UC1, Scalar(0));
+            Mat dest_zone_bloc = featureTracker.mask_up_half_img(targetRectBloc);
+            allZeorZoneBloc.copyTo(dest_zone_bloc);
+        }
+
+        featureTracker.mask_low_half_img.create(raw_img_height, raw_img_width, CV_8UC1);
+        featureTracker.mask_low_half_img.setTo(255);
+        {
+            // 遮掉上半幅图像
+            cv::Rect targetRectBloc(0, 0, raw_img_width, 180);
+            Mat allZeorZoneBloc(180, raw_img_width, CV_8UC1, Scalar(0));
+            Mat dest_zone_bloc = featureTracker.mask_low_half_img(targetRectBloc);
+            allZeorZoneBloc.copyTo(dest_zone_bloc);
+        }
+    }
+    else
+    {
+        // todo: 如果图像的尺寸发生了变化，则重新设置针对每个大bloc的mask
+        // if (featureTracker.row_img_prev != raw_img_height || featureTracker.col_img_prev != raw_img_width)
+        // {
+
+        // }
+    }
+
     while(!featureTracker.copy_mask_bg)
     {
         usleep(300);
     }
     
     // 将full_seg_map第一个通道的map取出，将其中cls值为1、2和4的点以及类别正确但是物体太小的点都设置为黑色，其他的点设置为白色。将该mask作为新的FAST点检测时的mask
-    if (!featureTracker.mask_solid_objs.data || featureTracker.row_img_prev != raw_img_height || featureTracker.col_img_prev != raw_img_width)
+    if (frame_count == 0 || featureTracker.row_img_prev != raw_img_height || featureTracker.col_img_prev != raw_img_width)
     {
         featureTracker.mask_solid_objs.create(raw_img_height, raw_img_width, CV_8UC1);
 
@@ -676,7 +742,7 @@ void Estimator::build_seg_map(const int &raw_img_width, const int &raw_img_heigh
     Mat padded_mask_for_bg = Mat(size_full_seg_map, CV_8UC1, (void*)host_mask_for_bg);
     featureTracker.mask_bg = padded_mask_for_bg(y_range, x_range).clone();
     
-    if(featureTracker.add_new_sift_in_next_frame)
+    if(featureTracker.add_new_fea_in_next_frame)
         featureTracker.mask_bg_cur = featureTracker.mask_bg.clone();
     else
         featureTracker.mask_bg_cur = featureTracker.mask_bg;
@@ -747,10 +813,9 @@ void Estimator::assign_sift_FAST(double &dt)
         }
     }
     
+    bool has_r_img = !(r_img_gray.empty());
     // 根据当前帧sift点的检测和匹配结果，确认跟踪自上一帧有效sift点的匹配，并且添加当前帧新的sift点。结合seg_map，暂时确定各个sift点的class label和物体id
-    bool initial_IMU_succ = (solver_flag == NON_LINEAR);
-    // if(!NEED_ESTI_G) initial_IMU_succ = true;
-    featureTracker.select_sift_V2(frame_count, r_img_gray, full_seg_map_prev, full_seg_map, map_depth_prev, map_flow, end_flow_post, initial_IMU_succ, use_mask_img_for_sift);
+    featureTracker.select_SIFT(has_r_img, full_seg_map_prev, full_seg_map, map_depth_prev, map_flow, end_flow_post, done_cam_motion_pred, use_mask_img_for_sift);
     
     while (!end_FAST_track)
     {
@@ -760,9 +825,9 @@ void Estimator::assign_sift_FAST(double &dt)
     // 基于跟踪到的FAST/sift点以及新检测的sift点，设置mask，然后检测新的FAST点(左和右图像中）并将当前帧跟踪到的和新检测到的FAST点按要求加入到各个obj集合中（包括bg的）
     // 如果是系统初始帧，则需要等待depth_map估计完成
     bool marg_old_prev = (marginalization_flag == MARGIN_OLD);
-    featureTracker.det_new_FAST_objs(frame_count, num_solid_obj_frame, full_seg_map, cls_map, map_depth, initial_IMU_succ, marg_old_prev, end_stereo_post, r_img_gray);
+    featureTracker.det_new_FAST_objs(num_solid_obj_frame, full_seg_map, cls_map, map_depth, marg_old_prev, end_stereo_post);
     // 可能需要等待GPU上的立体匹配完成
-    featureTracker.assign_fea_objs(frame_count, map_depth, end_flow_post, end_stereo_post, _img1, valid_solid_obj, id_map, bbox_mask);
+    featureTracker.assign_fea_objs(map_depth, end_flow_post, end_stereo_post, valid_solid_obj, id_map, bbox_mask);
 }
 
 // 对当前帧和上一帧的所有物体进行关联。关联的策略首先是基于特征点的匹配，如果特征点不够，再使用密集的像素点和flow_map以及物体运动假设：
@@ -781,33 +846,37 @@ void Estimator::assign_sift_FAST(double &dt)
 
 // 参数中需要给定前后两帧之间相机和各个动态物体的相对运动(相机的运动由IMU或视觉估计提供，物体的运动是用再往前2帧的速度，假设为恒速运动），以及左相机和IMU之间的外参
 // 在C++中，函数参数不能真正地是数组，数组参数会自动退化为指向其第一个元素的指针。这种行为称为“数组退化为指针”
-void Estimator::objs_matching(double dt, const vector<Vector3d> &Ps, const vector<Matrix3d> &Rs)
+void Estimator::objs_matching(const vector<Vector3d> &Ps, const vector<Matrix3d> &Rs)
 {
     bool initial_succ = (solver_flag == NON_LINEAR);
     // 对于系统前2帧，此时无法提供当前相机的位姿估计。物体的匹配只使用前后两帧像素点或特征点集的方差的相似性。或者在IMU未初始化之前，不进行动态物体的位姿估计，只进行每一帧中动态点的剔除？
     // if (frame_count < 2 && NEED_ESTI_G) 
     if (frame_count < 2) 
     {
-        featureTracker.objs_matching_assign(frame_count, dt, full_seg_map, map_flow, map_depth, initial_succ, false);
+        featureTracker.objs_matching_assign(full_seg_map, map_flow, map_depth, false);
     }
     else 
     {
-        featureTracker.objs_matching_assign(frame_count, dt, full_seg_map, map_flow, map_depth, initial_succ, true, Ps, Rs);
+        featureTracker.objs_matching_assign(full_seg_map, map_flow, map_depth, true, Ps, Rs);
     }
 }
 
 // 开始进行视觉前端的处理，包括CPU线程中的FAST特征点检测和跟踪，GPU线程中的SIFT点跟踪以及光流、深度和实例分割
-void Estimator::Fea_Obj_Extract_Track(double &t_vio, bool &init_succ, double t, cv::Mat &left_img, cv::Mat &right_img, cv::Mat &l_gray_img, cv::Mat &r_gray_img)
+void Estimator::Fea_Obj_Extract_Track(double &t_vio, bool &init_succ, double t, cv::Mat &left_img, cv::Mat &right_img, cv::Mat &l_gray_img,  
+                                        cv::Mat &r_gray_img, Matrix3d &gt_motion_R, Vector3d &gt_motion_P, set<int> spec_frame_to_show)
 {
     if(!_shutdown)
     {
         TicToc t_all;
 
+        printf("new image coming ------------------------------------------\n");
+        printf("Solving frame %d\n", frame_count);
+
         // while(raw_image_buffer.empty())
         // {
         //     usleep(2000);
         // }
-
+        
         // RawImageData raw_image;
         // mBuf.lock();
         // 注意，进行立体深度估计的图像需要是经过立体校正和去畸变的！！最好选择能提供去畸变图像的数据集！
@@ -819,13 +888,19 @@ void Estimator::Fea_Obj_Extract_Track(double &t_vio, bool &init_succ, double t, 
         // Mat left_img = raw_image.image_left;
         // Mat right_img = raw_image.image_right;
         
+        // 先重新设置tracker中的变量，并清理多余的变量
+        if(frame_count > 0) 
+            featureTracker.clear_var();
+
         _img  = left_img; 
         _img1 = right_img;
         l_img_gray = l_gray_img;
         r_img_gray = r_gray_img;
-
+        
         featureTracker.row = l_img_gray.rows;
         featureTracker.col = l_img_gray.cols;
+        featureTracker.frame_cnt = frame_count;
+        featureTracker.IMU_init_succ = (USE_IMU && solver_flag == NON_LINEAR);
         // cout << "rows of l_img: " << featureTracker.row << endl;
         // cout << "cols of l_img: " << featureTracker.col << endl;
 
@@ -865,21 +940,25 @@ void Estimator::Fea_Obj_Extract_Track(double &t_vio, bool &init_succ, double t, 
         // 除非需要更灵活并且想要独立地提供一种同步机制来等待线程完成，在这种情况下应该使用detach
         std::thread GPUprocess(&Estimator::GPUProcesImage, this, ref(t_GPU));
         GPUprocess.detach();
-        
-        // 清理上一帧featureTracker的变量
-        if(frame_count > 0) featureTracker.clear_var();
 
         if(USE_IMU && solver_flag == NON_LINEAR)
         {
             Get_Process_IMU(cur_time_);
         }
 
+        if(SHOW_TRACK && use_gt_to_show_match)
+        {
+            featureTracker.gt_motion_R = gt_motion_R;
+            featureTracker.gt_motion_P = gt_motion_P;
+        }
+        
+        featureTracker.frame_cnt = frame_count;
+        
         // 在完成seg之前，先用上一帧保留的特征点来制作上一帧物体特征点的mask，并计算各个特征点在当前帧图像的像素坐标预测值
         if(frame_count > 0)
         {
             // 防止下面build_seg_map的执行比这里的子线程更早
             featureTracker.copy_mask_bg = false;
-            
             std::thread set_mask_predict_pts(&Estimator::set_mask_objs_prev, this, ref(cur_time_));
             set_mask_predict_pts.detach();
         }
@@ -901,11 +980,13 @@ void Estimator::Fea_Obj_Extract_Track(double &t_vio, bool &init_succ, double t, 
         build_seg_map(cur_img_cols, cur_img_rows);
         end_seg_post = false;
         
+        // 这里是否必须要clone？ SIFT检测 和 FAST点的跟踪 都需要用到灰度图像，但是会对图像内容进行修改吗？
         // 每一帧跟踪FAST可以在SIFT的结果到来之前进行。需要seg_map来排除掉明显不对的匹配。
         // 而每一帧中新FAST点的检测除了要先获取FAST的跟踪结果，还需要等待sift的检测和跟踪结果（排除已有的特征点）。
         // 此函数用子线程来完成，这样后面主线程可以进行sift的分配以及新FAST的检测
-        // 系统的第2帧需要等待flow_map来为上一帧的新物体提供在当前帧的位置预测值。如果为了提高每一帧的FAST特征点的CPU光流计算精度，那么每一帧都应该先等待flow_map的结果，以便为上一帧的新物体特征点提供跟踪预测值？
+        // 系统的第2帧需要等待flow_map来为上一帧的新物体提供在当前帧的位置预测值。
         featureTracker.cur_img = l_img_gray.clone();
+        featureTracker.cur_img_r = r_img_gray.clone();
         
         // 如果是使用相机的运动模型来为特征点提供位置预测，则这里可以先进行FAST点的track了；如果要使用flow_map，则需要等待光流网络的推理结束
         std::thread track_FAST(&Estimator::CPU_Track_FAST, this, cur_time_);
@@ -966,6 +1047,11 @@ void Estimator::Fea_Obj_Extract_Track(double &t_vio, bool &init_succ, double t, 
 
         std::thread sample_pts(&Estimator::sample_pixel_objs,this);
 
+        if(!spec_frame_to_show.empty() && spec_frame_to_show.find(featureTracker.total_frame) != spec_frame_to_show.end())
+            show_spec_frame = true;
+        else
+            show_spec_frame = false;
+
         // 进行物体关联。综合使用seg_map、flow_map和depth_map，并构建二分图匹配来进行物体的帧间关联。应该要先进行关联，然后再判断物体是否运动？
         // !!但是物体关联步骤需要先知道相机的位姿！
 
@@ -1000,12 +1086,19 @@ void Estimator::Fea_Obj_Extract_Track(double &t_vio, bool &init_succ, double t, 
             printf("process time of backend: %f\n", processTime.toc());
         }
         
+        if(SHOW_TRACK || show_spec_frame)
+        {
+            featureTracker.show_valid_track(spec_frame_to_show);
+        }
+        
+        featureTracker.renew_var(cls_map);
+        
         featureTracker.row_img_prev = cur_img_rows;
         featureTracker.col_img_prev = cur_img_cols;
         
         map_depth_prev = map_depth.clone();
         // 当前帧的物体区域，用于下一帧均匀采样背景跟踪点
-        if(featureTracker.add_new_sift_in_next_frame) 
+        if(featureTracker.add_new_fea_in_next_frame) 
         {
             // featureTracker.mask_bg_prev = featureTracker.mask_bg.clone();
 
@@ -1151,7 +1244,7 @@ void Estimator::GPUProcesImage(float &time_calcu)
     {
         // 用于计算时间间隔的两个Event可以不关联到同个stream上。不包括首帧的计算时间
         cudaEventElapsedTime(&time_calcu, start_preproc_seg, stop_post_depth);
-        cout<< "Time for GPU process of a frame is" << time_calcu <<"ms"<<endl;
+        cout<< "Time for GPU process of a frame is " << time_calcu <<"ms"<<endl;
     }
     // 得到推理结果之后，应该要立即将其中位于页锁内存的数据拷贝到其他内存中，因为这些推理结果在GPU线程中不会一直被保存，下一次推理的后处理之前会被清除！
     // std::cout<<"Infer in GPU succeed!"<<endl;
@@ -1195,28 +1288,31 @@ void Estimator::CPU_Track_FAST(double _cur_time)
         // featureTracker.ave_disp_bg  = 2/3 * mbf/mThDepthBg + 1/3 * mbf/mMinDepthPt;
 
         cout << "Succeeded calcu border bg and img!" << endl;
+
+        P_cam.resize(2,Vector3d());
+        R_cam.resize(2,Matrix3d());
     }
-    
+
     while(!done_cam_motion_pred)
     {
         usleep(300);
     }
 
-    vector<Vector3d> P_cam(2,Vector3d());
-    vector<Matrix3d> R_cam(2,Matrix3d());
-    R_cam[0] = prev_cam_R;
-    P_cam[0] = prev_cam_P;
-    
-    R_cam[1] = cur_cam_R;
-    P_cam[1] = cur_cam_P;
-
-    done_cam_motion_pred = false;
+    if(frame_count > 1)
+    {
+        R_cam[0] = prev_cam_R;
+        P_cam[0] = prev_cam_P;
+        
+        R_cam[1] = cur_cam_R;
+        P_cam[1] = cur_cam_P;
+    }
     
     TicToc featureTrackerTime;
-    
+    featureTracker.cur_color_img_l = _img;
     // 每一次跟踪都需要用map_flow来为上一帧的新物体提供在当前帧的位置预测值？其实也可以不需要，即假设新物体在两帧间是静态的，则可以用相机的运动模型来预测其上特征点在当前帧的像素坐标
-    featureTracker.trackImage(frame_count, l_img_gray, end_flow_post, full_seg_map, end_FAST_track, map_depth_prev, map_flow, P_cam, R_cam);
+    featureTracker.trackImage(end_flow_post, full_seg_map, end_FAST_track, map_depth_prev, map_flow, P_cam, R_cam);
     
+    done_cam_motion_pred = false;
     printf("FAST Tracker time: %fms\n", featureTrackerTime.toc());
     
 }
@@ -1558,8 +1654,8 @@ void Estimator::processMeasurements()
         // if (frame_count < 2 && NEED_ESTI_G)
         if (frame_count < 2)
         {
-            cout << "Start objs_matching!" << endl;
-            objs_matching(delta_T_cam_new);
+            // cout << "Start objs_matching!" << endl;
+            objs_matching();
         }
         else
         {
@@ -1577,8 +1673,8 @@ void Estimator::processMeasurements()
             R_cam[1] = cur_cam_R;
             P_cam[1] = cur_cam_P;
             
-            cout << "Start objs_matching!" << endl;
-            objs_matching(delta_T_cam_new, P_cam, R_cam);
+            // cout << "Start objs_matching!" << endl;
+            objs_matching(P_cam, R_cam);
         }
         // printf("Objects matching cost time: %f ms\n", t_objs_matching.toc());
 
@@ -1709,21 +1805,19 @@ void Estimator::processIMU(double t, double dt, const Vector3d &linear_accelerat
 // 根据当前帧和上一帧的跟踪特征点进行位姿估计，结合已经完成的预积分进行视觉惯性的优化
 void Estimator::processImage(const double header)
 {
-    printf("new image coming ------------------------------------------\n");
-    // printf("Adding objects (including bg) %lu\n", (*(image[0])).size());
-
-    // ROS_DEBUG("new image coming ------------------------------------------");
-    // ROS_DEBUG("Adding objects (including bg) %lu", (*(image[0])).size());
     // td为相机和IMU之间的时间戳差异，IMU真实对应时间戳=相机时间戳+td。
     // 注意，对于每一个滑动窗口，其内部所有的帧都使用同一个td，即在LBA优化时所有帧共同使用和优化一个td值！因此，这里td是上一个滑窗优化出来的TD值（作为当前帧的初始TD），而prev_td则是上上个滑窗优化的结果（作为上一帧的初始TD)
     // 往滑窗的特征地图点集feature中 添加新的特征地图点和增加某地图点的观测帧记录的操作 都是在此函数中，包括添加系统首帧中的所有新地图点
     // 另外根据次新帧和次次新帧之间匹配点的平均视差，来决定是否将次新帧作为关键帧，从而决定是要marg掉次新帧还是最老帧（前提是当前滑窗帧数已满）！
     // prev_td其实是上上帧滑窗优化出来的TD，其被赋予了上一帧的点；而td是上一帧滑窗优化出来的TD，其被赋予了当前帧的点！即每个滑窗优化出来的TD是给下一帧的点使用的！！
 
-    int pnp_succ = 0;
+    bool pnp_succ = false, good_RT = false;
+    bool need_LBA = (USE_IMU || Use_LBA_for_puer_V);
+    int num_fea_3D_2D = 0, num_3D2D_track_cur = 0;
 
+    // 统计在PnP之后当前帧还有多少个静态跟踪点（包含纯背景点和被选择的静态物体点,3D-2D或2D-2D）
     int num_track_cur_bg = 0;
-    if (f_manager.addFeatureCheckParallax(frame_count, prev_td, td, featureTracker, num_track_cur_bg, true))
+    if (f_manager.addFeatureCheckParallax(frame_count, Headers, prev_td, td, featureTracker, num_track_cur_bg, num_fea_3D_2D, need_LBA))
     {
         marginalization_flag = MARGIN_OLD;
         //printf("keyframe\n");
@@ -1735,12 +1829,9 @@ void Estimator::processImage(const double header)
         //printf("non-keyframe\n");
     }
     
-    printf("Solving frame %d\n", frame_count);
     printf("current frame is %s\n", marginalization_flag ? "Non-keyframe" : "Keyframe");
-    
-    // 当前帧下连续观察帧数大于规定值的点数，且在首观测帧下有深度值的点
-    int num_pt_cur_frame_in_LBA = f_manager.getFeatureCountLBAcur(frame_count);
-    printf("number of feature in cur frame for LBA : %d\n", num_pt_cur_frame_in_LBA);
+
+    bool marg_old = (marginalization_flag == MARGIN_OLD);
 
     // int num_pt_in_LBA = f_manager.getFeatureCount();
     // printf("number of feature for LBA: %d\n", num_pt_in_LBA);
@@ -1762,6 +1853,15 @@ void Estimator::processImage(const double header)
     all_image_frame.insert(pair<double, ImageFrame>(header, imageframe));
     // 为下一帧图像创建好预积分对象，其起始时刻的IMU测量就是当前帧IMU预积分中的最后一个测量
     if(USE_IMU) tmp_pre_integration = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]};
+
+    // 每一帧都到设置该变量，因为系统中途可能改变传感器设置？
+    // 注意！当点数很少(即有效约束不足）时，LBA其实反而会导致窗口内的某些帧的位姿漂移！
+    // 另外，当滑窗内帧数太多时，一旦期间有路标点的深度不准确，那么就会导致所有帧的整体位姿准确性大大降低！此时其实还不如光靠PnP来逐帧估计位姿！
+    int thres_num_LBA = 1000;
+    if(!USE_IMU && Use_LBA_for_puer_V) 
+        thres_num_LBA = Th_num_fea_for_LBA_pure_V;
+    else if(USE_IMU) 
+        thres_num_LBA = 7;
 
     // 如果相机和IMU之间的外参未标定（即直接初始化为I和0），则从第2帧开始利用每帧的预积分来进行外参旋转变量估计
     // 注意，如果外参是有给定一个较为可靠的初始值，但是认为后续还需要优化估计，则ESTIMATE_EXTRINSIC == 1，在VI初始化阶段不会估计外参，而是之后的VI联合LBA才会。
@@ -1797,6 +1897,10 @@ void Estimator::processImage(const double header)
     bool has_t = true;
     Vector3d t_with_scale;
 
+    // 通过2d-2d匹配的平均光流长度来判断当前帧是否处于近乎静止的状态
+    bool small_motion = false, no_initial_guess = false;
+    if(featureTracker.ave_flow_len_sta_fea > 0 && featureTracker.ave_flow_len_sta_fea < 2.5) small_motion = true;
+
     if(STEREO || solver_flag == NON_LINEAR)
     {
         float pred_dist_t = 0.0;
@@ -1829,6 +1933,7 @@ void Estimator::processImage(const double header)
         }
 
         // 如果通过sift匹配计算了F矩阵，并分解得到R和归一化的t。则这里尝试用上一帧有深度值的跟踪点来估计t的尺度
+        // cal_Mat_F_H这个变量还用来控制是否要在这里恢复位移的尺度，如果使用IMU，则可能不需要恢复尺度而是直接使用IMU积分得到的位移
         if(frame_count > 0 && (featureTracker.has_valid_F || featureTracker.has_valid_H) && featureTracker.cal_Mat_F_H)
         {
             if(featureTracker.has_valid_F)
@@ -1839,34 +1944,44 @@ void Estimator::processImage(const double header)
             t_with_scale = featureTracker.t_from_E;
             float norm_t = t_with_scale.norm();
             cout << "norm_t of t_with_scale: " << norm_t << endl;
-            // 预测的两帧间相机运动(上一帧变换到当前帧)。如果是使用IMU，则在VI初始化之前应该使用恒速运动模型来预测此运动
-            Vector3d pred_motion_P = cur_cam_R.transpose() * (prev_cam_P - cur_cam_P); 
             
-            // 使用极线约束估计得到的当前帧相机方向
+            // 使用F/H估计得到的当前帧相机旋转运动和位移方向
             // 如果是IMU且已经初始化，则使用IMU的积分来作为R和t。其他情况下可视为纯视觉，则需要用此H和F估计得到的R和t
             if(!(USE_IMU && solver_flag == NON_LINEAR))
             {
-                pred_cam_R = prev_cam_R * featureTracker.R_from_E.transpose();
-                // 提前给定基于视觉的IMU位姿的预测值
-                Rs[frame_count] = pred_cam_R * ric[0].transpose();
-                cur_cam_R = pred_cam_R;
+                // todo: 纯视觉阶段只在系统最开始2帧使用来自F/H估计的R来作为初始值？
+                // if(frame_count == 1)
+                {
+                    pred_cam_R = prev_cam_R * featureTracker.R_from_E.transpose();
+                    // 提前给定基于视觉的IMU位姿的预测值
+                    Rs[frame_count] = pred_cam_R * ric[0].transpose();
+                    cur_cam_R = pred_cam_R;
+
+                    // todo:如果当前帧有F/H的估计（这只会在纯视觉阶段），则会使用来自F/H的更准确的R去更新位移的预测值，因此这里用该更新后的位移预测值和当前帧相机全局位姿预测
+                    if(0)
+                    {
+                        pred_cam_P = prev_cam_P - pred_cam_R * featureTracker.P_cam_motion;
+                        cur_cam_P = pred_cam_P;
+                        Ps[frame_count] = pred_cam_P - Rs[frame_count] * tic[0];
+                    }
+                }
             }
             
             // 如果有相机的运动预测，则用其提供位移尺度的初始值
             if(frame_count > 1 && norm_t > 0)
             {
-                pred_dist_t = pred_motion_P.norm();
+                // 预测的两帧间相机运动(上一帧变换到当前帧)。如果是使用IMU，则在VI初始化之前应该使用恒速运动模型来预测此运动
+                // Vector3d pred_motion_P = cur_cam_R.transpose() * (prev_cam_P - cur_cam_P); 
+                // pred_dist_t = pred_motion_P.norm();
+                
+                pred_dist_t = featureTracker.P_cam_motion.norm();
                 cout << "norm_t of pred_dist_t: " << pred_dist_t << endl;
                 // 用IMU积分或者恒速运动模型的预测值给定t的尺度的初始值
                 scale_init = pred_dist_t/norm_t;
-                // 预测的位移大小不太小，否则认为物体是几乎没有位姿的。
+                // 预测的位移大小不太小，否则认为物体是几乎没有运动的。
                 // 但是这应该会受到加速度计静态偏差和噪声的影响？
-                // 如果tracker里面估计了H矩阵，那么应该是可以给定t的方向向量，如果位移几乎为0，那么其方向向两应该是什么？可以用来作为判断吗？好像没办法
-                if(pred_dist_t >= 0.06)
-                {
-                    has_t = true;
-                }
-                else
+                // todo: 如果tracker里面估计了H矩阵，那么应该是可以给定t的方向向量，如果位移几乎为0，那么其方向向量应该是什么？可以用来作为判断吗？好像没办法
+                if((norm_t < 1.0 && pred_dist_t <= 0.1) || small_motion)
                 {
                     scale_init = 1.0;
                     // 即使预测的相机运动显示没有位移，也可以尝试恢复P的尺度？毕竟通过极线约束恢复了R 和 t的方向，说明并非纯旋转？
@@ -1887,29 +2002,44 @@ void Estimator::processImage(const double header)
         {
             set<int> &reserve_bg_track_pt_id = featureTracker.reserve_bg_track_pt_id;
             // 同时用恢复深度的3D-2D匹配来恢复t的尺度（这个对单目+IMU也可以使用）
-            recover_scale_succ = f_manager.triangulate(frame_count, Ps, Rs, tic, ric, featureTracker, prev_cam_P_using_imu, prev_cam_R_using_imu,  
-                                                        true, featureTracker.R_from_E, &(t_with_scale), scale_init, pred_dist_t, reserve_bg_track_pt_id);
+            recover_scale_succ = f_manager.triangulate(frame_count, Headers, Ps, Rs, tic, ric, featureTracker, num_fea_3D_2D, pnp_succ, marg_old, true, false, 
+                                                       false, false, featureTracker.R_from_E, &(t_with_scale), scale_init, pred_dist_t, reserve_bg_track_pt_id);
         }
         else
-            f_manager.triangulate(frame_count, Ps, Rs, tic, ric, featureTracker, prev_cam_P_using_imu, prev_cam_R_using_imu, true);
-
+            f_manager.triangulate(frame_count, Headers, Ps, Rs, tic, ric, featureTracker, num_fea_3D_2D, pnp_succ, marg_old, true);
+        
         // 如果成功恢复了t的尺度，则基于此t计算当前帧相机和IMU的P预估值
         if(recover_scale_succ)
         {
             // todo:IMU且初始化后，F或H估计出来的P是否要使用？
             // if(!(USE_IMU && solver_flag == NON_LINEAR))
             {
-                cout << "estimated motion P of cam is: " << t_with_scale.transpose() << endl;
+                cout << "estimated motion P of cam before PnP is: " << t_with_scale.transpose() << endl;
                 // 赋予t尺度，并作为P的初始估计值，防止参与PnP的点数不足而失败
                 pred_cam_P = prev_cam_P - pred_cam_R * t_with_scale;
                 cur_cam_P = pred_cam_P;
-
                 Ps[frame_count] = pred_cam_P - Rs[frame_count] * tic[0];
             }
         }
     }
     
+    // 如果视觉跟踪的平均光流很小，则直接把当前2帧间的旋转和位移分别置为 I和0
+    if(small_motion && (!USE_IMU || solver_flag == INITIAL))
+    {
+        pred_cam_R = prev_cam_R;
+        pred_cam_P = prev_cam_P;
+        
+        cur_cam_R = pred_cam_R;
+        cur_cam_P = pred_cam_P;
+
+        no_initial_guess = true;
+    }
+    
+    // 当前帧之前是否还未初始化完成
     // bool initial_succ_prev = (solver_flag == NON_LINEAR);
+
+    Matrix3d orig_pred_cam_R = pred_cam_R;
+    Vector3d orig_pred_cam_P = pred_cam_P;
 
     // 对于单目-IMU而言，首个滑窗帧数刚满时不一定能VI初始化成功，但是一定会marg掉最老帧或次新帧（即滑窗是为了保持局部帧数，与初始化是否成功无关）。
     // 如果当前滑窗VI失败，则marg后获取下一帧并形成新的滑窗，再次尝试初始化，重复尝试直到成功。
@@ -1957,7 +2087,7 @@ void Estimator::processImage(const double header)
         // 原代码中对于双目-IMU，应该是默认有提供一个外参旋转的标定结果作为初始值，则无需想单目一样累积WINDOW_SIZE+1帧再一次性进行所有帧的位姿估计和VI初始化，而是从第2帧起就根据跟踪点来用PnP视觉估计当前帧的全局位姿！
         if(STEREO && USE_IMU)
         {
-            //!!! 此处是否应该先判断一下上面IMU和相机相对旋转ric是否已初始估计成功？此工作采取的是逐帧的预积分和视觉位姿估计来逐渐地优化外参，需要到系统第WINDOW_SIZE+1帧（即需要WINDOW_SIZE个预积分）时才完成外参的初始估计。
+            // !!! 此处是否应该先判断一下上面IMU和相机相对旋转ric是否已初始估计成功？此工作采取的是逐帧的预积分和视觉位姿估计来逐渐地优化外参，需要到系统第WINDOW_SIZE+1帧（即需要WINDOW_SIZE个预积分）时才完成外参的初始估计。
             // 上面ESTIMATE_EXTRINSIC == 2是指外参ric完全没有任何的标定结果可以作为初始化值，而是直接以I作为初始值，才需要整个滑动窗口的帧来逐渐估计出一个初始值（这其实更多是针对单目IMU的情况，其一开始整个窗口的帧都没进行视觉的位姿估计，而是等待ric的初始估计完成）。
             // 而如果我们能给定一个线下的标定结果作为初始值，则不需要上面的ric初始值估计过程。
             // 另外这里可以直接用“不太准确”的ric初始值来参与每帧相机全局位姿的视觉估计，因为对于每帧计算时只要求将3D地图点转换到同一个统一的坐标系（ric的标定偏差会导致这个坐标系与当前假定的世界坐标系有偏差，但是只要初始化期间ric不变，则相当于只是再稍微改变了一下假定的世界坐标系！）
@@ -1974,7 +2104,9 @@ void Estimator::processImage(const double header)
             // 基于跟踪点和给定的当前帧位姿预测值，估计当前帧相机的全局位姿，更新所有内点的在当前帧的深度估计值（深度值不满足要求的点删除）；
             // 对于背景中的外点sift，如果当前帧深度估计可靠，可以考虑保留为新点（最终放弃该想法），否则和FAST外点一样全部删除（跟踪记录和地图记录）
             // todo: 如果PnP失败怎么办？后续是否有失败检查和重启？VINS-Fusion采用了不会失败的PnP（即不管估计的位姿结果有多烂，除非匹配点数不够4个）...
-            pnp_succ = f_manager.initFramePoseByPnP(frame_count, featureTracker, Ps, Rs, tic, ric, pred_cam_R, pred_cam_P, prev_cam_R, prev_cam_P, reserve_new_sift, num_track_cur_bg);
+            bool comp_with_pred = false;
+            if(frame_count > 1 && !no_initial_guess) comp_with_pred = true;
+            pnp_succ = f_manager.initFramePoseByPnP(frame_count, featureTracker, Ps, Rs, tic, ric, pred_cam_R, pred_cam_P, prev_cam_R, prev_cam_P, ave_epi_dist_inliers, reserve_new_sift, reserve_new_FAST, num_track_cur_bg, num_fea_3D_2D, comp_with_pred);
             
             // 如果视觉跟踪成功，则用估计的结果作为当前帧相机的位姿
             // 如果视觉跟踪失败，则用IMU积分预测的位姿作为当前帧相机的位姿
@@ -1982,14 +2114,68 @@ void Estimator::processImage(const double header)
             {
                 cur_cam_R = pred_cam_R;
                 cur_cam_P = pred_cam_P;
+
+                orig_pred_cam_R = pred_cam_R;
+                orig_pred_cam_P = pred_cam_P;
             }
             else
             {
-                pnp_succ = num_track_cur_bg;
+                cout << "Invalid PnP!" << endl;
+                // 如果跟踪失败，则尝试重定位 或者 直接重启系统！
+                // if(frame_count != 0) restart_or_relocate();
+
+                pred_cam_R = orig_pred_cam_R;
+                pred_cam_P = orig_pred_cam_P;
+
                 // todo 如果视觉约束不够多，则在LBA中固定当前帧的位姿（使用IMU的积分预测的位姿）
                 // id_frame_const_pose.push_back(frame_count);
             }
+
+            // 因为线程函数parallel_pose_objs_est()的型参均不是左值引用，因此这里无需传入的参数使用ref()来变成左值引用
+            // 即使是系统首帧，也要执行此函数，其中不仅会估计动态物体的运动，还会更新所有特征点的全局信息，删除无效的特征点，并保存各个全局物体的采样像素点。
+            // todo:这个是否要放在再次PnP之后？以便获得更精确的相机位姿估计 和 3D-2D点的数量统计？
+            num_3D2D_track_cur = num_fea_3D_2D;
+            cout << "Start thread of obj motion est!" << endl;
+            obj_motion_esti = std::thread(&Estimator::parallel_pose_objs_est, this, prev_td, td, prev_cam_R, prev_cam_P, cur_cam_R, cur_cam_P, ref(num_3D2D_track_cur), false);
             
+            good_RT = pnp_succ;
+            // 如果pnp成功且允许进行2d-2d点的三角化测量，则使用pnp估计的相机运动来进行。但是在暂时不在此处进行当前帧点的深度更新
+            
+            if(frame_count > 0) 
+            {
+                bool try_tria = Use_tria_for_2d2d;
+                // 无论PnP是否成功，这里都需要对现有的跟踪点进行处理。如果PnP成功，则可以选择进行三角化测量恢复2d-2d点为3D-2D点。如果对于无法进行三角化测量（PnP失败或者三角化无效）的部分2d-2d点进行滤除
+                int num_tria_succ = f_manager.triangulate(frame_count, Headers, Ps, Rs, tic, ric, featureTracker, num_fea_3D_2D, good_RT, marg_old, false, try_tria);
+                // 更新现有的3D-2D数。如果再次进行PnP，则可能再有3D-2D点成为外点，是否需要等到再次PnP结束后再给tria_2d2d_track_done赋值？
+                num_3D2D_track_cur = num_fea_3D_2D;
+                tria_2d2d_track_done = true;
+
+                // 如果有三角化成功的点，则再次进行PnP？
+                if (good_RT && num_tria_succ > 0)
+                {
+                    // todo: 如果再次PnP时失败呢？则使用预测的运动值
+                    bool succ = f_manager.initFramePoseByPnP(frame_count, featureTracker, Ps, Rs, tic, ric, pred_cam_R, pred_cam_P, prev_cam_R, prev_cam_P, ave_epi_dist_inliers, reserve_new_sift, reserve_new_FAST, num_track_cur_bg, num_fea_3D_2D, true);
+                    // f_manager.initFramePoseByPnP(frame_count, featureTracker, Ps, Rs, tic, ric, pred_cam_R, pred_cam_P, prev_cam_R, prev_cam_P, reserve_new_sift, reserve_new_FAST, num_track_cur_bg, num_fea_3D_2D);
+                    
+                    if(succ)
+                    {
+                        cur_cam_R = pred_cam_R;
+                        cur_cam_P = pred_cam_P;
+                    }
+                    else
+                    {
+                        pred_cam_R = orig_pred_cam_R;
+                        pred_cam_P = orig_pred_cam_P;
+                    }
+                }
+            }
+            
+            if(pnp_succ)
+            {
+                Vector3d motion_P_from_PnP = cur_cam_R.transpose()*(prev_cam_P - cur_cam_P);
+                cout << "estimated motion_P of cam after PnP: " << motion_P_from_PnP.transpose() << endl;
+            }
+
             if(frame_count < 2)
             {
                 prev_cam_R_using_imu[frame_count] = pred_cam_R;
@@ -2003,7 +2189,7 @@ void Estimator::processImage(const double header)
                 prev_cam_R_using_imu[1] = pred_cam_R;
                 prev_cam_P_using_imu[1] = pred_cam_P;
             }
-
+            
             if(frame_count > 0) Vs[frame_count] = (Ps[frame_count] - Ps[frame_count-1])/delta_T_cam_new;
             if(frame_count == 1) Vs[0] = Vs[1];
 
@@ -2011,33 +2197,9 @@ void Estimator::processImage(const double header)
             all_cam_R_before_init.push_back(Rs[frame_count]);
             all_cam_P_before_init.push_back(Ps[frame_count]);
 
-            // 当完成了相机-IMU的外参 以及 当前帧的相机位姿（在Rs和Ps中）的初步估计之后，则可以开始并行地估计相机的运动 和 每个动态物体的运动
-            // 单独子线程进行。其实也可以边进行相机的运动初始化，边估计各物体的运动，但是函数中需要使用当前帧相机位姿的估计，可以使用基于恒速模型的预测值，但是这样不够精确；等到初始化成功之后，其实就可以直接使用IMU的推测值
-            map_fea_optimized = true;
-
-            // 因为线程函数parallel_pose_objs_est()的型参均不是左值引用，因此这里无需传入的参数使用ref()来变成左值引用
-            // 即使是系统首帧，也要执行此函数，其中不仅会估计动态物体的运动，还会更新所有特征点的全局信息，删除无效的特征点，并保存各个全局物体的采样像素点。
-            obj_motion_esti = std::thread(&Estimator::parallel_pose_objs_est, this, prev_td, td, prev_cam_R, prev_cam_P, cur_cam_R, cur_cam_P, pnp_succ, false);
-
-            // 如果跟踪失败，则尝试重定位 或者 直接重启系统！
-            // if(!pnp_succ && frame_count!=0) restart_or_relocate();
-            
-            // 三角化深度仍未知的地图点的坐标（针对当前帧新增加的有左右匹配的特征点，以及在观测首2帧内都没完成三角化的点（需要到其第4帧观测起才会再次三角化））。此时当前帧Ps和Rs都是视觉估计出来的IMU的全局位姿了！三角化得到的深度都是该点在其观测首帧相极坐标系下的深度。
-            // 用于三角化上一帧与当前帧间的跟踪点的位姿变化，是采用IMU积分得到的值 还是 用上面视觉估计得到的位姿 （为了避免视觉估计质量差导致大量点的三角化测量失败，于是使用基于IMU积分的两帧位姿）
-            f_manager.triangulate(frame_count, Ps, Rs, tic, ric, featureTracker, prev_cam_P_using_imu, prev_cam_R_using_imu);
-            
-            // TODO：:如何才需要固定住当前的位姿？确实需要该帧有足够参与LBA的点的观测，但是不能只看该帧之前的点，而是还得看从该帧开始跟踪的点？
-            // if(0 && frame_count >= TH_NUM_FRAME_FOR_LBA-1)
-            // {
-            //     if(num_LBA_fea_cur_frame < 6)
-            //     {
-            //         if(pnp_succ) id_frame_const_pose.push_back(frame_count);
-            //     }
-            // }
-            
-            // 双目-IMU也要在首个滑窗内帧数满足时进行VI的联合初始化！
+            // 双目-IMU在首个滑窗内帧数满足时进行VI的联合初始化！
             // 除了要估计加速度计的bias，还应该估计全局参考坐标系下的g的方向值，使得其与Rs等IMU全局姿态估计相匹配！！全局参考坐标系可以不严格对齐东北天，但是g和Rs等必须是在同一个全局坐标系下（起始后续还是要转换对齐到东北天，否则g的读数会出问题）
-            if (frame_count == WINDOW_SIZE)
+            if(frame_count == WINDOW_SIZE)
             {
                 map<double, ImageFrame>::iterator frame_it;
                 int i = 0;
@@ -2061,15 +2223,40 @@ void Estimator::processImage(const double header)
                 //     pre_integrations[i]->repropagate(Vector3d::Zero(), Bgs[i]);
                 // }
 
-                if (result)
+                if(result)
                 {
                     initial_timestamp = header; 
                     initial_succ_first_win = true;
-                    // 此函数内联合所有VI数据对当前滑窗内所有待优化变量进行LBA，然后再marg掉某一帧得到当前滑窗的先验残差信息。但是由于此时solver_flag还未被设置为NON_LINEAR，因此当前帧环窗内不进行marg形成先验，而是下面直接滑窗去掉某一帧
-                    optimization();
 
-                    tracker_pts_updated = true;
+                    // 当前滑窗中，被跟踪到当前帧、连续观察帧数大于规定值、且在首观测帧下有深度值的点的数量（实际上参与LBA的点数会大于等于这个数，因为有些点可能帧数够了但是没有被跟踪到当前帧）
+                    // 是否也要统计窗口内各帧（参与LBA）的观测点数，以免有的帧约束不足造成优化结果严重漂移？
+                    int num_pt_cur_frame_in_LBA = f_manager.getFeatureCountLBAcur(frame_count);
+                    printf("number of feature in cur frame for LBA : %d\n", num_pt_cur_frame_in_LBA);
+
+                    // 此函数内联合所有VI数据对当前滑窗内所有待优化变量进行LBA，然后再marg掉某一帧得到当前滑窗的先验残差信息。但是由于此时solver_flag还未被设置为NON_LINEAR，因此当前帧环窗内不进行marg形成先验，而是下面直接滑窗去掉某一帧
+                    // todo: 这里是否需要参与LBA的当前帧地跟踪数足够多才进行LBA？但即使当前帧的点数够了，那对滑窗内先前帧的约束如果不够呢？
+                    if(num_pt_cur_frame_in_LBA >= thres_num_LBA)
+                    {
+                        LBA_succ = optimization();
+                    }
                     
+                    if(!LBA_succ)
+                    {
+                        cout << "Not enough trackers for LBA in first slide window!" << endl;
+                        exit(-1);
+                    }
+                    // else
+                    // {
+                    //     // 使用IMU的情况下，保留的是IMU积分的结果
+                    //     prev_cam_R_using_imu[0] = Rs[(frame_count-1)] * ric[0]; 
+                    //     prev_cam_P_using_imu[0] = Rs[(frame_count-1)] * tic[0] + Ps[(frame_count-1)];
+                    //     prev_cam_R_using_imu[1] = Rs[frame_count] * ric[0]; 
+                    //     prev_cam_P_using_imu[1] = Rs[frame_count] * tic[0] + Ps[frame_count];
+
+                    //     cur_cam_R = prev_cam_R_using_imu[1];
+                    //     cur_cam_P = prev_cam_P_using_imu[1];
+                    // }
+
                     // 如果首个滑窗就VI初始化成功，则除了在visualInitialAlign函数中校正所有相机位姿的参考坐标系之后，在LBA之后还要更新所有相机的估计值
                     if(first_win)
                     {
@@ -2077,17 +2264,16 @@ void Estimator::processImage(const double header)
                         all_cam_P_before_init.clear();
                         for (int i = 0; i <= frame_count; i++)
                         {
-                            // trans to w_T_cam
-                            // 从下面的公式可以看出，就cam位姿的校正跟IMU的位姿校正相同，只需要在先前估计值左乘rot_diff即可。
-                            // cam_R = Rs[i] * ric[0]; 
-                            // cam_P = Rs[i] * tic[0] + Ps[i];
-                            // all_cam_R_before_init.push_back(cam_R);
-                            // all_cam_P_before_init.push_back(cam_P);
-
                             all_cam_R_before_init.push_back(Rs[i]);
                             all_cam_P_before_init.push_back(Ps[i]);
-                        } 
+                        }
                         first_win = false;
+
+                        // prev_cam_R_using_imu[0] = Rs[(frame_count-1)] * ric[0]; 
+                        // prev_cam_P_using_imu[0] = Rs[(frame_count-1)] * tic[0] + Ps[(frame_count-1)];
+                        // prev_cam_R_using_imu[1] = Rs[frame_count] * ric[0]; 
+                        // prev_cam_P_using_imu[1] = Rs[frame_count] * tic[0] + Ps[frame_count];
+
                     }
                     // 否则，由于前面的滑窗已经marg掉了一些帧，那些帧的位姿没法参与LBA，因此没法对所有相机帧位姿都进行更新，这里只更新最新的一帧
                     else
@@ -2112,116 +2298,31 @@ void Estimator::processImage(const double header)
                     // 预测这些量的作用是什么？用于可视化轨迹吗？
                     //updateLatestStates();
 
-                    // 为什么不在当前滑窗就进行marg形成先验残差？
+                    // 为什么不在第一个滑窗已满时就进行marg形成先验残差？
                     solver_flag = NON_LINEAR;
 
-                    // 清理上面被marg掉的帧的相关数据（包括去除marg后无法提供有效优化约束的地图点），更新受影响的地图点的深度估计值和观测信息，移动滑窗变量中各元素的位置
-                    // 注意，滑窗只清除相机帧和相关静态点，更改地图点的帧信息；对于动态物体，在初始化成功之后，始终只保存最近的连续四帧的观测和三个位姿变换
-                    slideWindow();
-                    
-                    // 是否需要固定某些帧的位姿
-                    // if(!id_frame_const_pose.empty())
-                    // {
-                    //     int first_elem = 0;
-                    //     int rest_elem = 0;
-                    //     int num = id_frame_const_pose.size();
-                    //     // set的迭代器默认是const类型的，即无法通过其默认迭代器对set中的元素进行修改
-                    //     if(marginalization_flag == MARGIN_OLD)
-                    //     {
-                    //         if(id_frame_const_pose[0] == 0) first_elem = 1;
-                    //         for(int i = first_elem; i < num; ++i)
-                    //         {
-                    //             id_frame_const_pose[rest_elem] = id_frame_const_pose[i] - 1;
-                    //             ++rest_elem;
-                    //         }
-                    //         id_frame_const_pose.resize(rest_elem);
-                    //     }
-                    //     else
-                    //     {
-                    //         for(int i = 0; i < num; ++i)
-                    //         {
-                    //             if(id_frame_const_pose[i] != WINDOW_SIZE-1) 
-                    //             {
-                    //                 if(rest_elem < i) id_frame_const_pose[rest_elem] = id_frame_const_pose[i] - 1;
-                    //                 ++rest_elem;
-                    //             }
-                    //         }
-                    //         if(rest_elem < num) id_frame_const_pose.resize(rest_elem);
-                    //     }
-                    // }
-
-                    // 等待物体运动估计和添加新的静态点观测 完成后，再进行物体的全局运动的更新，以及滑窗操作中的地图无效点的清除
-                    obj_motion_esti.join();
-
-                    // 滑窗marg之前，使用相机的全局位姿来更新计算两帧之间物体的绝对运动变换（即世界坐标系下的该物体的帧间位姿转换）
-                    // 这个函数可以放在下一帧的开始，即覆盖GPU中seg和flow的时间？
-                    // 其实时间也不会很长，因为只有初始化成功的这一帧需要全部帧的物体运动都更新；之后由于相机滑窗marg掉一些帧（尤其是次新帧），会导致marg帧及之前的所有帧都没法更新了
-                    // 但似乎没有在这里求得物体的全部帧的全局运动变换？因为无论是KITTI的tracking数据集中，还是BEV算法中，都只需要知道物体在每一帧的相机坐标系下的位姿，运动变换也都是在相机坐标下的
-                    // 这里只需要求得两帧间的物体点的运动变换矩阵（表达在后一帧的相机坐标系下），后续如果有某一帧被marg掉，其实有间隔的两帧的运动变换也是把多个变换矩阵相乘起来而以，然后就可以求得全局的运动变换了。
-                    // updatePoseTransObjs();
                     printf("Initialization finish!\n");
                     // ROS_INFO("Initialization finish!");
                 }
                 // 在VINS-Fusion原代码中不存在双目-IMU初始化失败的考虑！！
                 else
                 {
-                    printf("VIO-initialization failed!\n");
-                    abort();
+                    printf("Stereo VIO-initialization failed!\n");
+                    exit(-1);
                     // ROS_INFO("misalign stereo visual structure with IMU");
-                    tracker_pts_updated = true;
-                    slideWindow();
-
-                    // if(!id_frame_const_pose.empty())
-                    // {
-                    //     int first_elem = 0;
-                    //     int rest_elem = 0;
-                    //     int num = id_frame_const_pose.size();
-                    //     // set的迭代器默认是const类型的，即无法通过其默认迭代器对set中的元素进行修改
-                    //     if(marginalization_flag == MARGIN_OLD)
-                    //     {
-                    //         if(id_frame_const_pose[0] == 0) first_elem = 1;
-                    //         for(int i = first_elem; i < num; ++i)
-                    //         {
-                    //             id_frame_const_pose[rest_elem] = id_frame_const_pose[i] - 1;
-                    //             ++rest_elem;
-                    //         }
-                    //         id_frame_const_pose.resize(rest_elem);
-                    //     }
-                    //     else
-                    //     {
-                    //         for(int i = 0; i < num; ++i)
-                    //         {
-                    //             if(id_frame_const_pose[i] != WINDOW_SIZE-1) 
-                    //             {
-                    //                 if(rest_elem < i) id_frame_const_pose[rest_elem] = id_frame_const_pose[i] - 1;
-                    //                 ++rest_elem;
-                    //             }
-                    //         }
-                    //         if(rest_elem < num) id_frame_const_pose.resize(rest_elem);
-                    //     }
-                    // }
-
-                    // 等待物体运动估计和添加新的静态点观测 完成后，再进行物体的全局运动的更新，以及滑窗操作中的地图无效点的清除
-                    obj_motion_esti.join();
                 }
-            }
-            else
-            {
-                tracker_pts_updated = true;
-                obj_motion_esti.join();
             }
         }
         
         // stereo only initilization 对于双目而言，即使是首帧，也是可以添加3D点的
         if(STEREO && !USE_IMU)
         {
-            Matrix3d orig_pred_cam_R = pred_cam_R;
-            Vector3d orig_pred_cam_P = pred_cam_P;
-            // 如果PnP失败怎么办？
-            // if(frame_count > 1)
             if(frame_count > 0)
             {
-                pnp_succ = f_manager.initFramePoseByPnP(frame_count, featureTracker, Ps, Rs, tic, ric, pred_cam_R, pred_cam_P, prev_cam_R, prev_cam_P, reserve_new_sift, num_track_cur_bg, false);
+                bool comp_with_pred = false;
+                if(frame_count > 1 && !no_initial_guess) comp_with_pred = true;
+                // 这里不知道pnp是否成功，如果不成功，则纯视觉情况下后续肯定不进行2D-2D三角化，则不应该提前把部分2D-2D点计数为3D-2D点！
+                pnp_succ = f_manager.initFramePoseByPnP(frame_count, featureTracker, Ps, Rs, tic, ric, pred_cam_R, pred_cam_P, prev_cam_R, prev_cam_P, ave_epi_dist_inliers, reserve_new_sift, reserve_new_FAST, num_track_cur_bg, num_fea_3D_2D, comp_with_pred);
             }
             
             // 如果视觉跟踪成功，则用估计的结果作为当前帧相机的位姿
@@ -2230,25 +2331,63 @@ void Estimator::processImage(const double header)
             {
                 cur_cam_R = pred_cam_R;
                 cur_cam_P = pred_cam_P;
+
+                orig_pred_cam_R = pred_cam_R;
+                orig_pred_cam_P = pred_cam_P;
             }
             else
             {
+                cout << "Invalid PnP!" << endl;
+                // 如果跟踪失败，则尝试重定位 或者 直接重启系统！
+                // if(frame_count != 0) restart_or_relocate();
+
                 pred_cam_R = orig_pred_cam_R;
                 pred_cam_P = orig_pred_cam_P;
-
-                pnp_succ = num_track_cur_bg;
+                
                 // todo: 如果视觉约束不够多，则在LBA中固定当前帧的位姿（使用IMU的积分预测的位姿）。
                 // 视觉约束是否足够，不是在当前帧决定吧？还得看之后该帧中是否有新的LBA的点？
                 // id_frame_const_pose.push_back(frame_count);
             }
             
+            // 物体运动估计是否要放到多次PnP完成之后再开始？
+            num_3D2D_track_cur = num_fea_3D_2D;
             cout << "Start thread of obj motion est!" << endl;
-            
-            obj_motion_esti = std::thread(&Estimator::parallel_pose_objs_est, this, prev_td, td, prev_cam_R, prev_cam_P, cur_cam_R, cur_cam_P, pnp_succ, false);
-            
-            map_fea_optimized = true;
-            
-            // 纯双目的话就不使用相机预测值（相机的运动模型）来进行三角化了，而是直接使用视觉估计值
+            obj_motion_esti = std::thread(&Estimator::parallel_pose_objs_est, this, prev_td, td, prev_cam_R, prev_cam_P, cur_cam_R, cur_cam_P, ref(num_3D2D_track_cur), false);
+
+            good_RT = pnp_succ;
+            if(frame_count > 0) 
+            {
+                bool try_tria = Use_tria_for_2d2d;
+                int num_tria_succ = f_manager.triangulate(frame_count, Headers, Ps, Rs, tic, ric, featureTracker, num_fea_3D_2D, good_RT, marg_old, false, try_tria);
+                num_3D2D_track_cur = num_fea_3D_2D;
+                tria_2d2d_track_done = true;
+
+                // 如果有三角化成功的点，则再次进行PnP？
+                if (good_RT && num_tria_succ > 0)
+                {
+                    // todo: 如果再次PnP时失败呢？
+                    // pnp_succ = f_manager.initFramePoseByPnP(frame_count, featureTracker, Ps, Rs, tic, ric, pred_cam_R, pred_cam_P, prev_cam_R, prev_cam_P, reserve_new_sift, reserve_new_FAST, num_track_cur_bg, num_fea_3D_2D);
+                    bool succ = f_manager.initFramePoseByPnP(frame_count, featureTracker, Ps, Rs, tic, ric, pred_cam_R, pred_cam_P, prev_cam_R, prev_cam_P, ave_epi_dist_inliers, reserve_new_sift, reserve_new_FAST, num_track_cur_bg, num_fea_3D_2D, true);
+
+                    if(succ)
+                    {
+                        cur_cam_R = pred_cam_R;
+                        cur_cam_P = pred_cam_P;
+                    }
+                    else
+                    {
+                        pred_cam_R = orig_pred_cam_R;
+                        pred_cam_P = orig_pred_cam_P;
+                    }
+                }
+            }
+
+            if(pnp_succ)
+            {
+                Vector3d motion_P_from_PnP = cur_cam_R.transpose()*(prev_cam_P - cur_cam_P);
+                cout << "estimated motion_P of cam after PnP: " << motion_P_from_PnP.transpose() << endl;
+            }
+
             if(frame_count < 2)
             {
                 prev_cam_R_using_imu[frame_count] = pred_cam_R;
@@ -2262,25 +2401,35 @@ void Estimator::processImage(const double header)
                 prev_cam_R_using_imu[1] = pred_cam_R;
                 prev_cam_P_using_imu[1] = pred_cam_P;
             }
-            
-            if(frame_count > 0) f_manager.triangulate(frame_count, Ps, Rs, tic, ric, featureTracker, prev_cam_P_using_imu, prev_cam_R_using_imu);
-            
-            // 如何衡量某帧的视觉约束是否足够？
-            // if(frame_count >= TH_NUM_FRAME_FOR_LBA-1)
-            // {
-            //     if(num_LBA_fea_cur_frame < 6)
-            //     {
-            //         if(pnp_succ) id_frame_const_pose.push_back(frame_count);
-            //     }
-            // }
 
-            // 纯双目情况下滑窗帧数还未满时就可以进行联合优化了，只是其后不会进行marg而已！
-            optimization();
+            // 如果纯双目允许进行LBA
+            if(Use_LBA_for_puer_V)
+            {
+                int num_pt_cur_frame_in_LBA = f_manager.getFeatureCountLBAcur(frame_count);
+                printf("number of feature in cur frame for LBA : %d\n", num_pt_cur_frame_in_LBA);
+
+                // todo: 纯双目情况下滑窗帧数还未满时就可以进行联合优化了，只是其后不会进行marg而已
+                if(num_pt_cur_frame_in_LBA >= thres_num_LBA)
+                {
+                    LBA_succ = optimization();
+                    
+                    if(LBA_succ)
+                    {
+                        // 更新
+                        prev_cam_R_using_imu[0] = Rs[(frame_count-1)] * ric[0]; 
+                        prev_cam_P_using_imu[0] = Rs[(frame_count-1)] * tic[0] + Ps[(frame_count-1)];
+                        prev_cam_R_using_imu[1] = Rs[frame_count] * ric[0]; 
+                        prev_cam_P_using_imu[1] = Rs[frame_count] * tic[0] + Ps[frame_count];
+
+                        cur_cam_R = prev_cam_R_using_imu[1];
+                        cur_cam_P = prev_cam_P_using_imu[1];
+                    }
+                }
+            }
             
             if(frame_count == WINDOW_SIZE)
             {
                 // optimization();
-                tracker_pts_updated = true;
 
                 Matrix3d cam_R;
                 Vector3d cam_P;
@@ -2295,94 +2444,21 @@ void Estimator::processImage(const double header)
                     all_cam_R_before_init.push_back(cam_R);
                     all_cam_P_before_init.push_back(cam_P);
                 }
+                
                 cur_cam_R = all_cam_R_before_init[frame_count];
                 cur_cam_P = all_cam_P_before_init[frame_count];
                 
-                // updateLatestStates();
+                initial_succ_first_win = true;
                 solver_flag = NON_LINEAR;
-
-                // 滑窗操作的最后需要等待 子线程中往地图中加入新观测完成之后 才进行地图点的信息更新和清理
-                slideWindow();
-
-                // 是否要固定某些观测不足的帧的位姿？
-                // if(!id_frame_const_pose.empty())
-                // {
-                //     int first_elem = 0;
-                //     int rest_elem = 0;
-                //     int num = id_frame_const_pose.size();
-                //     // set的迭代器默认是const类型的，即无法通过其默认迭代器对set中的元素进行修改
-                //     if(marginalization_flag == MARGIN_OLD)
-                //     {
-                //         if(id_frame_const_pose[0] == 0) first_elem = 1;
-                //         for(int i = first_elem; i < num; ++i)
-                //         {
-                //             id_frame_const_pose[rest_elem] = id_frame_const_pose[i] - 1;
-                //             ++rest_elem;
-                //         }
-                //         id_frame_const_pose.resize(rest_elem);
-                //     }
-                //     else
-                //     {
-                //         for(int i = 0; i < num; ++i)
-                //         {
-                //             if(id_frame_const_pose[i] != WINDOW_SIZE-1) 
-                //             {
-                //                 if(rest_elem < i) id_frame_const_pose[rest_elem] = id_frame_const_pose[i] - 1;
-                //                 ++rest_elem;
-                //             }
-                //         }
-                //         if(rest_elem < num) id_frame_const_pose.resize(rest_elem);
-                //     }
-                // }
-
-                obj_motion_esti.join();
-                // updatePoseTransObjs();
+                
                 printf("Initialization finish!\n");
-                // ROS_INFO("Initialization finish!");
-            }
-            else
-            {
-                tracker_pts_updated = true;
-                obj_motion_esti.join();
             }
         }
-
-        cout << "estimated translation P of IMU is: " << Ps[frame_count].transpose() << endl;
-
-        // 将下一帧的预积分的初始值设置为当前帧的这些量
-        // Rs[0]和Ps[0]是初始帧IMU坐标系相对于假定的世界坐标系的位姿（此项目中是通过计算前几个加速度测量的平均来假定为初始帧IMU坐标下的g方向，并计算其相对于东北天坐标系的位姿）
-        // 所以使用Rs[0]和Ps[0]只能将初始帧IMU坐标系变换到一个假定的世界坐标系（与东北天坐标系近似）
-        // 这里将当前帧的这些值设置为下一帧的初始值，则之后每一帧在根据IMU测量积分出来的Rs、Ps和Vs都是 该帧IMU相对于 假定世界坐标系 的位姿！
-        // 这里如果还没完成初始化，则应该继续预积分以待完成初始化
-        // if(frame_count < WINDOW_SIZE)
-
-        map_fea_writen = false;
-        if(frame_count < WINDOW_SIZE)
-        {
-            // 首个滑窗未满时才会++，当首个滑窗已满后，之后每个新帧的frame_count都是WINDOW_SIZE
-            frame_count++;
-            int prev_frame = frame_count - 1;
-            Ps[frame_count] = Ps[prev_frame];
-            Vs[frame_count] = Vs[prev_frame];
-            Rs[frame_count] = Rs[prev_frame];
-            Bas[frame_count] = Bas[prev_frame];
-            Bgs[frame_count] = Bgs[prev_frame];
-        }
-        
-        prev_cam_R = cur_cam_R;
-        prev_cam_P = cur_cam_P;
-        prev_td = td;
-        // cout << "Succeeded process backend of MVIO!" << endl;
-
-        // 世界坐标系z轴为竖直向上
-        // prev_height = prev_cam_P(2);
     }
     else
     {
         TicToc t_solve;
-
-        Matrix3d orig_pred_cam_R = pred_cam_R;
-        Vector3d orig_pred_cam_P = pred_cam_P;
+        bool need_pnp = false;
 
         // 纯双目视觉的情况下，对于每一个新帧都要基于视觉跟踪约束使用PnP来求解当前帧的位姿，并保存仅Ps和Rs中
         // 而有IMU且已经完成VI初始化的系统，会直接使用IMU测量的积分来预测当前帧图像时刻对应的IMU坐标系的状态（认为短时间内的IMU积分足够准确），保存在Rs和Ps中，见processIMU()函数
@@ -2391,22 +2467,31 @@ void Estimator::processImage(const double header)
         // 仅配备双目相机的情况下才需要进行PnP估计。为什么？单目在初始化之后每一帧也可以进行3D-2D的位姿估计了呀？
         if(!USE_IMU)
         {
-            pnp_succ = f_manager.initFramePoseByPnP(frame_count, featureTracker, Ps, Rs, tic, ric, pred_cam_R, pred_cam_P, prev_cam_R, prev_cam_P, reserve_new_sift, num_track_cur_bg, false, true);
+            bool comp_with_pred = !no_initial_guess;
+            pnp_succ = f_manager.initFramePoseByPnP(frame_count, featureTracker, Ps, Rs, tic, ric, pred_cam_R, pred_cam_P, prev_cam_R, prev_cam_P, ave_epi_dist_inliers, reserve_new_sift, reserve_new_FAST, num_track_cur_bg, num_fea_3D_2D, comp_with_pred);
         }
         // stereo+IMU的模式下，在初始化之后是否也要进行2帧间的PnP？
         else if(STEREO)
         {   
             // IMU初始化之后，可以设置每帧均进行PnP;否则，如果之前已经通过F或H的估计对跟踪点的外点滤除，则这里才不进行PnP，否则还是要用PnP来滤除外点
             // todo:是否有些情况下连续跟踪点数太少，LBA难以进行，则是否要进行PnP?
-            // if(use_pnp_after_imu_init)
+            // use_pnp_after_imu_init是由用户定义的，如果为1，则不论先前有没有过滤，这里都要执行PnP;如果为0，则还要看先前是否过滤成功，如果没有成功，则这里还是要PnP!
             if(use_pnp_after_imu_init || !featureTracker.fea_filtered)
-                pnp_succ = f_manager.initFramePoseByPnP(frame_count, featureTracker, Ps, Rs, tic, ric, pred_cam_R, pred_cam_P, prev_cam_R, prev_cam_P, reserve_new_sift, num_track_cur_bg, true, true);
+            {
+                pnp_succ = f_manager.initFramePoseByPnP(frame_count, featureTracker, Ps, Rs, tic, ric, pred_cam_R, pred_cam_P, prev_cam_R, prev_cam_P, ave_epi_dist_inliers, reserve_new_sift, reserve_new_FAST, num_track_cur_bg, num_fea_3D_2D, true, true);
+                // 对于IMU初始化成功后，就算此次PnP不成功，如果来自IMU积分的运动值可以被直接用于三角化测量且有成功的点，则后续都可以再次尝试PnP？这取决于下面good_RT变量的定义
+                need_pnp = true;
+            }
             else
             {
-                // 如果当前帧参与LBA的跟踪点数不足，后续不进行LBA，则在这里进行PnP
-                if(num_pt_cur_frame_in_LBA < 3)
+                int num_pt_cur_frame_in_LBA = f_manager.getFeatureCountLBAcur(frame_count);
+                // 如果当前帧参与LBA的跟踪点数不太多，后续不进行LBA或容易失败，则在这里进行PnP
+                // 如果当前帧近乎静止，则后续也不会进行LBA？
+                // if(no_initial_guess || num_pt_cur_frame_in_LBA < thres_num_LBA)
+                if(num_pt_cur_frame_in_LBA < thres_num_LBA)
                 {
-                    pnp_succ = f_manager.initFramePoseByPnP(frame_count, featureTracker, Ps, Rs, tic, ric, pred_cam_R, pred_cam_P, prev_cam_R, prev_cam_P, reserve_new_sift, num_track_cur_bg, true, true);
+                    pnp_succ = f_manager.initFramePoseByPnP(frame_count, featureTracker, Ps, Rs, tic, ric, pred_cam_R, pred_cam_P, prev_cam_R, prev_cam_P, ave_epi_dist_inliers, reserve_new_sift, reserve_new_FAST, num_track_cur_bg, num_fea_3D_2D, true, true);
+                    need_pnp = true;
                 }
             }
         }
@@ -2415,85 +2500,170 @@ void Estimator::processImage(const double header)
         {
             cur_cam_R = pred_cam_R;
             cur_cam_P = pred_cam_P;
-            if(!USE_IMU)
-            {
-                prev_cam_R_using_imu[0] = prev_cam_R_using_imu[1];
-                prev_cam_P_using_imu[0] = prev_cam_P_using_imu[1];
-                
-                prev_cam_R_using_imu[1] = pred_cam_R;
-                prev_cam_P_using_imu[1] = pred_cam_P;
-            }
+
+            orig_pred_cam_R = pred_cam_R;
+            orig_pred_cam_P = pred_cam_P;
+
+            need_pnp = true;
         }
         else
         {
-            if(!USE_IMU)
-            {
-                prev_cam_R_using_imu[0] = prev_cam_R_using_imu[1];
-                prev_cam_P_using_imu[0] = prev_cam_P_using_imu[1];
-                
-                prev_cam_R_using_imu[1] = orig_pred_cam_R;
-                prev_cam_P_using_imu[1] = orig_pred_cam_P;
-            }
-            
-            pnp_succ = num_track_cur_bg;
+            // 如果跟踪失败，则尝试重定位 或者 直接重启系统！
+            // if(frame_count != 0) restart_or_relocate();
+            cout << "Invalid PnP!" << endl;
+            pred_cam_R = orig_pred_cam_R;
+            pred_cam_P = orig_pred_cam_P;
 
             // todo: 如果视觉约束不够多，则在LBA中固定当前帧的位姿（使用IMU的积分预测的位姿）。
             // 视觉约束是否足够，不是在当前帧决定吧？还得看之后该帧中是否有新的LBA的点？
             // id_frame_const_pose.push_back(frame_count);
         }
         
-        Vs[frame_count] = (Ps[frame_count] - Ps[frame_count-1])/delta_T_cam_new;
-
-        // 对于双目IMU，直接拿IMU的积分结果作为当前帧相机的位姿，完成物体的运动估计
-        obj_motion_esti = std::thread(&Estimator::parallel_pose_objs_est, this, prev_td, td, prev_cam_R, prev_cam_P, cur_cam_R, cur_cam_P, pnp_succ, true);
+        // Vs能否直接这么计算？需要坐标系变换吗？
+        Vs[frame_count] = (Ps[frame_count] - Ps[frame_count-1])/(Headers[frame_count] - Headers[frame_count-1]);
         
-        // 带有IMU且已经初始化完成之后，直接使用IMU的积分值来推断当前帧的全局位姿
-        // 根据初步估计的当前帧IMU位姿 和 相机/IMU外参，三角化当前滑窗中还没有深度估计的地图点（主要是上一帧中那些被当前帧跟踪到的还没有深度估计（在上一帧中没有左右匹配）的新点，以及当前帧中有左右匹配的新点）
-        // 此项目的初始版本中默认双目系统中每一帧的特征点都必须要有立体深度估计！因为一方面有些背景点可能是动态物体的漏检；另一方面静态物体在某些帧可能重新变为动态。这就要要求了最好直接所有的点都要求有立体深度
-        // 对于静态跟踪点，其深度值会在LBA中被优化～
-        // 但由于近处点的立体匹配不容易获取，因此后续背景中的点不要求要有立体深度，否则背景跟踪点太少了
-        f_manager.triangulate(frame_count, Ps, Rs, tic, ric, featureTracker, prev_cam_P_using_imu, prev_cam_R_using_imu);
+        // 物体运动估计是否要放到多次PnP完成之后再开始？
+        num_3D2D_track_cur = num_fea_3D_2D;
+        cout << "Start thread of obj motion est!" << endl;
+        // 对于有IMU的情况，在VI初始化后，是否使用IMU积分的位姿预测值来参与物体运动估计？
+        // obj_motion_esti = std::thread(&Estimator::parallel_pose_objs_est, this, prev_td, td, prev_cam_R, prev_cam_P, cur_cam_R, cur_cam_P, ref(num_3D2D_track_cur), true);
+        obj_motion_esti = std::thread(&Estimator::parallel_pose_objs_est, this, prev_td, td, prev_cam_R, prev_cam_P, pred_cam_R, pred_cam_P, ref(num_3D2D_track_cur), true);
         
-        // 如何衡量某一帧的视觉约束是否足够？不能只看该帧之前的跟踪点，还得看该帧之后的跟踪情况吧？
-        // if(0 && frame_count >= TH_NUM_FRAME_FOR_LBA-1)
-        // {
-        //     if(num_LBA_fea_cur_frame < 6)
-        //     {
-        //         if(pnp_succ) id_frame_const_pose.push_back(frame_count);
-        //     }
-        // }
+        // todo: 如果IMU已初始化，且不进行PnP，是否能直接使用来自IMU积分的运动值尝试进行三角化测量（更多的3D-2D点使得后续会有更多长跟踪点）？
+        // good_RT = (pnp_succ);
+        good_RT = (pnp_succ || USE_IMU);
 
-        // 联合当前滑窗所有VI信息对所有变量进行LBA优化，并且marg掉某帧形成先验残差信息
-        // 非纯视觉时，由于初始化之后没有PnP,因此执行LBA。纯视觉时是否也需要每帧LBA？
-        // 此外，如果当前帧参与LBA的点数过少，则不进行LBA。但是上面如果既没有PnP,又没有估计F或H呢？无论如何，如果某一帧的约束太少，则不适合进行LBA。则直接采用恒速运动的预测 或者 IMU积分值 作为当前帧相机的位姿
-        // if(USE_IMU) 
-        if(num_pt_cur_frame_in_LBA >= 3)
+        bool try_tria = Use_tria_for_2d2d;
+        // todo: 对于IMU的情况，在初始化之后是否直接使用来自IMU积分的运动 来 进行三角化？三角化之后还需要进行暴力搜寻立体匹配，如果无法得到立体匹配，则认为三角化失败，因此可以进行
+        int num_tria_succ = f_manager.triangulate(frame_count, Headers, Ps, Rs, tic, ric, featureTracker, num_fea_3D_2D, good_RT, marg_old, false, try_tria);
+        num_3D2D_track_cur = num_fea_3D_2D;
+        tria_2d2d_track_done = true;
+
+        // 如果有三角化成功的点，则再次进行PnP
+        if(good_RT && num_tria_succ > 0)
         {
-            optimization();
+            // 注意，在有IMU的情况下，即使可以直接使用来自IMU积分的运动值来进行三角化测量，也不代表就必须进行PnP，而是保留到之后的帧形成多帧跟踪并参与LBA
+            if(need_pnp)
+            {
+                bool init_succ = (USE_IMU == 1);
+                bool succ = f_manager.initFramePoseByPnP(frame_count, featureTracker, Ps, Rs, tic, ric, pred_cam_R, pred_cam_P, prev_cam_R, prev_cam_P, ave_epi_dist_inliers, reserve_new_sift, reserve_new_FAST, num_track_cur_bg, num_fea_3D_2D, true, init_succ);
+                // f_manager.initFramePoseByPnP(frame_count, featureTracker, Ps, Rs, tic, ric, pred_cam_R, pred_cam_P, prev_cam_R, prev_cam_P, reserve_new_sift, reserve_new_FAST, num_track_cur_bg, num_fea_3D_2D, true, init_succ);
+
+                if(succ)
+                {
+                    cur_cam_R = pred_cam_R;
+                    cur_cam_P = pred_cam_P;
+                    pnp_succ = succ;
+                }
+                else
+                {
+                    pred_cam_R = orig_pred_cam_R;
+                    pred_cam_P = orig_pred_cam_P;
+                }
+            }
+        }
+
+        if(pnp_succ)
+        {
+            Vector3d motion_P_from_PnP = pred_cam_R.transpose()*(prev_cam_P - pred_cam_P);
+            cout << "estimated motion_P of cam after PnP: " << motion_P_from_PnP.transpose() << endl;
         }
         
+        if(!USE_IMU)
+        {
+            prev_cam_R_using_imu[0] = prev_cam_R_using_imu[1];
+            prev_cam_P_using_imu[0] = prev_cam_P_using_imu[1];
+            
+            prev_cam_R_using_imu[1] = pred_cam_R;
+            prev_cam_P_using_imu[1] = pred_cam_P;
+        }
+
+        // 如果允许进行LBA
+        // 纯视觉阶段如果当前帧几乎静止，则不进行LBA（防止前一帧的运动对当前帧的运动估计产生影响）
+        if(USE_IMU || (Use_LBA_for_puer_V && !no_initial_guess))
+        {
+            // PnP时可能某些地图点变为无效点，因此需要再次统计
+            int num_pt_cur_frame_in_LBA = f_manager.getFeatureCountLBAcur(frame_count);
+            printf("number of feature in cur frame for LBA : %d\n", num_pt_cur_frame_in_LBA);
+            
+            // 联合当前滑窗所有VI信息对所有变量进行LBA优化，并且marg掉某帧形成先验残差信息
+            // 非纯视觉时，由于初始化之后没有PnP,因此执行LBA。纯视觉时是否也需要每帧LBA？
+            // 此外，如果当前帧参与LBA的点数过少，则不进行LBA。但是上面如果既没有PnP,又没有估计F或H呢？无论如何，如果某一帧的约束太少，则不适合进行LBA。则直接采用恒速运动的预测 或者 IMU积分值 作为当前帧相机的位姿
+            
+            if(num_pt_cur_frame_in_LBA >= thres_num_LBA)
+            {
+                LBA_succ = optimization();
+
+                if(LBA_succ)
+                {
+                    cur_cam_R = Rs[frame_count] * ric[0];
+                    cur_cam_P = Rs[frame_count] * tic[0] + Ps[frame_count];
+
+                    if(!USE_IMU)
+                    {
+                        prev_cam_R_using_imu[0] = Rs[(frame_count-1)] * ric[0]; 
+                        prev_cam_P_using_imu[0] = Rs[(frame_count-1)] * tic[0] + Ps[(frame_count-1)];
+                        prev_cam_R_using_imu[1] = cur_cam_R;
+                        prev_cam_P_using_imu[1] = cur_cam_P;
+                    }
+                }
+            }
+            else
+            {
+                cout << "No LBA in current frame!" << endl;
+            }
+        }
+    }
+
+    // 更新跟踪点在当前帧的深度，删除深度不符合要求的点
+    if(frame_count > 0) 
+    {
+        bool try_tria = false;
+        if(LBA_succ) 
+        {
+            good_RT = true;
+            // 如果先前没有任何一次有效的PnP,则map中的当前帧2d-2d点还在，可以尝试三角化测量
+            // todo: 但是恢复深度值的3D-2D如何保证准确性？没有再次PnP，只用重投影误差进行检验吗？
+            if(!pnp_succ && Use_tria_for_2d2d) try_tria = true;
+        }
+        
+        // 至此需要尝试更新所有当前帧跟踪点的深度值。如果当前帧没有PnP但有LBA，则尝试在此进行2D-2D点的三角化测量，再更新所有跟踪点在当前帧的深度值
+        f_manager.triangulate(frame_count, Headers, Ps, Rs, tic, ric, featureTracker, num_fea_3D_2D, good_RT, marg_old, false, try_tria, true, LBA_succ);
+    }
+    
+    // 如果当前帧进行了LBA，则进行地图中参与LBA点的重投影误差检验，并及时删除无效点
+    // todo:是否一定要有LBA才进行地图中异常点的筛查？还是只要达到进行LBA的帧数要求就开始筛查？
+    if(LBA_succ)
+    // if((USE_IMU && frame_count == WINDOW_SIZE) || (!USE_IMU && frame_count >= TH_NUM_FRAME_FOR_LBA-1))
+    {
+        {
+            Matrix3d prev_cam_R = Rs[(frame_count-1)] * ric[0]; 
+            Vector3d prev_cam_P = Rs[(frame_count-1)] * tic[0] + Ps[(frame_count-1)];
+            Matrix3d motion_R_from_LBA = cur_cam_R.transpose() * prev_cam_R;
+            Quaterniond delta_Q(motion_R_from_LBA);
+            double delta_angle = acos(delta_Q.w()) * 2.0 / 3.1416 * 180.0;
+            Vector3d motion_P_from_LBA = cur_cam_R.transpose()*(prev_cam_P - cur_cam_P);
+            cout << "estimated motion_R of cam after LBA: " << delta_angle << ", estimated motion_P of cam after LBA: " << motion_P_from_LBA.transpose() << endl;
+        }
+
         set<int> removeIndex;
         // 对当前滑窗内的所有参与了LBA的地图点（需要至少有4帧观测）进行重投影（将地图点从其被观测首帧的左图像 重投影到 其他被观测帧的左右图像和首观测帧的右图像），计算和观测值的距离作为误差，平均像素误差大于3则认为是优化外点
         // 其中还要保留那些在当前帧还有跟踪且深度估计较为可靠的点作为新特征点！
         outliersRejection(removeIndex);
-        // 去除地图中的外点。注意，此时物体位姿估计线程中可能正往地图中添加某些地图点的新观测或者新地图点，这里应该和该子线程就地图变量feature加锁(用map_fea_optimized变量来代替mutex）！
-        // 倾向于这里先进行移除LBA后的外点，然后子线程中再往地图加入新的观测！因为如果某个静态点在前面至少连续4帧都跟踪到，但是在LBA后又平均投影误差较大，则即使再加上当前帧的观测，其平均误差也不会变小多少！！
+        // 去除地图中参与了LBA的外点。注意，此时物体位姿估计线程中可能正往地图中添加某些地图点的新观测或者新地图点，这里应该和该子线程就地图变量feature加锁(用map_fea_optimized变量来代替mutex）！
+        // 倾向于这里先进行移除LBA后的外点，然后子线程中再往地图加入新的观测！因为如果某个静态点在前面至少连续n帧都跟踪到，但是在LBA后又平均投影误差较大，则即使再加上当前帧的观测，其平均误差也不会变小多少！！
         f_manager.removeOutlier(removeIndex);
-        // 设置此值为true，通知子线程可以进行地图的写入操作了！
+        // 主线程完成了对地图点的更新和筛选后设置此值为true，通知子线程可以进行地图的写入操作了！
         map_fea_optimized = true;
         
-        if (!MULTIPLE_THREAD)
+        if(!MULTIPLE_THREAD)
         {
             // 当前滑窗内某些地图点因为重投影误差大于阈值，已经被作为外点从滑窗的地图点集中去除了，下面需要在跟踪线程的变量（与最新帧和次新帧的匹配相关）中去除与其中某些点相关的信息
             // 这里面只进行两个status的修改，真正删除cur_sift等变量中的元素要在子线程中进行！这样可以覆盖后续操作的时间
-            // reserve_new_sift中是那些在当前帧有跟踪到的点，但是其之前所有的观测记录已经被删除，后续会作为当前帧其所属物体的新点（则当前帧不会加入地图）
+            // reserve_new_sift中是那些在当前帧有跟踪到的点，但是其之前所有的观测记录已经被删除，后续会作为当前帧其所属物体的新点（因此其当前帧不会加入地图）
             featureTracker.removeOutliers(removeIndex,reserve_new_sift,reserve_new_FAST);
-            
-            tracker_pts_updated = true;
-            // 确定次新帧和最新帧中保留的特征点观测之后，根据当前最新两帧的全局位姿和恒速运动假设，预测这些点在下一帧左相机坐标系中可能的3D坐标
-            // 预测下一帧的点坐标。放到下一帧的最开始去完成，因为需要知道两帧间的时间差，这样预估才能比较准确，防止掉帧的情况出现
-            // predictPtsInNextFrame();
         }
+        
         // printf("solver costs: %fms\n", t_solve.toc());    
         // ROS_DEBUG("solver costs: %fms", t_solve.toc());
         // 根据当前帧和上一帧的关联点数、当前帧IMU的bias的估计值、当前帧和上一帧之间的相对位移或旋转 来决定当前帧是否跟踪失败
@@ -2512,50 +2682,73 @@ void Estimator::processImage(const double header)
             return;
         }
 
-        cout << "start slide window!" << endl;
-
+        LBA_succ = false;
+    }
+    else
+    {
+        map_fea_optimized = true;
+    }
+    
+    cout << "final estimated translation P of IMU in current frame: " << Ps[frame_count].transpose() << endl;
+    
+    if(frame_count == WINDOW_SIZE)
+    {
+        cout << "Start slide window!" << endl;
         // 滑窗去除某一帧的信息，更新各地图点的信息（观测记录和深度）。该函数最后需要等待子线程完成往地图中添加所有剩余的的静态跟踪点
         slideWindow();
-        map_fea_writen = false;
-        // if(!id_frame_const_pose.empty())
-        // {
-        //     int first_elem = 0;
-        //     int rest_elem = 0;
-        //     int num = id_frame_const_pose.size();
-        //     // set的迭代器默认是const类型的，即无法通过其默认迭代器对set中的元素进行修改
-        //     if(marginalization_flag == MARGIN_OLD)
-        //     {
-        //         if(id_frame_const_pose[0] == 0) first_elem = 1;
-        //         for(int i = first_elem; i < num; ++i)
-        //         {
-        //             id_frame_const_pose[rest_elem] = id_frame_const_pose[i] - 1;
-        //             ++rest_elem;
-        //         }
-        //         id_frame_const_pose.resize(rest_elem);
-        //     }
-        //     else
-        //     {
-        //         for(int i = 0; i < num; ++i)
-        //         {
-        //             if(id_frame_const_pose[i] != WINDOW_SIZE-1) 
-        //             {
-        //                 if(rest_elem < i) id_frame_const_pose[rest_elem] = id_frame_const_pose[i] - 1;
-        //                 ++rest_elem;
-        //             }
-        //         }
-        //         if(rest_elem < num) id_frame_const_pose.resize(rest_elem);
-        //     }
-        // }
-        
-        // 去除掉那些LBA优化和滑窗之后之后深度估计值为负的地图点及其观测记录
+        cout << "Slide window succeed!" << endl;
+    }
+    else
+    {
+        // 对当前帧的跟踪点（这只影响到featureTracker对象中的变量，不会影响到地图）的更新和筛选已完成，通知子线程可以删除无效featureTracker中的无效跟踪点
+        // 当需要marg某一帧时，此值会在slideWindow()函数中设置
+        tracker_pts_updated = true;
+    }
+    
+    // 因为子线程中可能要往地图加入新跟踪点，然而上面不一定执行slideWindow操作（其函数内会等待到地图点写入完成），因此需要在这里阻塞
+    while(!map_fea_writen)
+    {
+        usleep(300);
+    }
+    map_fea_writen = false;
+    
+    // 去除掉那些LBA优化或滑窗之后首观测帧下深度估计值为负（且不会再被跟踪）的地图点
+    // 纯双目允许在滑窗未满时就进行LBA
+    if(LBA_succ || frame_count == WINDOW_SIZE)
+    {
         f_manager.removeFailures();
-        cout << "succeeded remove failue points!" << endl;
-        obj_motion_esti.join();
-        
-        // prepare output of VINS
-        // key_poses.clear();
-        // for (int i = 0; i <= WINDOW_SIZE; i++)
-        //     key_poses.push_back(Ps[i]);
+        cout << "succeeded remove failue points in map!" << endl;
+    }
+    
+    if(frame_count > 0 && (USE_IMU || Use_LBA_for_puer_V))
+    {
+        if(frame_count > 1) featureTracker.fea_with_more_frames_in_map.clear();
+        if(frame_count > 2) featureTracker.fea_with_3_frames_in_map.clear();
+        f_manager.find_long_track_fea_in_map(frame_count, featureTracker.fea_with_more_frames_in_map, featureTracker.fea_with_3_frames_in_map);
+    }
+    
+    // 将下一帧的预积分的初始值设置为当前帧的这些量
+    // Rs[0]和Ps[0]是初始帧IMU坐标系相对于假定的世界坐标系的位姿（此项目中是通过计算前几个加速度测量的平均来假定为初始帧IMU坐标下的g方向，并计算其相对于东北天坐标系的位姿）
+    // 所以使用Rs[0]和Ps[0]只能将初始帧IMU坐标系变换到一个假定的世界坐标系（与东北天坐标系近似）
+    // 这里将当前帧的这些值设置为下一帧的初始值，则之后每一帧在根据IMU测量积分出来的Rs、Ps和Vs都是 该帧IMU相对于 假定世界坐标系 的位姿！
+    // 这里如果还没完成初始化，则应该继续预积分以待完成初始化
+    if(frame_count < WINDOW_SIZE)
+    {
+        // 首个滑窗未满时才会++，当首个滑窗已满后，之后每个新帧的frame_count都是WINDOW_SIZE
+        frame_count++;
+        int prev_frame = frame_count - 1;
+        Ps[frame_count] = Ps[prev_frame];
+        Vs[frame_count] = Vs[prev_frame];
+        Rs[frame_count] = Rs[prev_frame];
+        Bas[frame_count] = Bas[prev_frame];
+        Bgs[frame_count] = Bgs[prev_frame];
+
+        prev_cam_R = cur_cam_R;
+        prev_cam_P = cur_cam_P;
+        if(USE_IMU) prev_td = td;
+    }
+    else
+    {
         // 记录当前滑窗优化和marg后的首帧（如果marg的是首帧，则marg后的首帧是当前滑窗的第2帧）和 尾帧（虽然滑窗内各帧在Rs中移动位置了，但是最后一个元素永远和当前滑窗的最新帧的数据相等）的全局位姿
         last_R = Rs[WINDOW_SIZE];
         last_P = Ps[WINDOW_SIZE];
@@ -2563,24 +2756,19 @@ void Estimator::processImage(const double header)
         last_P0 = Ps[0];
         prev_cam_R = last_R * ric[0];
         prev_cam_P = last_R * tic[0] + last_P;
-        // 取IMU的测量queue中的所有新数据（大于或等与当前图像时间戳+td的时刻的IMU数据），持续积分得到最新的IMU全局状态量的预测
-        // 预测这些量的作用是什么？为什么要在当前帧的最后积分下一帧图像期间要干的事？
-        // 猜测是因为相机的测量频率比IMU的低很多，且此VINS系统的处理帧率也比相机的测量频率高，则在等待下一帧图像到来之前，先尽可能地处理一些accBuf中的测量数据？
-        // 因此作用是在图像处理线程中优化完当前滑窗中所有帧之后，根据queue中新的IMU测量来推测之后最新的IMU位姿，用于尽快视觉化展示
-        // 另外，函数中也只是从accBuf和gyrBuf中复制数据，而没有pop掉它们中的数据，这样也无法较少其中等待被取的数据数量？
-        // 暂时不使用
-        // updateLatestStates();
-
-        cout << "estimated translation P of IMU is: " << Ps[frame_count].transpose() << endl;
-        // prev_height = prev_cam_P(2);
-        cout << "Succeeded process backend of MVIO!" << endl;
-    } 
-
+    }
+    
+    // 注意，这里需要阻塞等待此子线程完成，因为子线程中使用了此线程的局部变量的引用，如果这里结束，则该变量的引用就失效了！
+    obj_motion_esti.join();
+    tria_2d2d_track_done = false;
+    ave_epi_dist_inliers = 0;
     if (!deform_obj_cls.empty()) deform_obj_cls.clear();
     if (!small_solid_objs.empty()) small_solid_objs.clear();
     if (!solid_obj_cls.empty()) solid_obj_cls.clear();
     if (!bbox_mask.empty()) bbox_mask.clear();
     // featureTracker.last_id_track_fea_prev = featureTracker.last_id_sift_cur;
+
+    cout << "Succeeded process backend of MVIO!" << endl;
 }
 
 // 单目-IMU的VI联合初始化函数。
@@ -2934,7 +3122,8 @@ bool Estimator::visualInitialAlign(bool ForStereo)
         f_manager.clearDepth();
         int num_LBA_fea_cur_frame = 0;
         // 用校正之后的各帧位姿来重新得到各个特征地图点在全局坐标系（东北天坐标系）下的3D坐标！
-        f_manager.triangulate(frame_count, Ps, Rs, tic, ric, featureTracker, prev_cam_P_using_imu, prev_cam_R_using_imu, num_LBA_fea_cur_frame);
+        int num_fea_3D_2D = 0;
+        f_manager.triangulate(frame_count, Headers, Ps, Rs, tic, ric, featureTracker, num_fea_3D_2D, prev_cam_P_using_imu, prev_cam_R_using_imu, num_LBA_fea_cur_frame);
     }
     return true;
 }
@@ -3124,7 +3313,7 @@ void Estimator::double2vector()
     for (int i = 0; i < f_manager.getFeatureCount(); i++)
         dep(i) = para_Feature[i][0];
     
-    f_manager.setDepth(dep);
+    f_manager.setDepth(frame_count, dep);
     
     if(USE_IMU)
     {
@@ -3191,6 +3380,214 @@ bool Estimator::failureDetection()
     return false;
 }
 
+void Estimator::filter_outlier_pixel_objs()
+{
+    if(!featureTracker.valid_detect_obj.empty())
+    {
+        int id_obj_in_sample = 0;
+        for(auto &obj_id: featureTracker.valid_detect_obj)
+        {
+            float* ptr_obj = featureTracker.sampled_pixel[id_obj_in_sample] + 2;
+            int num_pixel = (int)ptr_obj[-1];
+            // 至少要有4个采样像素点，才能进行点集深度的MAD计算
+            if(num_pixel > 3)
+            {
+                Vector3d ave_pt;
+                int ave_pt_index = NUM_SAMPLED_PIXEL_OBJ*3 + 4;
+                ave_pt(0) = ptr_obj[ave_pt_index];
+                ave_pt(1) = ptr_obj[ave_pt_index+1];
+                ave_pt(2) = ptr_obj[ave_pt_index+2];
+
+                ave_pt = ave_pt * num_pixel;
+
+                vector<uchar> invalid_pts(num_pixel, 0);
+                // 当前帧检测的物体可能有基于特征点的平均深度值作为先验
+                float ave_dep = featureTracker.ave_dep_cur_objs[obj_id];
+
+                // 对该物体的所有上一帧的点深度值滤除外点！那么是否让特征点也加入（特征点和部分像素点应该有重合？）？如果加入且发现特征点是外点，那么该如何处理？是直接删除了吗？
+                // 是否对匹配点在当前帧的深度也进行外点滤除？不需要，因为PnP只需要3D-2D点。当然对跟踪点在当前帧的深度值也进行滤除，可能可以排除掉flow_map的一些错误匹配？
+                vector<float> dep_pts;
+                vector<int> l_id_pts;
+                float dep;
+                for(int i = 0; i < num_pixel; ++i)
+                {
+                    dep = ptr_obj[(i*3+2)];
+                    if(dep < 1.5 || dep >= mThDepthObj)
+                        invalid_pts[i] = 1;
+                    else
+                    {
+                        // 如果该物体已经有了特征点集的平均深度，则采样像素点的深度不应该离这个深度太远（8m的长度应该足够覆盖大多数常见车型的长度）
+                        if(ave_dep > 0 && ((dep > ave_dep+5.5) || (dep < ave_dep-2.5)))
+                        {
+                            invalid_pts[i] = 1;
+                        }
+                        else
+                        {
+                            dep_pts.push_back(dep);
+                            l_id_pts.push_back(i);
+                        }
+                    }
+                }
+
+                int num_pts = l_id_pts.size();
+                if(num_pts > 3)
+                {
+                    set<int> outliers;
+                    use_MAD_to_filter_dep_outlier(dep_pts, outliers, ave_dep, true);
+                    if(!outliers.empty())
+                    {
+                        for(auto &it: outliers)
+                        {
+                            int l_id = l_id_pts[it];
+                            invalid_pts[l_id] = 1;
+                        }
+                    }
+                    // 如果该局部物体没有来自特征点的平均深度，则赋予采样像素点的平均深度
+                    if(featureTracker.ave_dep_cur_objs[obj_id] <= 0) featureTracker.ave_dep_cur_objs[obj_id] = ave_dep;
+                }
+                else
+                {
+                    if(featureTracker.ave_dep_cur_objs[obj_id] <= 0)
+                    {
+                        if(num_pts > 0) 
+                        {
+                            ave_dep = std::accumulate(dep_pts.begin(), dep_pts.end(), 0.0);
+                            featureTracker.ave_dep_cur_objs[obj_id] = ave_dep;
+                        }
+                        else
+                        {
+                            cout << "Weired! Line 3390" << endl;
+                            exit(-1);
+                        }
+                    }
+                }
+                
+                int num_valid = 0;
+                float dep_pt;
+                Point2f pts, un_pts;
+                Vector3d pt_3d;
+                for(int i = 0; i < num_pixel; ++i)
+                {
+                    if(invalid_pts[i] > 0) 
+                    {
+                        pts.x = ptr_obj[(3*i)];
+                        pts.y = ptr_obj[(3*i+1)];
+                        featureTracker.undistortedPts(pts, un_pts, featureTracker.m_camera[0]);
+                        dep_pt = ptr_obj[(3*i+2)];
+                        pt_3d(0) = un_pts.x * dep_pt;
+                        pt_3d(1) = un_pts.y * dep_pt;
+                        pt_3d(2) = dep_pt;
+
+                        ave_pt = ave_pt - pt_3d;
+                        continue;
+                    }
+
+                    if(num_valid < i)
+                    {
+                        int k = num_valid;
+                        ptr_obj[(3*k)] = ptr_obj[(3*i)];
+                        ptr_obj[(3*k+1)] = ptr_obj[(3*i+1)];
+                        ptr_obj[(3*k+2)] = ptr_obj[(3*i+2)];
+                    }
+                    ++num_valid;
+                }
+
+                if(num_valid < num_pixel)
+                {
+                    if(num_valid > 0)
+                    {
+                        ave_pt = ave_pt/num_valid;
+                        ptr_obj[ave_pt_index] = ave_pt(0);
+                        ptr_obj[ave_pt_index+1] = ave_pt(1);
+                        ptr_obj[ave_pt_index+2] = ave_pt(2);
+                    }
+
+                    ptr_obj[-1] = num_valid;
+                }
+            }
+
+            ++id_obj_in_sample;
+        }
+    }
+}
+
+// 为当前帧完全漏检的物体采集像素点，使用flow_map匹配 和 基于运动模型的重投影 的对比 来获取有效的采样像素点
+Vector3f Estimator::sample_pixel_for_lost_obj(int prev_obj_id, float* ptr_pix_prev, float* ptr_pix_cur, int &num_pixel_cur, Vector3d &delta_P, Matrix3d &delta_R, bool cal_ave_3d_pts)
+{
+    vector<camodocal::CameraPtr> &cam = featureTracker.m_camera;
+    Vector3f ave_3d_pts(0,0,0);
+    float min_u = 0, max_u = 0, min_v = 0, max_v = 0;
+
+    int num_pixel_prev = (int)ptr_pix_prev[-1];
+
+    float flow_pred_u, flow_pred_v, motion_pred_u, motion_pred_v;
+    Point2f tmp_pt, tmp_un_pt;
+    Vector3d pt_prev, pt_cur;
+
+    num_pixel_cur = 0;
+    vector<float> pix_u, pix_v;
+
+    for(int k = 0; k < num_pixel_prev; ++k)
+    {
+        tmp_pt.x = ptr_pix_prev[3*k];
+        tmp_pt.y = ptr_pix_prev[3*k+1];
+        
+        flow_pred_u = map_flow.at<Vec2f>(tmp_pt.y,tmp_pt.x)(0) + tmp_pt.x;
+        flow_pred_v = map_flow.at<Vec2f>(tmp_pt.y,tmp_pt.x)(1) + tmp_pt.y;
+
+        featureTracker.undistortedPts(tmp_pt, tmp_un_pt, cam[0]);
+        pt_prev(2) = ptr_pix_prev[3*k+2];
+        pt_prev(0) = tmp_un_pt.x * pt_prev(2);
+        pt_prev(1) = tmp_un_pt.y * pt_prev(2);
+        pt_cur = delta_R * pt_prev + delta_P;
+        float dep_cur = pt_cur(2);
+        // if (dep_cur < mMinDepthPt || dep_cur > mThDepthObj) continue;
+        if (dep_cur < 1.0 || dep_cur > mThDepthObj) continue;
+        featureTracker.spaceToPlane(pt_cur,tmp_pt,cam[0]);
+        
+        // 是否还要查看投影点是否在图像范围内？有距离约束应该就不会出现这种情况
+        // 相差不超过4个像素点，认为该点属于漏检物体的
+        if((flow_pred_u-tmp_pt.x)*(flow_pred_u-tmp_pt.x) + (flow_pred_v-tmp_pt.y)*(flow_pred_v-tmp_pt.y) < 16)
+        {
+            ptr_pix_cur[(num_pixel_cur*3)]   = tmp_pt.x;
+            ptr_pix_cur[(num_pixel_cur*3+1)] = tmp_pt.y;
+            ptr_pix_cur[(num_pixel_cur*3+2)] = dep_cur;
+
+            pix_u.push_back(tmp_pt.x);
+            pix_v.push_back(tmp_pt.y);
+            
+            ++num_pixel_cur;
+
+            if (cal_ave_3d_pts)
+            {
+                // 需要隐式转换double为float
+                ave_3d_pts(0) = ave_3d_pts(0) + pt_cur(0);
+                ave_3d_pts(1) = ave_3d_pts(1) + pt_cur(1);
+                ave_3d_pts(2) = ave_3d_pts(2) + pt_cur(2);
+            }
+        }
+    }
+    
+    if(num_pixel_cur > 0)
+    {
+        ave_3d_pts = ave_3d_pts/num_pixel_cur;
+        // 当前帧漏检物体的cls label继承自上一帧的匹配物体的全局cls
+        ptr_pix_cur[-2] = ptr_pix_prev[-2];
+        int num_size = 3 * NUM_SAMPLED_PIXEL_OBJ;
+        
+        min_u = *(std::min_element(pix_u.begin(), pix_u.end()));
+        max_u = *(std::max_element(pix_u.begin(), pix_u.end()));
+        min_v = *(std::min_element(pix_v.begin(), pix_v.end()));
+        max_v = *(std::max_element(pix_v.begin(), pix_v.end()));
+        ptr_pix_cur[num_size++] = min_u;
+        ptr_pix_cur[num_size++] = max_u;
+        ptr_pix_cur[num_size++] = min_v;
+        ptr_pix_cur[num_size++] = max_v;
+    }
+    
+    return ave_3d_pts;
+}
+
 // 根据动态物体的特征点在上一帧相机坐标系下的3D坐标，和其在当前帧相机坐标系下的归一化平面的匹配点坐标，计算两帧之间物体的复合运动变换（融合了相机的帧间运动）
 bool Estimator::SolveObjPoseTransByPnP(const FeaFrame &fea_tracked_obj, Vector3d &delta_P, Matrix3d &delta_R, vector<float*> &pixel_lost_objs, const int &valid_objs, Vector3f &ave_3D_pts_obj, int gl_obj_id)
 {
@@ -3203,7 +3600,7 @@ bool Estimator::SolveObjPoseTransByPnP(const FeaFrame &fea_tracked_obj, Vector3d
     map<int,int> &gl_id_index_map = featureTracker.gl_id_index_map;
     vector<float> &prev_FAST_dep = featureTracker.prev_FAST_dep;
     vector<float> &prev_sift_dep = featureTracker.prev_sift_dep;
-
+    
     for (auto &pt:fea_tracked_obj)
     {
         const Vector8d &pt_info = pt.second[0].second;
@@ -3229,7 +3626,7 @@ bool Estimator::SolveObjPoseTransByPnP(const FeaFrame &fea_tracked_obj, Vector3d
             {
                 prev_z = prev_sift_dep[-index];
             }
-
+            
             // 物体点在每一帧下应该都要有深度
             // assert(prev_z > 1.0);
 
@@ -3269,10 +3666,12 @@ bool Estimator::SolveObjPoseTransByPnP(const FeaFrame &fea_tracked_obj, Vector3d
             prev_y_norm = pt_info(6);
             prev_z = pt_info(7);
         }
+
         pts3D.emplace_back(prev_x_norm * prev_z,prev_y_norm * prev_z,prev_z);
         pt_id.insert(pt.first);
         pt_id_vec.push_back(pt.first);
     }
+
     cv::Mat r, rvec, t, D, tmp_r, inliers;
     cv::eigen2cv(delta_R, tmp_r);
     // 旋转矩阵变为旋转向量
@@ -3284,7 +3683,9 @@ bool Estimator::SolveObjPoseTransByPnP(const FeaFrame &fea_tracked_obj, Vector3d
     // 投影误差阈值的经验值8.0是像素坐标系的，而这里要用的是归一化平面坐标
     // FOCAL_LENGTH_X == FOCAL_LENGTH_Y
 
-    pnp_succ = cv::solvePnPRansac(pts3D, pts2D, K, D, rvec, t, true, 100, 4.0 / FOCAL_LENGTH_X, 0.95, inliers);
+    // cout << "Num of 3D-2D track of obj: " << pts3D.size() << endl;
+    pnp_succ = cv::solvePnPRansac(pts3D, pts2D, K, D, rvec, t, true, 100, 4.0 / FOCAL_LENGTH_X, 0.96, inliers);
+
     // 尝试放宽条件
     if (!pnp_succ)
     {
@@ -3292,7 +3693,7 @@ bool Estimator::SolveObjPoseTransByPnP(const FeaFrame &fea_tracked_obj, Vector3d
         cv::Rodrigues(tmp_r, rvec);
         cv::eigen2cv(delta_P, t);
         // 此函数内应该是不会改变非空Mat的inliers的size的，如果直接使用上面的inliers，则两次估计时如果内点数不一样，则数量差异无法体现在inliers中！所以这里使用新的inliers_loose
-        pnp_succ = cv::solvePnPRansac(pts3D, pts2D, K, D, rvec, t, true, 100, 8.0 / FOCAL_LENGTH_X, 0.85, inliers_loose);
+        pnp_succ = cv::solvePnPRansac(pts3D, pts2D, K, D, rvec, t, true, 100, 8.0 / FOCAL_LENGTH_X, 0.90, inliers_loose);
         if(!pnp_succ)
         {
             printf("pnp for object failed ! \n");
@@ -3303,7 +3704,7 @@ bool Estimator::SolveObjPoseTransByPnP(const FeaFrame &fea_tracked_obj, Vector3d
         // copyto works for same size and type matrices, if src and dst Mat have different size or type, before copy data dst Mat will be relocated using create(NewSize,NewType)
         inliers_loose.copyTo(inliers);
     }
-    
+
     // 内点数不至于这么少吧？这个是针对上一帧完全漏检的情况，如果最终内点数太少，则不认为该漏检发现是有效的。
     if (inliers.rows < 4) return false;
 
@@ -3346,9 +3747,9 @@ bool Estimator::SolveObjPoseTransByPnP(const FeaFrame &fea_tracked_obj, Vector3d
             if(index > 0)
             {
                 index -= 1;
-                if(std::find(id_FAST_no_depth.begin(),iter_end_FAST,index) == iter_end_FAST)
+                cur_z = cur_FAST_dep[index];
+                if(cur_z > 0 && std::find(id_FAST_no_depth.begin(),iter_end_FAST,index) == iter_end_FAST)
                 {
-                    cur_z = cur_FAST_dep[index];
                     ave_3D_pts_obj(0) = ave_3D_pts_obj(0) + cur_un_FAST[index].x * cur_z;
                     ave_3D_pts_obj(1) = ave_3D_pts_obj(1) + cur_un_FAST[index].y * cur_z;
                     ave_3D_pts_obj(2) = ave_3D_pts_obj(2) + cur_z;
@@ -3356,6 +3757,7 @@ bool Estimator::SolveObjPoseTransByPnP(const FeaFrame &fea_tracked_obj, Vector3d
                 } 
                 else
                 {
+                    // 通过运动估计来更新当前帧匹配点深度
                     pt_prev(0) = pts3D[id_vec].x;
                     pt_prev(1) = pts3D[id_vec].y;
                     pt_prev(2) = pts3D[id_vec].z;
@@ -3385,10 +3787,11 @@ bool Estimator::SolveObjPoseTransByPnP(const FeaFrame &fea_tracked_obj, Vector3d
             else
             {
                 index = -1 * index;
-                if(std::find(id_sift_no_depth.begin(),iter_end_sift,index) == iter_end_sift)
+                cur_z = cur_sift_dep[index];
+                if(cur_z > 0 && std::find(id_sift_no_depth.begin(),iter_end_sift,index) == iter_end_sift)
                 {
                     ++num_track_fea;
-                    cur_z = cur_sift_dep[index];
+                    
                     ave_3D_pts_obj(0) = ave_3D_pts_obj(0) + cur_un_sift[index].x * cur_z;
                     ave_3D_pts_obj(1) = ave_3D_pts_obj(1) + cur_un_sift[index].y * cur_z;
                     ave_3D_pts_obj(2) = ave_3D_pts_obj(2) + cur_z;
@@ -3494,7 +3897,7 @@ bool Estimator::SolveObjPoseTransByPnP(const FeaFrame &fea_tracked_obj, Vector3d
             float* ptr_pix_cur = featureTracker.sampled_pixel[(valid_objs+id)] + 2;
             int num_pixel_cur = 0;
             
-            sample_pixel_for_lost_obj(ptr_pix_prev, ptr_pix_cur, num_pixel_cur, delta_P, delta_R);
+            sample_pixel_for_lost_obj(gl_obj_id, ptr_pix_prev, ptr_pix_cur, num_pixel_cur, delta_P, delta_R);
             // 修改物体信息
             // 物体的全局cls继承自上一帧的匹配物体
             // auto iter = std::find(featureTracker.glob_obj_id_prev.begin(), featureTracker.glob_obj_id_prev.end(),gl_obj_id);
@@ -3512,87 +3915,12 @@ bool Estimator::SolveObjPoseTransByPnP(const FeaFrame &fea_tracked_obj, Vector3d
     return pnp_succ;
 }
 
-// 为当前帧完全漏检的物体采集像素点，使用flow_map匹配 和 基于运动模型的重投影 的对比 来获取有效的采样像素点
-Vector3f Estimator::sample_pixel_for_lost_obj(float* ptr_pix_prev, float* ptr_pix_cur, int &num_pixel_cur, Vector3d &delta_P, Matrix3d &delta_R, bool cal_ave_3d_pts)
-{
-    vector<camodocal::CameraPtr> &cam = featureTracker.m_camera;
-    Vector3f ave_3d_pts(0,0,0);
-    float min_u = 0, max_u = 0, min_v = 0, max_v = 0;
-
-    int num_pixel_prev = (int)ptr_pix_prev[-1];
-    float flow_pred_u, flow_pred_v, motion_pred_u, motion_pred_v;
-    Point2f tmp_pt, tmp_un_pt;
-    Vector3d pt_prev, pt_cur;
-
-    num_pixel_cur = 0;
-    vector<float> pix_u, pix_v;
-
-    for(int k = 0; k < num_pixel_prev; ++k)
-    {
-        tmp_pt.x = ptr_pix_prev[3*k];
-        tmp_pt.y = ptr_pix_prev[3*k+1];
-        
-        flow_pred_u = map_flow.at<Vec2f>(tmp_pt.y,tmp_pt.x)(0) + tmp_pt.x;
-        flow_pred_v = map_flow.at<Vec2f>(tmp_pt.y,tmp_pt.x)(1) + tmp_pt.y;
-
-        featureTracker.undistortedPts(tmp_pt, tmp_un_pt, cam[0]);
-        pt_prev(2) = ptr_pix_prev[3*k+2];
-        pt_prev(0) = tmp_un_pt.x * pt_prev(2);
-        pt_prev(1) = tmp_un_pt.y * pt_prev(2);
-        pt_cur = delta_R * pt_prev + delta_P;
-        float dep_cur = pt_cur(2);
-        // if (dep_cur < mMinDepthPt || dep_cur > mThDepthObj) continue;
-        if (dep_cur < 1.0 || dep_cur > mThDepthObj) continue;
-        featureTracker.spaceToPlane(pt_cur,tmp_pt,cam[0]);
-        
-        // 是否还要查看投影点是否在图像范围内？有距离约束应该就不会出现这种情况
-        // 相差不超过3个像素点，认为该点属于漏检物体的
-        if((flow_pred_u-tmp_pt.x)*(flow_pred_u-tmp_pt.x) + (flow_pred_v-tmp_pt.y)*(flow_pred_v-tmp_pt.y) < 9)
-        {
-            ptr_pix_cur[(num_pixel_cur*3)]   = tmp_pt.x;
-            ptr_pix_cur[(num_pixel_cur*3+1)] = tmp_pt.y;
-            ptr_pix_cur[(num_pixel_cur*3+2)] = dep_cur;
-
-            pix_u.push_back(tmp_pt.x);
-            pix_v.push_back(tmp_pt.y);
-            
-            ++num_pixel_cur;
-
-            if (cal_ave_3d_pts)
-            {
-                // 需要隐式转换double为float
-                ave_3d_pts(0) = ave_3d_pts(0) + pt_cur(0);
-                ave_3d_pts(1) = ave_3d_pts(1) + pt_cur(1);
-                ave_3d_pts(2) = ave_3d_pts(2) + pt_cur(2);
-            }
-        }
-    }
-    
-    if(num_pixel_cur > 0)
-    {
-        ave_3d_pts = ave_3d_pts/num_pixel_cur;
-        // 当前帧漏检物体的cls label继承自上一帧的匹配物体的全局cls
-        ptr_pix_cur[-2] = ptr_pix_prev[-2];
-        int num_size = 3 * NUM_SAMPLED_PIXEL_OBJ;
-        
-        min_u = *(std::min_element(pix_u.begin(), pix_u.end()));
-        max_u = *(std::max_element(pix_u.begin(), pix_u.end()));
-        min_v = *(std::min_element(pix_v.begin(), pix_v.end()));
-        max_v = *(std::max_element(pix_v.begin(), pix_v.end()));
-        ptr_pix_cur[num_size++] = min_u;
-        ptr_pix_cur[num_size++] = max_u;
-        ptr_pix_cur[num_size++] = min_v;
-        ptr_pix_cur[num_size++] = max_v;
-    }
-    
-    return ave_3d_pts;
-}
 
 // 2000行的主要函数！！
 // 使用openMP对多个物体同时进行RANSAC位姿变换估计
 // 此函数是要作为线程调用函数的，而这里不需要对其实参进行修改并反映到子线程之外的原变量，因此形参全都不需要是左值引用类型，即thread函数对所有传入的参数进行值拷贝即可（要求原变量的内存占用也不大，否则还是用左值引用比较好）
 // 另外，thread函数需要给定其可调用函数对象的所有形参的实参值，不能依靠可调用对象的默认参数值，因此这里函数声明时就无需对initial_succ_prev赋予默认值了（否则浪费。但是如果此函数不需要在子线程中执行，则设置默认参数还是有用的）
-void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCam_1, Vector3d PCam_1, Matrix3d RCam_2, Vector3d PCam_2, int num_inliers_PnP, bool initial_succ_prev)
+void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCam_1, Vector3d PCam_1, Matrix3d RCam_2, Vector3d PCam_2, int &num_inliers_PnP, bool initial_succ_prev)
 {
     cout << "Start estimate motion of objs and process the info of features!" << endl;
     
@@ -3608,10 +3936,11 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
     map<int,int> &FinalTrackCurObj = featureTracker.FinalTrackCurObj;
     // int num_final_valid_obj = FinalTrackCurObj.size();
     map<int,uchar> FinalTrackCurObjCls;
-
+    
     const FeaObjFrame &TrackObjFeaFrame = featureTracker.TrackObjFeaFrame;
     int &pt_id = featureTracker.n_id;
     int &n_obj_id = featureTracker.n_obj_id;
+    int &num_old_track_fea = featureTracker.num_old_track_fea;
     map<int,int> &gl_id_index_map = featureTracker.gl_id_index_map;
     vector<uchar> &status_FAST = featureTracker.statusLeftRIght;
     vector<uchar> &status_sift = featureTracker.status_sift;
@@ -3632,7 +3961,11 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
     map<int, cv::Vec4f> &prev_un_Fea_map = featureTracker.prev_un_Fea_map;
     map<int, cv::Point2f> &prevRightFeaMap = featureTracker.prevRightFeaMap;
 
+    const set<int> &sta_obj_fea_in_map_cur = featureTracker.sta_obj_fea_in_map_cur;
     const set<int> &sta_obj_fea_in_map = featureTracker.sta_obj_fea_in_map;
+    const set<int> &fea_with_more_frames_in_map = featureTracker.fea_with_more_frames_in_map;
+    const set<int> &fea_with_3_frames_in_map = featureTracker.fea_with_3_frames_in_map;
+    const set<int> &g_id_sta_obj_3D2D_high_NCC = featureTracker.g_id_sta_obj_3D2D_high_NCC;
     
     vector<float*> sampled_pixel_lost_obj(detect_lost_objs_cur.size(), nullptr);
 
@@ -3659,11 +3992,15 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
     vector<vector<pair<int,int>>> vec_new_tracked_stat_fea, vec_new_stat_obj_sift;
     vector<pair<int,int>> vec_cur_prev_obj_id;
     vector<uchar> vec_g_cls;
+    // 如果当前系统需要执行LBA，则需要考虑每一帧下的长跟踪点数 和 总的3D-2D跟踪点数 是否满足最小要求（以便后续每一帧都有较大的可能性拥有足够的点观测参与LBA）
+    bool need_LBA = (USE_IMU || Use_LBA_for_puer_V);
+    // if(num_inliers_PnP < Thres_num_track_cur)
+    map<int,int> rest_sta_obj_fea;
 
     bool marg_old = false;
     if (marginalization_flag == MARGIN_OLD) marg_old = true;
 
-    bool add_new_sift_in_next_frame = featureTracker.add_new_sift_in_next_frame;
+    bool add_new_fea_in_next_frame = featureTracker.add_new_fea_in_next_frame;
 
     map<int,uchar> status_objs_prev;
     // map<int,Vector3f> ave_3d_pts_objs;
@@ -3786,7 +4123,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                     // Matrix3d R_init = delta_Rs[i];
                     // Vector3d P_init = delta_Ps[i];
                     bool succ = false;
-                    // 保存运动估计成功的物体的3D特征点的平均坐标，用于与真值物体bbox进行匹配
+                    // 保存运动估计成功的物体的3D特征点的平均坐标，用于计算跟踪精度时与真值物体bbox进行匹配
                     Vector3f ave_3D_pts_obj(0,0,0);
                     // 给定位姿估计的初始值
                     if (i < num_gl_dyn_objs)
@@ -3800,9 +4137,8 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                         int cur_id = id_lost[i-num_gl_dyn_objs];
                         if(featureTracker.TotalLostObjPrevBg.find(cur_id) == featureTracker.TotalLostObjPrevBg.end())
                         {
-                            // cout << "cur_id: " << cur_id << endl;
-                            cout << "Weired!" << endl;
-                            abort();
+                            cout << "Weired! Line 4006" << endl;
+                            exit(-1);
                         }
                         
                         succ = SolveObjPoseTransByPnP(featureTracker.TotalLostObjPrevBg[cur_id], delta_Ps[i], delta_Rs[i], sampled_pixel_lost_obj, valid_objs, ave_3D_pts_obj);
@@ -3830,7 +4166,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                         float r_rpe = acos( ( trace_rpe -1.0 )/2.0 )*180.0/3.1415926;
                         // cout << "the pose change error between camera and object, " << "t: " << t_rpe <<  " R: " << r_rpe << endl;
                         // TODO: 这个相对运动的误差的阈值要仔细地设置，12厘米和1.2度的差别是合适的吗？
-                        if (t_rpe <= 0.15 && r_rpe <= 1)
+                        if (t_rpe <= 0.15 && r_rpe <= 1.2)
                         {
                             is_static[i] = true;
                             cout << "Got a static object!" << endl;
@@ -3869,8 +4205,13 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
             // 下面开始各个物体的特征点信息修改
 
             featureTracker.RP_objs_pred.clear();
-            
-            for(int i = 0; i< num_dyn_objs; ++i)
+            // 等待主线程中完成对变量num_inliers_PnP的更新
+            while(!tria_2d2d_track_done)
+            {
+                usleep(300);
+            }
+
+            for(int i = 0; i < num_dyn_objs; ++i)
             {
                 // 如果是动态物体
                 if (PnPSucc[i] && !is_static[i]) 
@@ -3909,6 +4250,11 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                             // 另外该物体在当前帧还有可能完全漏检
                             if(cur_id == 0)
                             {
+                                if(FinalTrackObj[id_tracked_dyn_objs].second.size() == 1)
+                                {
+                                    cout << "Got a total detect-lost dyn obj in cur frame!" << endl;
+                                }
+
                                 auto iter_lose = std::find(featureTracker.lose_objs_cur_bg.begin(),featureTracker.lose_objs_cur_bg.end(),prev_id);
                                 int id_in_lost = std::distance(featureTracker.lose_objs_cur_bg.begin(), iter_lose);
                                 // 注意，关联异常点不会加入fea_cur_lose_objs中，而是提前被排除了或者修改为背景上的新sift点
@@ -3945,7 +4291,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                         // 运动估计外点sift，如果其深度估计是比较可靠的，且每一帧需要添加新点，则将其作为背景的新点
                                         if(status_sift[index] == 0)
                                         {
-                                            if(!add_new_sift_in_next_frame)
+                                            if(!add_new_fea_in_next_frame)
                                             {
                                                 // 如果该跟踪点的深度是使用depth_map来获得，则认为深度估计不是很可靠，则放弃该点作为新点
                                                 // 注意，虽然当前帧该点在背景区域，但是其跟踪的是上一帧的物体点，所以其在当前帧是否有立体匹配是记录在id_sift_no_depth中的，即物体点的情况
@@ -3994,8 +4340,9 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                     // 注意，这里改变某些特征点的全局id之后，这里的gl_id_index_map的该点的key理论上也要改变，但是由于改后的点的全局id在当前帧不需要用到（而且其他关于特征点信息的变量也是基于旧id，因此这里不修改）！
                                     int index = gl_id_index_map[pt.first];
                                     auto iter = featureTracker.FinalTrackObjFea[prev_id].find(pt.first);
-                                    
+
                                     // 当前帧检测物体上的非关联点 或者 匹配异常点 如果没有立体匹配 则直接去除
+                                    // todo:其实即使该点在当前帧没有立体匹配，也可以保留，等到下一帧其被跟踪到时可以再尝试为其暴力寻找立体匹配。这样可以避免下一帧一些可跟踪物体点的浪费
                                     if (iter == end)
                                     {
                                         if (index > 0)
@@ -4007,8 +4354,6 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                             else
                                             {
                                                 track_cnt_FAST[index] = 1;
-                                                // 对于上一帧完全漏检的物体，则使用当前帧的检测类别来作为全局类别。
-                                                // 注意，该物体的这些点由于不是和上一帧的背景点关联，而是和别的物体相关联，因此其obj_cls_id_sift的first是与其关联物体的全局cls相关联了。这里改为其当前帧检测类别
                                                 obj_cls_id_FAST[index].first = cls_prev;
                                                 // 当前物体为新物体
                                                 obj_cls_id_FAST[index].second = glo_obj_id;
@@ -4073,11 +4418,10 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                                 status_FAST[index] = 1;
                                                 // 修改为动态物体上的新特征点
                                                 track_cnt_FAST[index] = 1;
-                                                
                                                 ids_FAST[index] = pt_id++;
                                                 continue;
                                             }
-                                            
+                                            // ？？？静态点比变为动态点，则其跟踪次数就减少为2，防止其因为长跟踪数而被当作优质点被加入地图？
                                             if (state_prev_obj == 1) 
                                             {
                                                 track_cnt_FAST[index] = 2;
@@ -4100,7 +4444,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                             {
                                                 // 需要该外点有立体匹配，才能保留为新点
                                                 // if (id_sift_no_depth.find(index) != id_sift_no_depth.end() || featureTracker.cur_sift_dep[index] <= 0) 
-                                                if (id_sift_no_depth.find(index)!= id_sift_no_depth.end())
+                                                if (id_sift_no_depth.find(index) != id_sift_no_depth.end())
                                                 {
                                                     continue;
                                                 }
@@ -4108,7 +4452,6 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                                 status_sift[index] = 1;
                                                 // 修改为动态物体上的新特征点
                                                 track_cnt_sift[index] = 1;
-                                                
                                                 ids_sift[index] = pt_id++;
                                                 
                                                 continue;
@@ -4141,7 +4484,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                         featureTracker.RP_objs_pred.insert(make_pair(glo_obj_id,temp_pair));
                     }
                     // 上一帧完全漏检的物体。这种情况下无法使用像素点匹配
-                    // TODO：（其实如果有逆向光流估计的话，则可以根据当前帧的物体寻找上一帧的匹配背景点）
+                    // todo:（其实如果有逆向光流估计的话，则可以根据当前帧的物体寻找上一帧的匹配漏检点）
                     else
                     {
                         int cur_id = id_lost[i-num_gl_dyn_objs];
@@ -4152,9 +4495,20 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                         // 而容器在重新分配内存时会自动将旧的内存回收，但是旧的迭代器在函数退出时要被销毁，而销毁迭代器同时默认销毁它所指向的内存的内容，但是该内存早已被demalloc！
                         // FeaFrame::iterator end = featureTracker.TotalLostObjPrevBg[cur_id].end();
                         // 随机取一个匹配点的像素坐标
-                        float x = featureTracker.TotalLostObjPrevBg[cur_id].begin()->second[0].second(3);
-                        float y = featureTracker.TotalLostObjPrevBg[cur_id].begin()->second[0].second(4);
-                        uchar cls_cur = cls_map.at<uchar>(y,x);
+                        // float x = featureTracker.TotalLostObjPrevBg[cur_id].begin()->second[0].second(3);
+                        // float y = featureTracker.TotalLostObjPrevBg[cur_id].begin()->second[0].second(4);
+                        // uchar cls_cur = cls_map.at<uchar>(y,x);
+
+                        uchar cls_cur = 0;
+                        if(bbox_mask.find(cur_id) == bbox_mask.end())
+                        {
+                            cout << "Weired! Line 4368" << endl;
+                            exit(-1);
+                        }
+                        else
+                        {
+                            cls_cur = bbox_mask[cur_id].class_label;
+                        }
 
                         for(const auto &pt: featureTracker.TrackObjFeaFrame[cur_id])
                         {
@@ -4313,7 +4667,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                     {
                                         // 是否将所有跟踪点保留为新特征点
                                         int index = -1 * index;
-                                        if(add_new_sift_in_next_frame)
+                                        if(add_new_fea_in_next_frame)
                                         {
                                             status_sift[index] = 0;
                                             continue;
@@ -4411,6 +4765,11 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                             // 把在 物体关联阶段被当作异常点 和 在运动估计时被当作外点的 的背景sift跟踪点 改为当前帧背景中新的sift特征点。
                             if(cur_id == 0)
                             {
+                                if(FinalTrackObj[id_tracked_dyn_objs].second.size() == 1)
+                                {
+                                    cout << "Found a total detect-lost static obj in cur frame!" << endl;
+                                }
+
                                 auto iter_lose = std::find(featureTracker.lose_objs_cur_bg.begin(),featureTracker.lose_objs_cur_bg.end(),prev_id);
                                 int id_in_lost;
                                 if(iter_lose != featureTracker.lose_objs_cur_bg.end())
@@ -4426,30 +4785,72 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                     if (index <= 0)
                                     {
                                         index = -1 *index;
+                                        
                                         // 如果是匹配和运动估计内点
                                         if(status_sift[index] != 0)
                                         {
-                                            // 只要当前帧不是marg次新帧，则无论上一帧是否已经VI初始化，只要PnP后静态跟踪内点数量不足，则添加当前帧静态跟踪点的观测。
-                                            // 要考虑该物体的距离，太远的物体点也不适合加入地图
-                                            if (frame_count < WINDOW_SIZE || marg_old)
+                                            int new_id = lost_pt_in_bg;
+                                            // 该物体如果在上一帧为动态，则这些跟踪点只承认最新这两帧的观测为静态点的。
+                                            // 对于上一帧部分漏检的点，因为它是从属于上一帧的该物体的，因此其运动属性应该也相同，则对这些漏检点的cnt操作与此相同。
+                                            if (state_prev_obj == 0) 
                                             {
-                                                // 当前帧PnP得到的静态跟踪内点是否足够多
-                                                if(num_inliers_PnP < Thres_num_track_cur)
+                                                track_cnt_sift[index] = 2;
+                                                // 如果修改了该点的cnt，是否也要修改该点的全局id?修改后即使该点加入地图，也不会担心该点在地图中的观测不连续
+                                                // 最后还是选择不改变其全局id，因为改变后该点如果在下面要作为当前帧的新静态跟踪点补充到地图中会比较麻烦（在rest_sta_obj_fea中要同时记录其新旧id）
+                                                // 如果在map中发现其该点最终没法形成连续的观测，则删除该点在此前的所有记录，只记录该点最新2帧的观测（如果当前帧帧还要marg次新帧，则放弃该点的加入）
+                                                // new_id = pt_id;
+                                                // ids_sift[index] = pt_id++;
+                                            }
+
+                                            bool selected_pt = false;
+                                            // 只要当前帧不是marg次新帧，则无论上一帧是否已经VI初始化，只要PnP后静态跟踪内点数量不足，则添加当前帧静态跟踪点的观测。
+                                            // 如果marg最老帧，则说明次新帧与次次新帧之间的视差较大（或者跟踪点较少），总之就是之后有跟踪丢失的风险，则考虑把当前帧所有的跟踪点都加入到地图（后续加入多少，根据长距离点和跟踪点的数量来决定）
+                                            // 只选取那些较近且跟踪NCC值较高的静态物体点,这意味这该物体在上一帧就是静态物体了！上一帧新物体即使在当前帧确定为静态，其点也暂不加入（因为不知道跟踪质量如何，即NCC值多高）
+                                            if(frame_count < WINDOW_SIZE || marg_old)
+                                            {
+                                                // 只有当需要LBA时，才需要保证当前帧或者下一帧会有足够的长跟踪点（大于等于连续3帧观测）
+                                                if(need_LBA)
                                                 {
-                                                    float dep = prev_sift_dep[index];
-                                                    // 如果marg最老帧，则说明次新帧与次次新帧之间的视差较大（或者跟踪点较少），总之就是之后有跟踪丢失的风险，则考虑把当前帧所有的跟踪点都加入到地图（后续加入多少，根据长距离点和跟踪点的数量来决定）
-                                                    if(dep > 0 && dep <= 7) 
+                                                    // 先尽可能保证当前帧地图中有足够的长跟踪点（大于等于3帧观测），虽然这些添加的点不会参与当前帧的LBA。最后再保证有足够多的跟踪点（使得下一帧时会有一定的旧点）
+                                                    // 如果系统的滑窗长度大于3，则优先添加那些已经在地图中有>=2帧观测的点（且该点上一帧观测已经在地图中）
+                                                    // 否则，如果滑窗长度为3，则某个点就算加入当前帧观测可以形成>=3的观测帧数，但是由于当前滑窗要marg最老帧，其最终的地图帧数仍为2
+                                                    // 是否要限制长跟踪点的数量？
+                                                    // if(WINDOW_SIZE > 2)
+                                                    if(WINDOW_SIZE > 2)
                                                     {
-                                                        new_tracked_stat_fea.emplace_back(lost_pt_in_bg,lost_pt_in_bg);
-                                                        ++num_inliers_PnP;
+                                                        if(num_old_track_fea < Min_num_old_track_per_frame)
+                                                        {
+                                                            if(fea_with_more_frames_in_map.find(lost_pt_in_bg) != fea_with_more_frames_in_map.end())
+                                                            {
+                                                                ++num_old_track_fea;
+                                                                ++num_inliers_PnP;
+                                                                new_tracked_stat_fea.emplace_back(lost_pt_in_bg,new_id);
+                                                                selected_pt = true;
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    if(!selected_pt)
+                                                    {
+                                                        // +5的原因是防止在LBA后某些长跟踪点不满足平均重投影误差而被删除，从而导致该点无法加入成为新的地图点，因此这里做一定的冗余处理
+                                                        if(num_inliers_PnP < (Thres_num_track_cur+5))
+                                                        {
+                                                            // 当前帧得到的静态跟踪内点是否足够多，这间接关系到下一帧是否能有足够的长跟踪点去参与LBA
+                                                            // 要考虑该物体的距离，太远的物体点也不适合加入地图?
+                                                            // 是否只从旧静态物体的高NCC值的跟踪点中选取？这些点既然上一帧不在地图中，似乎除了跟踪NCC值确定较高以外，与其他的（新或旧）静态物体的跟踪点没有区别？
+                                                            // 选择暂时记录那些较近的静态物体的跟踪点，这其中就会包括g_id_sta_obj_3D2D_high_NCC中的点，最后如果要添加，则优先添加其中属于g_id_sta_obj_3D2D_high_NCC中的点(track的NCC值较高)
+                                                            float dep = prev_sift_dep[index];
+                                                            // 无需关注该点上一帧是否已经在地图，因为对于仅3帧长度的滑窗而言，marg后无论如何该点在地图中都只剩下2帧观测
+                                                            if(dep > 0 && dep <= Th_dep_sta_obj_fea_to_add && prevRightFeaMap.find(lost_pt_in_bg) != prevRightFeaMap.end())
+                                                            // if(sta_obj_fea_in_map.find(lost_pt_in_bg) != sta_obj_fea_in_map.end()) 
+                                                            {
+                                                                rest_sta_obj_fea[lost_pt_in_bg] = cur_id;
+                                                            }
+                                                        }
                                                     }
                                                 }
-
-                                                // 该物体如果在上一帧为动态，则这些跟踪点只承认最新这两帧的观测为静态点的。
-                                                // 对于上一帧部分漏检的点，因为它是从属于上一帧的该物体的，因此其运动属性应该也相同，则对这些漏检点的cnt操作与此相同。
-                                                if (state_prev_obj == 0) track_cnt_sift[index] = 2;
                                             }
-                                            // 滑窗已满且当前帧需要marg次新帧，则看上一帧是否已经完成了VI初始化
+                                            // 滑窗已满且当前帧需要marg次新帧
                                             else
                                             {
                                                 // 如果该点是上一帧的物体新点，当前帧确认为静态点，且上一帧该点有立体深度估计，当前帧没有深度估计，但是又刚好要marg次新帧，则应该及时将上一帧的物体点加入地图！
@@ -4461,26 +4862,38 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                                 
                                                 // 如果当前帧marg次新帧，那么需要将该静态点的跟踪次数减1吗？
                                                 // 减掉1代表着该点的上一帧观测不会被加入地图及参与当前帧的LBA，这样一来，track_cnt_sift就代表着一个静态点能够在当前地图中保留的观测帧数的最大值。
-                                                // 但是对于静态物体点而言，如果其一开始没有被加入地图，而是跟踪几帧后才开始加入，那么这里减1似乎没什么意义？最后决定不减1，减少操作时间
+                                                // 但是对于静态物体点而言，如果其一开始没有被加入地图，而是跟踪几帧后才开始加入，那么这里减1似乎没什么意义？可以不减1以减少操作时间。
+                                                // 最后决定不减1，因为这代表着该点在当前帧是跟踪点，有来自运动更新后的深度（假如需要的话），下一帧如果该点被跟踪后可以使用此来自运动更新的深度值
                                                 // track_cnt_sift[index] = track_cnt_sift[index] - 1;
 
-                                                // 如果上一帧该物体是动态点，则其有效的静态观测为2帧
-                                                if (state_prev_obj == 0) 
+                                                if(need_LBA)
                                                 {
-                                                    // 又因为上一帧要被marg掉，则实际有效观测只剩下1帧。最后决定marg次新帧也不将静态点的cnt_track减1
-                                                    // track_cnt_sift[index] = 1;
-                                                    track_cnt_sift[index] = 2;
-                                                }
-
-                                                if (initial_succ_prev)
-                                                {
-                                                    // 如果上一帧已VI初始化，则将那些一直以来都是静态点，且已连续被观测到足够多帧的点观测加入地图
-                                                    // 将该跟踪点最新帧观察加入地图后，即使当前滑窗后续marg掉次新帧的观测（该点一定参与了LBA和次新帧的marg），该点在下一滑窗中不论下一帧有没有被跟踪到都至少还有足够的帧观测数量（可以参与LBA和marg）
-                                                    // 注意，即使该静态点实际被观测帧数是这么多，不意味着这里将其加入地图后 其在地图中的观测帧数会等于这个数（因为物体点不一定从一开始就加入地图）。但是有可能形成足够多帧的地图点，后续如果不足，则删除即可
-                                                    if(track_cnt_sift[index] >= (TH_NUM_FRAME_FOR_LBA+1) && state_prev_obj == 1 && prev_sift_dep[index] <= 5)
+                                                    if(WINDOW_SIZE > 2)
                                                     {
-                                                        new_tracked_stat_fea.emplace_back(lost_pt_in_bg,lost_pt_in_bg);
-                                                        ++num_inliers_PnP;
+                                                        if(num_old_track_fea < Min_num_old_track_per_frame)
+                                                        {
+                                                            if(fea_with_3_frames_in_map.find(lost_pt_in_bg) != fea_with_3_frames_in_map.end()) 
+                                                            {
+                                                                new_tracked_stat_fea.emplace_back(lost_pt_in_bg,lost_pt_in_bg);
+                                                                ++num_inliers_PnP;
+                                                                ++num_old_track_fea;
+                                                                selected_pt = true;
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    if(!selected_pt && num_inliers_PnP < (Thres_num_track_cur+5))
+                                                    {
+                                                        // 如果该静态物体点在上一帧已经加入地图,但是该点在地图中的观测帧数不一定大于1吧？
+                                                        // 将该跟踪点最新帧观察加入地图后，即使当前滑窗后续marg掉次新帧的观测（该点一定参与了LBA和次新帧的marg），该点在下一滑窗中不论下一帧有没有被跟踪到都至少还有足够的帧观测数量（可以参与LBA和marg）
+                                                        // 注意，即使该静态点实际被观测帧数是这么多，不意味着这里将其加入地图后 其在地图中的观测帧数会等于这个数（因为物体点不一定从一开始就加入地图），滑窗也会不断marg某一帧。
+                                                        // 但是有可能形成足够多帧的地图点，后续如果不足，则删除即可？
+                                                        // 最后的选择是：如果当前帧要marg次新帧，则只选择那些在地图中至少已经有2帧观测的点（且该点上一帧也在地图中）
+                                                        if(fea_with_more_frames_in_map.find(lost_pt_in_bg) != fea_with_more_frames_in_map.end())
+                                                        {
+                                                            new_tracked_stat_fea.emplace_back(lost_pt_in_bg,lost_pt_in_bg);
+                                                            ++num_inliers_PnP;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -4488,10 +4901,9 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                         }
                                         // 如果是运动估计外点，则将深度可靠的点改为背景中的新点
                                         // 如果当前帧不需要保留背景中的新点
-                                        if(add_new_sift_in_next_frame) continue;
+                                        if(add_new_fea_in_next_frame) continue;
 
                                         if (id_sift_no_depth.find(index) != id_sift_no_depth.end()) continue;
-                                        
                                         if(cur_sift_dep[index] > 0)
                                         {
                                             if(featureTracker.TrackObjFeaFrame[0][lost_pt_in_bg].size() == 2)
@@ -4517,45 +4929,75 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                         // 如果是运动估计内点
                                         if(status_FAST[index] != 0)
                                         {
-                                            if ((frame_count < WINDOW_SIZE || marg_old))
+                                            int new_id = lost_pt_in_bg;
+                                            if (state_prev_obj == 0) 
+                                            {
+                                                track_cnt_FAST[index] = 2;
+                                                // new_id = pt_id;
+                                                // ids_FAST[index] = pt_id++;
+                                            }
+
+                                            bool selected_pt = false;
+
+                                            if((frame_count < WINDOW_SIZE || marg_old))
                                             {
                                                 // 当前帧PnP得到的静态跟踪内点是否足够多
-                                                if(num_inliers_PnP < Thres_num_track_cur)
+                                                if(need_LBA)
                                                 {
-                                                    float dep = prev_FAST_dep[index];
-                                                    // 如果marg最老帧，则说明次新帧与次次新帧之间的视差较大（或者跟踪点较少），总之就是之后有跟踪丢失的风险，则考虑把当前帧所有的跟踪点都加入到地图（后续加入多少，根据长距离点和跟踪点的数量来决定）
-                                                    if(dep > 0 && dep <= 7) 
+                                                    if(WINDOW_SIZE > 2)
                                                     {
-                                                        new_tracked_stat_fea.emplace_back(lost_pt_in_bg,lost_pt_in_bg);
-                                                        ++num_inliers_PnP;
+                                                        if(num_old_track_fea < Min_num_old_track_per_frame)
+                                                        {
+                                                            if(fea_with_more_frames_in_map.find(lost_pt_in_bg) != fea_with_more_frames_in_map.end())
+                                                            {
+                                                                new_tracked_stat_fea.emplace_back(lost_pt_in_bg,new_id);
+                                                                ++num_inliers_PnP;
+                                                                ++num_old_track_fea;
+                                                                selected_pt = true;
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    if(!selected_pt)
+                                                    {
+                                                        if(num_inliers_PnP < (Thres_num_track_cur+5))
+                                                        {
+                                                            float dep = prev_FAST_dep[index];
+                                                            if(dep > 0 && dep <= Th_dep_sta_obj_fea_to_add && prevRightFeaMap.find(lost_pt_in_bg) != prevRightFeaMap.end())
+                                                            {
+                                                                rest_sta_obj_fea[lost_pt_in_bg] = cur_id;
+                                                            }
+                                                        }
                                                     }
                                                 }
-                                                
-                                                if (state_prev_obj == 0) track_cnt_FAST[index] = 2;
                                             }
                                             else
                                             {
-                                                // 如果该点是上一帧的物体新点，当前帧确认为静态点，但是又刚好要marg次新帧，则应该及时将上一帧的物体点加入地图！
-                                                // 不需要，理由同上！
-                                                // if(track_cnt_FAST[i] == 2) 
-                                                // {
-                                                //     new_tracked_stat_fea.emplace_back(lost_pt_in_bg,lost_pt_in_bg);
-                                                // }
-                                                
-                                                // track_cnt_FAST[i] = track_cnt_FAST[i] - 1;
-                                                
-                                                if (state_prev_obj == 0) 
+                                                // track_cnt_FAST[index] -= 1;
+                                                if(need_LBA)
                                                 {
-                                                    // track_cnt_FAST[index] = 1;
-                                                    track_cnt_FAST[index] = 2;
-                                                }
-
-                                                if (initial_succ_prev)
-                                                {
-                                                    if(track_cnt_FAST[index] >= (TH_NUM_FRAME_FOR_LBA+1) && state_prev_obj == 1)
+                                                    if(WINDOW_SIZE > 2)
                                                     {
-                                                        float dep = prev_FAST_dep[index];
-                                                        if(dep > 0 && dep <= 5)
+                                                        if(num_old_track_fea < Min_num_old_track_per_frame)
+                                                        {
+                                                            if(fea_with_3_frames_in_map.find(lost_pt_in_bg) != fea_with_3_frames_in_map.end()) 
+                                                            {
+                                                                new_tracked_stat_fea.emplace_back(lost_pt_in_bg,lost_pt_in_bg);
+                                                                ++num_inliers_PnP;
+                                                                ++num_old_track_fea;
+                                                                selected_pt = true;
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    if(!selected_pt && num_inliers_PnP < (Thres_num_track_cur+5))
+                                                    {
+                                                        // 如果该静态物体点在上一帧已经加入地图,但是该点在地图中的观测帧数不一定大于1吧？
+                                                        // 将该跟踪点最新帧观察加入地图后，即使当前滑窗后续marg掉次新帧的观测（该点一定参与了LBA和次新帧的marg），该点在下一滑窗中不论下一帧有没有被跟踪到都至少还有足够的帧观测数量（可以参与LBA和marg）
+                                                        // 注意，即使该静态点实际被观测帧数是这么多，不意味着这里将其加入地图后 其在地图中的观测帧数会等于这个数（因为物体点不一定从一开始就加入地图），滑窗也会不断marg某一帧。
+                                                        // 但是有可能形成足够多帧的地图点，后续如果不足，则删除即可？
+                                                        // 最后的选择是：如果当前帧要marg次新帧，则只选择那些在地图中至少已经有2帧观测的点（且该点上一帧也在地图中）
+                                                        if(fea_with_more_frames_in_map.find(lost_pt_in_bg) != fea_with_more_frames_in_map.end())
                                                         {
                                                             new_tracked_stat_fea.emplace_back(lost_pt_in_bg,lost_pt_in_bg);
                                                             ++num_inliers_PnP;
@@ -4573,16 +5015,16 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                             else
                             {
                                 // FeaFrame::iterator end = featureTracker.FinalTrackObjFea[prev_id].end();
-
                                 for(const auto &pt: featureTracker.TrackObjFeaFrame[cur_id])
                                 {
-                                    int index = gl_id_index_map[pt.first];
+                                    int g_id = pt.first;
+                                    int index = gl_id_index_map[g_id];
                                     
-                                    auto iter = featureTracker.FinalTrackObjFea[prev_id].find(pt.first);
+                                    auto iter = featureTracker.FinalTrackObjFea[prev_id].find(g_id);
                                     // 物体上非关联的特征点或异常匹配点如果没有立体匹配则直接去除，不恢复为新点
                                     if (iter == featureTracker.FinalTrackObjFea[prev_id].end())
                                     {
-                                        if (index > 0)
+                                        if(index > 0)
                                         {
                                             index -= 1;
                                             if(status_FAST[index] != 1)
@@ -4641,47 +5083,81 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
 
                                                 // 新特征点必须有立体匹配
                                                 status_FAST[index] = 1;
-                                                
                                                 track_cnt_FAST[index] = 1;
-
                                                 ids_FAST[index] = pt_id++;
                                                 continue;
                                             }
                                             
-                                            int id_pt = ids_FAST[index];
+                                            int new_id = g_id;
+                                            if (state_prev_obj == 0) 
+                                            {
+                                                track_cnt_FAST[index] = 2;
+                                                // new_id = pt_id;
+                                                // ids_FAST[index] = pt_id++;
+                                            }
+
+                                            bool selected_pt = false;
+                                            
                                             if ((frame_count < WINDOW_SIZE || marg_old))
                                             {
-                                                if(num_inliers_PnP < Thres_num_track_cur)
+                                                if(need_LBA)
                                                 {
-                                                    float dep = prev_FAST_dep[index];
-                                                    // 如果marg最老帧，则说明次新帧与次次新帧之间的视差较大（或者跟踪点较少），总之就是之后有跟踪丢失的风险，则考虑把当前帧所有的跟踪点都加入到地图（后续加入多少，根据长距离点和跟踪点的数量来决定）
-                                                    if(dep > 0 && dep <= 7) 
+                                                    if(WINDOW_SIZE > 2)
                                                     {
-                                                        new_tracked_stat_fea.emplace_back(id_pt,id_pt);
-                                                        ++num_inliers_PnP;
+                                                        if(num_old_track_fea < Min_num_old_track_per_frame)
+                                                        {
+                                                            if(fea_with_more_frames_in_map.find(g_id) != fea_with_more_frames_in_map.end())
+                                                            {
+                                                                new_tracked_stat_fea.emplace_back(g_id,new_id);
+                                                                ++num_inliers_PnP;
+                                                                ++num_old_track_fea;
+                                                                selected_pt = true;
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    if(!selected_pt)
+                                                    {
+                                                        if(num_inliers_PnP < (Thres_num_track_cur+5))
+                                                        {
+                                                            float dep = prev_FAST_dep[index];
+                                                            if(dep > 0 && dep <= Th_dep_sta_obj_fea_to_add && prevRightFeaMap.find(g_id) != prevRightFeaMap.end())
+                                                            {
+                                                                rest_sta_obj_fea[g_id] = cur_id;
+                                                            }
+                                                        }
                                                     }
                                                 }
-                                                
-                                                if (state_prev_obj == 0) track_cnt_FAST[index] = 2;
                                             }
                                             else
                                             {
-                                                // track_cnt_FAST[i] = track_cnt_FAST[i] - 1;
-
-                                                if (state_prev_obj == 0) 
+                                                // track_cnt_FAST[index] -= 1;
+                                                if(need_LBA)
                                                 {
-                                                    // track_cnt_FAST[index] = 1;
-                                                    track_cnt_FAST[index] = 2;
-                                                }
-
-                                                if (initial_succ_prev)
-                                                {
-                                                    if(track_cnt_FAST[index] >= (TH_NUM_FRAME_FOR_LBA+1) && state_prev_obj == 1)
+                                                    if(WINDOW_SIZE > 2)
                                                     {
-                                                        float dep = prev_FAST_dep[index];
-                                                        if(dep > 0 && dep <= 5)
+                                                        if(num_old_track_fea < Min_num_old_track_per_frame)
                                                         {
-                                                            new_tracked_stat_fea.emplace_back(id_pt,id_pt);
+                                                            if(fea_with_3_frames_in_map.find(g_id) != fea_with_3_frames_in_map.end()) 
+                                                            {
+                                                                new_tracked_stat_fea.emplace_back(g_id,g_id);
+                                                                ++num_inliers_PnP;
+                                                                ++num_old_track_fea;
+                                                                selected_pt = true;
+                                                            }
+                                                        }
+                                                    }
+
+                                                    if(!selected_pt && num_inliers_PnP < (Thres_num_track_cur+5))
+                                                    {
+                                                        // 如果该静态物体点在上一帧已经加入地图,但是该点在地图中的观测帧数不一定大于1吧？
+                                                        // 将该跟踪点最新帧观察加入地图后，即使当前滑窗后续marg掉次新帧的观测（该点一定参与了LBA和次新帧的marg），该点在下一滑窗中不论下一帧有没有被跟踪到都至少还有足够的帧观测数量（可以参与LBA和marg）
+                                                        // 注意，即使该静态点实际被观测帧数是这么多，不意味着这里将其加入地图后 其在地图中的观测帧数会等于这个数（因为物体点不一定从一开始就加入地图），滑窗也会不断marg某一帧。
+                                                        // 但是有可能形成足够多帧的地图点，后续如果不足，则删除即可？
+                                                        // 最后的选择是：如果当前帧要marg次新帧，则只选择那些在地图中至少已经有2帧观测的点（且该点上一帧也在地图中）
+                                                        if(fea_with_more_frames_in_map.find(g_id) != fea_with_more_frames_in_map.end())
+                                                        {
+                                                            new_tracked_stat_fea.emplace_back(g_id,g_id);
                                                             ++num_inliers_PnP;
                                                         }
                                                     }
@@ -4702,53 +5178,83 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                             {
                                                 // 该点在当前帧必须有立体匹配
                                                 if (cur_sift_dep[index] <= 0 || id_sift_no_depth.find(index)!= id_sift_no_depth.end()) continue;
-                                                
                                                 status_sift[index] = 1;
-                                                
                                                 track_cnt_sift[index] = 1;
-                                                
                                                 ids_sift[index] = pt_id++;
-                                               
                                                 continue;
                                             }
 
-                                            // 物体上的运动估计内点
-                                            int id_pt = ids_sift[index];
-                                            if ((frame_count < WINDOW_SIZE || marg_old))
+                                            int new_id = g_id;
+                                            if (state_prev_obj == 0) 
                                             {
-                                                if(num_inliers_PnP < Thres_num_track_cur)
+                                                track_cnt_sift[index] = 2;
+                                                // new_id = pt_id;
+                                                // ids_sift[index] = pt_id++;
+                                            }
+
+                                            bool selected_pt = false;
+
+                                            // 物体上的运动估计内点
+                                            if((frame_count < WINDOW_SIZE || marg_old))
+                                            {
+                                                if(need_LBA)
                                                 {
-                                                    float dep = prev_sift_dep[index];
-                                                    // 如果marg最老帧，则说明次新帧与次次新帧之间的视差较大（或者跟踪点较少），总之就是之后有跟踪丢失的风险，则考虑把当前帧所有的跟踪点都加入到地图（后续加入多少，根据长距离点和跟踪点的数量来决定）
-                                                    if(dep > 0 && dep <= 7) 
+                                                    if(WINDOW_SIZE > 2)
                                                     {
-                                                        new_tracked_stat_fea.emplace_back(id_pt,id_pt);
-                                                        ++num_inliers_PnP;
+                                                        if(num_old_track_fea < Min_num_old_track_per_frame)
+                                                        {
+                                                            if(fea_with_more_frames_in_map.find(g_id) != fea_with_more_frames_in_map.end())
+                                                            {
+                                                                new_tracked_stat_fea.emplace_back(g_id,new_id);
+                                                                ++num_inliers_PnP;
+                                                                ++num_old_track_fea;
+                                                                selected_pt = true;
+                                                            }
+                                                        }
+                                                    }
+
+                                                    if(!selected_pt)
+                                                    {
+                                                        if(num_inliers_PnP < (Thres_num_track_cur+5))
+                                                        {
+                                                            float dep = prev_sift_dep[index];
+                                                            if(dep > 0 && dep <= Th_dep_sta_obj_fea_to_add && prevRightFeaMap.find(g_id) != prevRightFeaMap.end())
+                                                            {
+                                                                rest_sta_obj_fea[g_id] = cur_id;
+                                                            }
+                                                        }
                                                     }
                                                 }
-
-                                                if (state_prev_obj == 0) track_cnt_sift[index] = 2;
                                             }
                                             // 如果要marg次新帧，且该点观测帧数足够其下一帧参与LBA，则把当前帧的观测加入
                                             else
                                             { 
-                                                // track_cnt_sift[i] = track_cnt_sift[i] - 1;
-
-                                                if (state_prev_obj == 0) 
+                                                // track_cnt_sift[index] = track_cnt_sift[i] - 1;
+                                                if(WINDOW_SIZE > 2)
                                                 {
-                                                    // track_cnt_sift[index] = 1;
-                                                    track_cnt_sift[index] = 2;
-                                                }
-
-                                                if (initial_succ_prev)
-                                                {
-                                                    if(track_cnt_sift[index] >= (TH_NUM_FRAME_FOR_LBA+1) && state_prev_obj == 1)
+                                                    if(num_old_track_fea < Min_num_old_track_per_frame)
                                                     {
-                                                        float dep = prev_sift_dep[index];
-                                                        if(dep > 0 && dep <= 5)
+                                                        if(fea_with_3_frames_in_map.find(g_id) != fea_with_3_frames_in_map.end()) 
                                                         {
-                                                            new_tracked_stat_fea.emplace_back(id_pt,id_pt);
+                                                            new_tracked_stat_fea.emplace_back(g_id,g_id);
+                                                            ++num_inliers_PnP;
+                                                            ++num_old_track_fea;
+                                                            selected_pt = true;
                                                         }
+                                                    }
+                                                }
+                                                
+                                                if(!selected_pt && num_inliers_PnP < (Thres_num_track_cur+5))
+                                                {
+                                                    // 如果该静态物体点在上一帧已经加入地图,但是该点在地图中的观测帧数不一定大于1吧？
+                                                    // 将该跟踪点最新帧观察加入地图后，即使当前滑窗后续marg掉次新帧的观测（该点一定参与了LBA和次新帧的marg），该点在下一滑窗中不论下一帧有没有被跟踪到都至少还有足够的帧观测数量（可以参与LBA和marg）
+                                                    // 注意，即使该静态点实际被观测帧数是这么多，不意味着这里将其加入地图后 其在地图中的观测帧数会等于这个数（因为物体点不一定从一开始就加入地图），滑窗也会不断marg某一帧。
+                                                    // 但是有可能形成足够多帧的地图点，后续如果不足，则删除即可？
+                                                    // 最后的选择是：如果当前帧要marg次新帧，则只选择那些在地图中至少已经有2帧观测的点（且该点上一帧也在地图中）
+                                                    if(fea_with_more_frames_in_map.find(g_id) != fea_with_more_frames_in_map.end())
+                                                    {
+                                                        new_tracked_stat_fea.emplace_back(g_id,g_id);
+                                                        ++num_inliers_PnP;
                                                     }
                                                 }
                                             }
@@ -4759,15 +5265,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                 FinalTrackCurObj[cur_id] = prev_id;
                                 FinalTrackCurObjCls[cur_id] = cls_prev;
                             }
-                            // 记录当前帧该物体的全局id和全局cls label
-                            featureTracker.glob_obj_id_prev.push_back(prev_id);
-                            featureTracker.obj_cls_prev.push_back(cls_prev);
-
-                            // 记录跟踪到的全局静态物体
-                            featureTracker.id_gl_sta_obj.insert(prev_id);
-
-                            // 静态物体为1
-                            featureTracker.status_objs_prev[prev_id] = 1;
+                            
                             // 将当前帧的该静态物体（可能只是整个物体的一部分被检测为一个单独的物体）的匹配内点和新检测点都加入静态地图。
                             // 如果该物体在上一帧就是静态物体，则在静态地图中就已经有上一帧该物体的所有特征点了（如果上一帧该物体有部分漏检，则这些特征点也是在背景中，会被加入静态地图）
                             if (new_tracked_stat_fea.size() > 0)
@@ -4793,6 +5291,14 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                             //     vec_new_stat_obj_sift.push_back(vector<pair<int,int>>());
                         }
                         // 如果上一帧该物体有部分漏检，则应该检查这些点的全局跟踪次数是否等于2，如果大于2，则说明其上上帧也是背景点，则它当前帧不应该变成物体点。这种情况在特征点跟踪时就排除了
+
+                        // 记录该跟踪物体的全局id和全局cls label
+                        featureTracker.glob_obj_id_prev.push_back(prev_id);
+                        featureTracker.obj_cls_prev.push_back(cls_prev);
+                        // 记录跟踪到的全局静态物体
+                        featureTracker.id_gl_sta_obj.insert(prev_id);
+                        // 静态物体为1
+                        featureTracker.status_objs_prev[prev_id] = 1;
                     }
                     // 对于上一帧中完全漏检的物体，其在当前帧中只会与一个物体相关联，则该物体将作为新静态物体
                     else
@@ -4803,15 +5309,26 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                         int cur_id = id_lost[i-num_gl_dyn_objs];
                         // FeaFrame::iterator end = featureTracker.TotalLostObjPrevBg[cur_id].end();
                         // 随机取一个匹配点的像素坐标
-                        float x = featureTracker.TotalLostObjPrevBg[cur_id].begin()->second[0].second(3);
-                        float y = featureTracker.TotalLostObjPrevBg[cur_id].begin()->second[0].second(4);
-                        uchar cls_cur = cls_map.at<uchar>(y,x);
+                        // float x = featureTracker.TotalLostObjPrevBg[cur_id].begin()->second[0].second(3);
+                        // float y = featureTracker.TotalLostObjPrevBg[cur_id].begin()->second[0].second(4);
+                        // uchar cls_cur = cls_map.at<uchar>(y,x);
+                        uchar cls_cur = 0;
+                        if(bbox_mask.find(cur_id) == bbox_mask.end())
+                        {
+                            cout << "Weired! Line 5226" << endl;
+                            exit(-1);
+                        }
+                        else
+                        {
+                            cls_cur = bbox_mask[cur_id].class_label;
+                        }
                         
                         for(const auto &pt: featureTracker.TrackObjFeaFrame[cur_id])
                         {
-                            int index = gl_id_index_map[pt.first];
+                            int g_id = pt.first;
+                            int index = gl_id_index_map[g_id];
                             // 如果不是匹配物体之间的关联点（匹配错物体，或者异常的匹配），则去除FAST点，保留sift点作为新特征点
-                            if (featureTracker.TotalLostObjPrevBg[cur_id].find(pt.first) == featureTracker.TotalLostObjPrevBg[cur_id].end())
+                            if (featureTracker.TotalLostObjPrevBg[cur_id].find(g_id) == featureTracker.TotalLostObjPrevBg[cur_id].end())
                             {
                                 if(index > 0)
                                 {
@@ -4875,20 +5392,20 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                         continue;
                                     }
                                     
-                                    int id = ids_FAST[index];
-                                    float dep = prev_FAST_dep[index];
+                                    // 对于漏检的静态物体，暂时不添加其跟踪点到地图点
+                                    // float dep = prev_FAST_dep[index];
                                     // obj_cls_id_FAST[index] = std::pair<uchar,int>(cls_cur,0);                           
-                                    if ((frame_count < WINDOW_SIZE || marg_old))
-                                    {
-                                        if(num_inliers_PnP < Thres_num_track_cur)
-                                        {
-                                            if(dep > 0 && dep <= 7)
-                                            {
-                                                new_tracked_stat_fea.emplace_back(id,id);
-                                                ++num_inliers_PnP;
-                                            }
-                                        }
-                                    }
+                                    // if ((frame_count < WINDOW_SIZE || marg_old))
+                                    // {
+                                    //     if(num_inliers_PnP < Thres_num_track_cur)
+                                    //     {
+                                    //         if(dep > 0 && dep <= 10)
+                                    //         {
+                                    //             new_tracked_stat_fea.emplace_back(g_id,g_id);
+                                    //             ++num_inliers_PnP;
+                                    //         }
+                                    //     }
+                                    // }
                                     // 上一帧完全漏检的物体点最多只有2帧观测
                                     // else
                                     // {
@@ -4899,7 +5416,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                     //         if(track_cnt_FAST[index] >= (TH_NUM_FRAME_FOR_LBA+1))
                                     //         {
                                     //             if(dep > 0 && dep <= 5)
-                                    //             new_tracked_stat_fea.emplace_back(id_pt,id_pt);
+                                    //             new_tracked_stat_fea.emplace_back(g_id,g_id);
                                     //         }
                                     //     }
                                     // }
@@ -4927,21 +5444,21 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
 
                                     // 如果是运动估计的内点
                                     track_cnt_sift[index] = 2;
-                                    int id = ids_sift[index];
                                     
+                                    // 对于漏检的静态物体，暂时不添加其跟踪点到地图点
                                     // 如果不是marg当前次新帧
-                                    if ((frame_count < WINDOW_SIZE || marg_old))
-                                    {
-                                        if(num_inliers_PnP < Thres_num_track_cur)
-                                        {
-                                            float dep = prev_sift_dep[index];
-                                            if(dep > 0 && dep <= 7)
-                                            {
-                                                new_tracked_stat_fea.emplace_back(id,id);
-                                                ++num_inliers_PnP;
-                                            }
-                                        }
-                                    }
+                                    // if ((frame_count < WINDOW_SIZE || marg_old))
+                                    // {
+                                    //     if(num_inliers_PnP < Thres_num_track_cur)
+                                    //     {
+                                    //         float dep = prev_sift_dep[index];
+                                    //         if(dep > 0 && dep <= 10)
+                                    //         {
+                                    //             new_tracked_stat_fea.emplace_back(g_id,g_id);
+                                    //             ++num_inliers_PnP;
+                                    //         }
+                                    //     }
+                                    // }
                                     // 上一帧完全漏检的物体点最多只有2帧观测
                                     // else
                                     // {
@@ -4951,8 +5468,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                     //         if(track_cnt_sift[index] >= (TH_NUM_FRAME_FOR_LBA+1))
                                     //         {
                                     //             if(dep > 0 && dep <= 5)
-                                    //                 new_tracked_stat_fea.emplace_back(id_pt,id_pt);
-                                    //         }
+                                    //                 new_tracked_stat_fea.emplace_back(g_id,g_id);
                                     //     }
                                     // }
                                 }
@@ -5058,6 +5574,10 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                 int cur_id = (*iter).second[i];
                 if (cur_id == 0)
                 {
+                    if((*iter).second.size() == 1)
+                    {
+                        cout << "Found a total detect-lost obj (during objs-matching) in cur frame!" << endl;
+                    }
                     // 该全局静态物体在当前帧中有漏检
                     auto iter_lose = std::find(featureTracker.lose_objs_cur_bg.begin(),featureTracker.lose_objs_cur_bg.end(),prev_id);
                     int id_in_lost = std::distance(featureTracker.lose_objs_cur_bg.begin(), iter_lose);
@@ -5066,6 +5586,8 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                     {
                         // 对于当前帧背景中的漏检部分跟踪点而言，其与上一帧匹配点的cls是对齐的，因此不需要修改cls
                         int index = gl_id_index_map[lost_pt_in_bg];
+                        float dep;
+                        bool add_as_new_track = false;
                         // sift点只是需要修改那些异常匹配点为背景点
                         if(index <= 0)
                         {
@@ -5078,7 +5600,8 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                             // 因此这里的条件应该是不会成立的
                             if(status_sift[index] == 0)
                             {
-                                if(add_new_sift_in_next_frame) continue;
+                                if(add_new_fea_in_next_frame) continue;
+
                                 // 深度估计不可靠的点则放弃
                                 if (id_sift_no_depth.find(index)!= id_sift_no_depth.end() || cur_sift_dep[index] <= 0) 
                                 {
@@ -5106,16 +5629,16 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                             // 更新匹配内点的深度值。
                             // 这里只负责更新那些静态物体上当前帧观测还未加入地图的跟踪点的深度
                             // 所有超过2帧观测的跟踪点（深度要小于阈值，可以参与LBA） 和 一部分只有2帧观测的点（需要上一帧有立体匹配且深度值较小） 已经在地图中了（这些在相机位姿估计线程中进行更新）
-                            if(sta_obj_fea_in_map.find(lost_pt_in_bg) == sta_obj_fea_in_map.end())
+                            if(sta_obj_fea_in_map_cur.find(lost_pt_in_bg) == sta_obj_fea_in_map_cur.end())
                             {
-                                float dep = prev_sift_dep[index];
+                                dep = prev_sift_dep[index];
                                 if(dep <= 0) 
                                 {
                                     status_sift[index] = 0;
                                     continue;
                                 }
                                 
-                                // 只更新那些没有立体匹配的物体点
+                                // 只更新那些当前帧没有立体匹配的物体点的深度
                                 if(id_sift_no_depth.find(index) != id_sift_no_depth.end()) 
                                 {
                                     pt_prev(2) = dep;
@@ -5124,7 +5647,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                     pt_cur = Cam_R_Trans * pt_prev + Cam_P_Trans;
                                     cur_z = pt_cur(2);
                                     // if (cur_z < mMinDepthPt || cur_z > mThDepthObj)
-                                    if (cur_z < 1.2 || cur_z > (1.2 * mThDepthObj))
+                                    if (cur_z < 1.0 || cur_z >= (1.1 * mThDepthObj))
                                     {
                                         status_sift[index] = 0;
                                         continue;
@@ -5132,67 +5655,23 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                     else
                                         cur_sift_dep[index] = cur_z;
 
+                                    // todo:是否要计算重投影误差来筛选该点，毕竟该物体没有进行运动估计并与PnP得到的相机运动进行比较？？
+
                                     // 这些静态物体点之所以前面没有加入地图，就是因为它们的深度不满足要求（上一帧没有立体匹配，或者深度值大于阈值）
                                     // 这里是否还有必要将它们加入地图？如果其在上一帧没有立体匹配，则不加入
                                 }
                                 
-                                
-                                // 之前没加入不一定是这些点不满足要求吧？看tracker中添加静态物体点的条件
-
-                                // 当前帧不是marg次新帧，则看PnP后的内点和上面已经添加的点是否已经足够
-                                // 如果marg最老帧，则说明次新帧与次次新帧之间的视差较大（或者跟踪点较少），总之就是之后有跟踪丢失的风险，则考虑把当前帧所有的跟踪点都加入到地图（后续加入多少，根据长距离点和跟踪点的数量来决定）
-                                if ((frame_count < WINDOW_SIZE || marg_old))
-                                {
-                                    if(num_inliers_PnP < Thres_num_track_cur)
-                                    {
-                                        // 需要该点在上一帧有立体匹配
-                                        if(track_cnt_sift[index] == 2)
-                                        {
-                                            if(prevRightFeaMap.find(lost_pt_in_bg) != prevRightFeaMap.end())
-                                            {
-                                                if(dep <= 7) 
-                                                {
-                                                    new_tracked_stat_fea.emplace_back(lost_pt_in_bg,lost_pt_in_bg);
-                                                    ++num_inliers_PnP;
-                                                }
-                                            }
-                                        }
-                                        else
-                                        {
-                                            // 增加后续参与LBA的点
-                                            if(dep <= 5) 
-                                            {
-                                                new_tracked_stat_fea.emplace_back(lost_pt_in_bg,lost_pt_in_bg);
-                                                ++num_inliers_PnP;
-                                            }
-                                        }
-                                    }
-                                }
-                                // 如果要marg次新帧，且该点观测帧数足够其下一帧参与LBA，则把当前帧的观测加入
-                                else
-                                { 
-                                    // track_cnt_sift[i] = track_cnt_sift[i] - 1;
-
-                                    if (initial_succ_prev)
-                                    {
-                                        if(track_cnt_sift[index] >= (TH_NUM_FRAME_FOR_LBA+1))
-                                        {
-                                            if(dep <= 5)
-                                            {
-                                                new_tracked_stat_fea.emplace_back(lost_pt_in_bg,lost_pt_in_bg);
-                                            }
-                                        }
-                                    }
-                                }
+                                add_as_new_track = true;
                             }
                         }
                         else
                         {
                             index -= 1;
+                            // todo:关联阶段的异常匹配FAST点，如果在当前帧有立体匹配，则是否将其作为背景的新点？
                             // 此条件同样不会成立。因为关联物体的漏检部分不会加入这些异常匹配点
                             if(status_FAST[index] == 0) continue;
-
-                            if(sta_obj_fea_in_map.find(lost_pt_in_bg) == sta_obj_fea_in_map.end())
+                            
+                            if(sta_obj_fea_in_map_cur.find(lost_pt_in_bg) == sta_obj_fea_in_map_cur.end())
                             {
                                 float dep = prev_FAST_dep[index];
                                 if(dep <= 0) 
@@ -5219,48 +5698,69 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                         cur_FAST_dep[index] = cur_z;
                                 }
                             
-                                // 是否将该点加入地图
-                                if ((frame_count < WINDOW_SIZE || marg_old))
+                                add_as_new_track = true;
+                            }
+                        }
+
+                        // 如果系统需要LBA，则查看PnP后的内点和上面已经添加的点是否已经足够
+                        // 需要该点还未加入地图
+                        if(add_as_new_track)
+                        {
+                            if(need_LBA)
+                            {
+                                bool selected_pt = false;
+                                // 如果marg最老帧
+                                if((frame_count < WINDOW_SIZE || marg_old))
                                 {
-                                    if(num_inliers_PnP < Thres_num_track_cur)
+                                    if(WINDOW_SIZE > 2)
                                     {
-                                        // 如果仅有2帧观测，则需要该点在上一帧有立体匹配
-                                        if(track_cnt_FAST[index] == 2)
+                                        if(num_old_track_fea < Min_num_old_track_per_frame)
                                         {
-                                            if(prevRightFeaMap.find(lost_pt_in_bg) != prevRightFeaMap.end())
-                                            {
-                                                if(dep <= 7) 
-                                                {
-                                                    new_tracked_stat_fea.emplace_back(lost_pt_in_bg,lost_pt_in_bg);
-                                                    ++num_inliers_PnP;
-                                                }
-                                            }
-                                        }
-                                        else
-                                        {
-                                            // 增加后续参与LBA的点
-                                            if(dep <= 5) 
+                                            if(fea_with_more_frames_in_map.find(lost_pt_in_bg) != fea_with_more_frames_in_map.end())
                                             {
                                                 new_tracked_stat_fea.emplace_back(lost_pt_in_bg,lost_pt_in_bg);
                                                 ++num_inliers_PnP;
+                                                ++num_old_track_fea;
+                                                selected_pt = true;
+                                            }
+                                        }
+                                    }
+                                    
+                                    if(!selected_pt)
+                                    {
+                                        if(num_inliers_PnP < (Thres_num_track_cur+5))
+                                        {
+                                            if(dep > 0 && dep <= Th_dep_sta_obj_fea_to_add && prevRightFeaMap.find(lost_pt_in_bg) != prevRightFeaMap.end())
+                                            {
+                                                rest_sta_obj_fea[lost_pt_in_bg] = cur_id;
                                             }
                                         }
                                     }
                                 }
-                                // 如果要marg次新帧，且该点观测帧数足够其下一帧参与LBA，则把当前帧的观测加入
+                                // 如果要marg次新帧
                                 else
-                                { 
-                                    // track_cnt_FAST[i] = track_cnt_FAST[i] - 1;
-
-                                    if (initial_succ_prev)
+                                {
+                                    // track_cnt_sift[index] -= 1;
+                                    if(WINDOW_SIZE > 2)
                                     {
-                                        if(track_cnt_FAST[index] >= (TH_NUM_FRAME_FOR_LBA+1))
+                                        if(num_old_track_fea < Min_num_old_track_per_frame)
                                         {
-                                            if(dep <= 5)
+                                            if(fea_with_3_frames_in_map.find(lost_pt_in_bg) != fea_with_3_frames_in_map.end()) 
                                             {
                                                 new_tracked_stat_fea.emplace_back(lost_pt_in_bg,lost_pt_in_bg);
                                                 ++num_inliers_PnP;
+                                                ++num_old_track_fea;
+                                                selected_pt = true;
                                             }
+                                        }
+                                    }
+                                    
+                                    if(!selected_pt && num_inliers_PnP < (Thres_num_track_cur+5))
+                                    {
+                                        if(fea_with_more_frames_in_map.find(lost_pt_in_bg) != fea_with_more_frames_in_map.end())
+                                        {
+                                            new_tracked_stat_fea.emplace_back(lost_pt_in_bg,lost_pt_in_bg);
+                                            ++num_inliers_PnP;
                                         }
                                     }
                                 }
@@ -5295,7 +5795,8 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                     // 早已确定为静态的物体在FinalTrackObjFea中的点应该都是有效跟踪点
                                     if(status_pt == 0)
                                     {
-                                        assert(false);
+                                        // assert(false);
+                                        cout << "Weired! Line 5701" << endl;
                                     }
 
                                     // 点的cls都是对齐自上一帧的，除非上一帧的匹配点是背景点
@@ -5314,7 +5815,8 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                     status_pt = status_sift[(-index)];
                                     if(status_pt == 0)
                                     {
-                                        assert(false);
+                                        // assert(false);
+                                        cout << "Weired! Line 5798" << endl;
                                     }
 
                                     obj_cls_id_sift[(-index)].second = 0;
@@ -5329,7 +5831,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
 
                                 int cnt_track = 0;
                                 // 这里只更新那些没加入地图的静态物体点的深度。那些加入地图的点则在其他函数中更新深度
-                                if(sta_obj_fea_in_map.find(cur_pt_id) == sta_obj_fea_in_map.end())
+                                if(featureTracker.sta_obj_fea_in_map_cur.find(cur_pt_id) == featureTracker.sta_obj_fea_in_map_cur.end())
                                 {
                                     // 只更新那些没有立体匹配的点的深度
                                     if (status_pt == 1) 
@@ -5373,43 +5875,55 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                         }
                                     }
 
-                                    if ((frame_count < WINDOW_SIZE || marg_old))
+                                    if(need_LBA)
                                     {
-                                        if(num_inliers_PnP < Thres_num_track_cur)
+                                        bool selected_pt = false;
+                                        if((frame_count < WINDOW_SIZE || marg_old))
                                         {
-                                            // 如果仅有2帧观测，则需要该点在上一帧有立体匹配
-                                            if(cnt_track == 2)
+                                            if(WINDOW_SIZE > 2)
                                             {
-                                                if(prevRightFeaMap.find(cur_pt_id) != prevRightFeaMap.end())
+                                                if(num_old_track_fea < Min_num_old_track_per_frame)
                                                 {
-                                                    if(dep <= 7) 
+                                                    if(fea_with_more_frames_in_map.find(cur_pt_id) != fea_with_more_frames_in_map.end())
                                                     {
                                                         new_tracked_stat_fea.emplace_back(cur_pt_id,cur_pt_id);
                                                         ++num_inliers_PnP;
+                                                        ++num_old_track_fea;
+                                                        selected_pt = true;
                                                     }
                                                 }
                                             }
-                                            else
+                                            
+                                            if(!selected_pt)
                                             {
-                                                // 增加后续参与LBA的点。无论其在上一帧中是否有立体匹配
-                                                if(dep <= 5) 
+                                                if(num_inliers_PnP < (Thres_num_track_cur+5))
                                                 {
-                                                    new_tracked_stat_fea.emplace_back(cur_pt_id,cur_pt_id);
-                                                    ++num_inliers_PnP;
+                                                    if(dep > 0 && dep <= Th_dep_sta_obj_fea_to_add && prevRightFeaMap.find(cur_pt_id) != prevRightFeaMap.end())
+                                                    {
+                                                        rest_sta_obj_fea[cur_pt_id] = cur_id;
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
-                                    // 如果要marg次新帧，且该点观测帧数足够其下一帧参与LBA，则把当前帧的观测加入
-                                    else
-                                    { 
-                                        // track_cnt_FAST[i] = track_cnt_FAST[i] - 1;
-
-                                        if (initial_succ_prev)
+                                        else
                                         {
-                                            if(cnt_track >= (TH_NUM_FRAME_FOR_LBA+1))
+                                            if(WINDOW_SIZE > 2)
                                             {
-                                                if(dep <= 5)
+                                                if(num_old_track_fea < Min_num_old_track_per_frame)
+                                                {
+                                                    if(fea_with_3_frames_in_map.find(cur_pt_id) != fea_with_3_frames_in_map.end()) 
+                                                    {
+                                                        new_tracked_stat_fea.emplace_back(cur_pt_id,cur_pt_id);
+                                                        ++num_inliers_PnP;
+                                                        ++num_old_track_fea;
+                                                        selected_pt = true;
+                                                    }
+                                                }
+                                            }
+                                            
+                                            if(!selected_pt && num_inliers_PnP < (Thres_num_track_cur+5))
+                                            {
+                                                if(fea_with_more_frames_in_map.find(cur_pt_id) != fea_with_more_frames_in_map.end())
                                                 {
                                                     new_tracked_stat_fea.emplace_back(cur_pt_id,cur_pt_id);
                                                     ++num_inliers_PnP;
@@ -5482,7 +5996,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
             featureTracker.status_objs_prev[prev_id] = 1;
             // 记录跟踪到的全局静态物体
             featureTracker.id_gl_sta_obj.insert(prev_id);
-
+            
             // 物体关联阶段已经确定的静态物体中，存在有在当前帧完全漏检的,则同样需要获取其在当前帧中的采样像素点
             if(detect_lost_objs_cur.size() > num_lost)
             {
@@ -5493,11 +6007,10 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                 else
                 {
                     int id_lost = std::distance(detect_lost_objs_cur.begin(), iter_lost);
-
                     if(featureTracker.pixel_objs_prev.find(prev_id) == featureTracker.pixel_objs_prev.end())
                     {
-                        cout << "Weired!" << endl;
-                        abort();
+                        cout << "Weired! Line 5941" << endl;
+                        exit(-1);
                     }
 
                     float* ptr_pix_prev = featureTracker.pixel_objs_prev[prev_id];
@@ -5507,18 +6020,18 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
 
                     int num_pixel_cur = 0;
                     // 根据相机运动估计结果来传播该物体的像素点
-                    Vector3f ave_3d_pts = sample_pixel_for_lost_obj(ptr_pix_prev, ptr_pix_cur, num_pixel_cur, Cam_P_Trans, Cam_R_Trans, true);
+                    Vector3f ave_3d_pts = sample_pixel_for_lost_obj(prev_id, ptr_pix_prev, ptr_pix_cur, num_pixel_cur, Cam_P_Trans, Cam_R_Trans, true);
                     // 物体的全局cls继承自上一帧的匹配物体，在sample_pixel_for_lost_obj函数内已获取
                     // ptr_pix_cur[-2] = cls_prev;
                     ptr_pix_cur[-1] = num_pixel_cur;
                     // 静态物体在当前帧的平均3D点。物体关联阶段暂时只计算了该物体的3D点的平均深度，且不一定是特征点的（也可能是使用像素采样点完成的关联验证）。
                     // TODO：这里暂时使用此静态物体的采样像素点的3D值的平均。如果为了提高精度，可以使用该静态物体的3D特征点的平均？
+                    // 不需要，一来是每一帧都会对各个保留的物体进行采样点深度的异常点滤除，二来是特征跟踪点一般较少
                     ptr_pix_cur[(3*NUM_SAMPLED_PIXEL_OBJ+4)] = ave_3d_pts(0);
                     ptr_pix_cur[(3*NUM_SAMPLED_PIXEL_OBJ+5)] = ave_3d_pts(1);
                     ptr_pix_cur[(3*NUM_SAMPLED_PIXEL_OBJ+6)] = ave_3d_pts(2);
                     // 保存采样像素点的内存指针
                     sampled_pixel_lost_obj[id_lost] = ptr_pix_cur;
-
                     ++num_lost;
                 }
             }
@@ -5542,6 +6055,10 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
         usleep(300);
     }
     done_sample = false;
+
+    // 使用MAD滤除每个物体的采样像素点中的异常深度点，更新每个物体的3D平均点和平均深度值
+    filter_outlier_pixel_objs();
+
     int num_new = 0;
     // 遍历new objs，改变其track fea为new fea，添加新物体。新物体的点无需加入静态地图（因为不知道其是否为静态）
     for (const auto &obj_id: featureTracker.new_objs_cur)
@@ -5557,14 +6074,13 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
         // abort();
 
         // 像素点的深度来自于depth_map，而立体匹配网络的最大有效视差为192，换算下来最小深度值为2.0
-        // if(depth_ave < mMinDepthPt || depth_ave > mThDepthObj)
-        if(depth_ave < 2.0 || depth_ave > mThDepthObj)
+        if(depth_ave < mMinDepthPt || depth_ave > mThDepthObj)
+        // if(depth_ave < 2.0 || depth_ave > mThDepthObj)
         {
             invalid_new_objs.insert(obj_id);
-
             continue;
         }
-
+        
         int num_fea = 0;
         if(featureTracker.NewObjFeaFrame.find(obj_id) != featureTracker.NewObjFeaFrame.end())
             num_fea += featureTracker.NewObjFeaFrame[obj_id].size();
@@ -5697,7 +6213,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
         }
     }
     cout << "Num of new object: " << num_new << endl;
-
+    
     // 删除无效新物体的所有点
     if(!invalid_new_objs.empty())
     {
@@ -5747,7 +6263,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
         }
     }
     invalid_new_objs.clear();
-
+    
     // for(auto iter: featureTracker.status_objs_prev)
     // {
     //     cout << "status_objs_prev: " << iter.first << endl;
@@ -5902,7 +6418,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
     int &num_new_sift_bg = featureTracker.num_new_sift_bg;
     int &num_bg_sift_with_dep = featureTracker.num_bg_sift_with_dep;
 
-    // 相机运动估计（此时VI还未初始化）和LBA 后是否有当前帧跟踪的sift点被作为外点，如果有，则将其保留为当前帧该物体的新点。
+    // 相机运动估计（此时VI还未初始化）和LBA 后是否有当前帧跟踪的物体sift点被作为外点，如果有，则将其保留为当前帧该物体的新点。
     // 这些保留点的要求是在当前帧中必须要有深度估计（即立体匹配）
     if (reserve_new_sift.size() > 0)
     {
@@ -5924,7 +6440,11 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
             if(det_obj_id != 0)
             {
                 // 当前帧的特征点应该不会是无效的非刚体或无效类别的点
-                assert(FinalTrackCurObjCls.find(det_obj_id) != FinalTrackCurObjCls.end());
+                if(FinalTrackCurObjCls.find(det_obj_id) == FinalTrackCurObjCls.end())
+                {
+                    cout << "Weired! Line 6209" << endl;
+                    exit(-1);
+                }
                 gl_cls = FinalTrackCurObjCls[det_obj_id];
             }
             
@@ -5943,7 +6463,8 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
             // 但是，是否需要检查一下该点所属的局部物体在当前帧中是否还有足够特征点（跟踪内点和新特征点）使得它还能称为一个物体并与某全局物体相关联？无所谓，即使它特征点数很少，大不了就是下一帧跟踪该物体失败！
             if(det_cls == 0)
             {
-                if(add_new_sift_in_next_frame)
+                // 本系统中暂时不会在当前帧保留新的背景点
+                if(add_new_fea_in_next_frame)
                 {
                     status_sift[index] = 0;
                     continue;
@@ -5998,7 +6519,11 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
             if(det_obj_id != 0)
             {
                 // 当前帧的特征点应该不会是无效的非刚体或无效类别的点
-                assert(FinalTrackCurObjCls.find(det_obj_id) != FinalTrackCurObjCls.end());
+                if(FinalTrackCurObjCls.find(det_obj_id) == FinalTrackCurObjCls.end())
+                {
+                    cout << "Weired! Line 6295" << endl;
+                    exit(-1);
+                }
                 gl_cls = FinalTrackCurObjCls[det_obj_id];
             }
 
@@ -6014,7 +6539,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
             // 实际上背景中的FAST跟踪外点是不会保留为新点的，因为认为其匹配精度不够高。
             if(det_cls == 0)
             {
-                if(add_new_sift_in_next_frame)
+                if(add_new_fea_in_next_frame)
                 {
                     status_FAST[index] = 0;
                     continue;
@@ -6032,7 +6557,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
             {
                 int gl_obj_id = FinalTrackCurObj[det_obj_id];
                 obj_cls_id_FAST[index].first = gl_cls;
-
+                
                 assert(featureTracker.status_objs_prev.find(gl_obj_id) != featureTracker.status_objs_prev.end());
                 // 如果最终该物体为静态物体
                 if(featureTracker.status_objs_prev[gl_obj_id] == 1)
@@ -6049,7 +6574,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
         }
     }
 
-    // 这是针对那些 在LBA之后被认定为外点的当前帧跟踪点（包括背景跟踪点，以及部分静态物体点（还未加入地图）），则这里需要将它们全部删除。还要防止它们被作为已有静态点的新观测加入地图
+    // 这是针对那些 在LBA之后通过平均重投影误差（与帧间匹配和首帧深度估计相关）被认定为外点的当前帧跟踪点（包括背景跟踪点，以及部分静态物体点（还未加入地图）），则这里需要将它们全部删除。还要防止它们被作为已有静态点的新观测加入地图
     if(direct_erase_fea.size() > 0)
     {
         for(auto &pts:direct_erase_fea)
@@ -6079,57 +6604,107 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
 
     // 这里选择暂时不再当前帧把背景或者任何静态物体的新特征点加入静态地图，而是等到下一帧跟踪到该点并且仍然为静态物体时才将两帧观测一起加入！
     
-    // 添加当前帧背景的新sift点到静态地图中。但是不添加
+    // 添加当前帧背景的新sift点到静态地图中。暂时不添加新点
     // if (!new_bg_sift.empty())
     // {
     //     f_manager.addStaticFeature(frame_count, prev_td, cur_td_old, FeatureTracker, new_bg_sift, 0, true, false);
     // }
 
+    bool need_marg = (frame_count >= WINDOW_SIZE);
     // 添加静态物体上的跟踪点观测。这里添加的跟踪点，有一部分是在运动估计后才确认为静态的物体上的点（其中有些是观测帧数大于4，因此无论当前帧marg哪一帧，都要添加该点），有一部分可能是所有静态物体的仅有2帧跟踪的点（即上一滑窗已完成初始化)
-    if (vec_new_tracked_stat_fea.size() > 0)
+    if (!vec_new_tracked_stat_fea.empty())
     {
-        for(int i = 0; i < vec_new_tracked_stat_fea.size(); ++i)
+        int num_ = vec_new_tracked_stat_fea.size();
+        for(int i = 0; i < num_; ++i)
         {
             int prev_id = vec_cur_prev_obj_id[i].second;
-            uchar glo_cls = vec_g_cls[i];
+            // uchar glo_cls = vec_g_cls[i];
             if (prev_id > 0)
             {
                 // 上一帧非完全漏检的物体，其在当前帧的匹配点中还可能会有背景漏检点。另外，上一帧的物体还可能部分漏检！
-                if(vec_new_tracked_stat_fea[i].size() == 0)
-                    assert(false && "It is impossible that the num of track point for two matched objects is zero!");
-                
-                // !注意，这里status_objs_prev和featureTracker.status_objs_prev已经是不同的变量！前者是当前函数内的临时变量，后者是已经被clear，用于存放新一帧的物体的状态信息！
-                if(status_objs_prev[prev_id] == 1)
-                    f_manager.addStaticFeature(frame_count, prev_td, cur_td_old, featureTracker, vec_new_tracked_stat_fea[i], vec_cur_prev_obj_id[i].first, reserve_fea, direct_erase_fea);
-                // 如果上一帧的该物体为动态或者新物体，则其特征点肯定还没有在地图中（有没有可能是先静态，后动态，当前帧又静态？这种情况下跟踪已不连续，当作是两个不同的静态物体了）
-                else
-                    f_manager.addStaticFeature(frame_count, prev_td, cur_td_old, featureTracker, vec_new_tracked_stat_fea[i], vec_cur_prev_obj_id[i].first, reserve_fea, direct_erase_fea);  
-                
-                // 这里可以保存当前帧静态物体的信息？
+                if(vec_new_tracked_stat_fea[i].size() > 0)
+                {
+                    // !注意，这里status_objs_prev和featureTracker.status_objs_prev已经是不同的变量！前者是当前函数内的临时变量，后者是已经被clear，用于存放新一帧的物体的状态信息！
+                    // if(status_objs_prev[prev_id] == 1)
+                    {
+                        int num_fail = f_manager.addStaticFeature(frame_count, prev_td, cur_td_old, featureTracker, Ps, Rs, tic, ric, vec_new_tracked_stat_fea[i], vec_cur_prev_obj_id[i].first, need_marg, marg_old);
+                        num_inliers_PnP -= num_fail;
+                    }
+                    // 如果上一帧的该物体为动态或者新物体，则其特征点肯定还没有在地图中（有没有可能是先静态，后动态，当前帧又静态？这种情况下跟踪已不连续，当作是两个不同的静态物体了）
+                    // else
+                    //     f_manager.addStaticFeature(frame_count, prev_td, cur_td_old, featureTracker, Ps, Rs, tic, ric, vec_new_tracked_stat_fea[i], vec_cur_prev_obj_id[i].first, need_marg, marg_old, reserve_fea, direct_erase_fea);  
+                    
+                    // 这里可以保存当前帧静态物体的信息？
+                }
 
                 // 物体上的新点这里仅指的是关联外点sift、位姿估计外点sift）
                 // 暂时不添加新特征点
-                if(0)
-                {
-                    if (vec_new_stat_obj_sift[i].size() > 0)
-                        f_manager.addStaticFeature(frame_count, prev_td, cur_td_old, featureTracker, vec_new_stat_obj_sift[i], vec_cur_prev_obj_id[i].first, reserve_fea, direct_erase_fea, true); 
-                }
+                // if(0)
+                // {
+                //     if (vec_new_stat_obj_sift[i].size() > 0)
+                //         f_manager.addStaticFeature(frame_count, prev_td, cur_td_old, featureTracker, Ps, Rs, tic, ric, vec_new_stat_obj_sift[i], vec_cur_prev_obj_id[i].first, need_marg, marg_old, reserve_fea, direct_erase_fea, true); 
+                // }
             }
             // 如果上一帧该物体完全漏检，则该物体必然是新的静态物体
             else
             {
                 if(vec_new_tracked_stat_fea[i].size() > 0)
+                {
                     // 因为该物体上一帧全漏检，则当前帧所匹配的上一帧的点都是背景点。
                     // 该特征点正常来说还不在静态地图中，因为上一帧为背景点，而当前帧为物体点，则该点必须为上一帧背景的新点而没加入地图（如果该点上一帧被发现为物体点，则id肯定已校正；如果该点上一帧和上上帧背景点关联，则不太可能当前帧突然变为物体点）
-                    f_manager.addStaticFeature(frame_count, prev_td, cur_td_old, featureTracker, vec_new_tracked_stat_fea[i], vec_cur_prev_obj_id[i].first, reserve_fea, direct_erase_fea);
-                if(0)
+                    int num_fail = f_manager.addStaticFeature(frame_count, prev_td, cur_td_old, featureTracker, Ps, Rs, tic, ric, vec_new_tracked_stat_fea[i], vec_cur_prev_obj_id[i].first, need_marg, marg_old);
+                    num_inliers_PnP -= num_fail;
+                }
+
+                // if(0)
+                // {
+                //     if (vec_new_stat_obj_sift[i].size() > 0) 
+                //         f_manager.addStaticFeature(frame_count, prev_td, cur_td_old, featureTracker, Ps, Rs, tic, ric, vec_new_stat_obj_sift[i], vec_cur_prev_obj_id[i].first, need_marg, marg_old, reserve_fea, direct_erase_fea, true); 
+                // }
+            }
+        }
+    }
+
+    // 需要添加的静态点，这些点的上一帧不在地图中
+    if(!rest_sta_obj_fea.empty())
+    {
+        vector<pair<int, int>> temp_pts_add;
+        vector<int> fea_checked;
+        int g_id = 0, local_obj_id = 0;
+        float ptx, pty;
+        for(int k = 0; k < 2; ++k)
+        {
+            if(num_inliers_PnP >= Thres_num_track_cur) break;
+            for(auto &iter: rest_sta_obj_fea)
+            {
+                if(num_inliers_PnP >= Thres_num_track_cur) break;
+                g_id = iter.first;
+                // 第一轮优先添加跟踪NCC值较高的点。这些点虽然是旧点，但是其之前的观测不一定已经在地图中
+                if(k == 0 && g_id_sta_obj_3D2D_high_NCC.find(g_id) == g_id_sta_obj_3D2D_high_NCC.end()) continue;
+                // 不需要寻找，reserve_fea和direct_erase_fea是已经加入地图但作为优化外点被删除或者被转为新点的当前帧跟踪点
+                // if(std::find(reserve_fea.begin(), reserve_fea.end(), g_id) != reserve_fea.end()) continue;
+                // if(std::find(direct_erase_fea.begin(), direct_erase_fea.end(), g_id) != direct_erase_fea.end()) continue;
+
+                temp_pts_add.emplace_back(g_id,g_id);
+                local_obj_id = iter.second;
+                if(k == 0) fea_checked.push_back(g_id);
+                
+                int num_fail = f_manager.addStaticFeature(frame_count, prev_td, cur_td_old, featureTracker, Ps, Rs, tic, ric, temp_pts_add, local_obj_id, need_marg, marg_old, reserve_fea, direct_erase_fea);
+                num_inliers_PnP += (1 - num_fail);
+                temp_pts_add.clear();
+            }
+
+            if(k == 0 && !fea_checked.empty())
+            {
+                for(auto &iter: fea_checked)
                 {
-                    if (vec_new_stat_obj_sift[i].size() > 0) 
-                        f_manager.addStaticFeature(frame_count, prev_td, cur_td_old, featureTracker, vec_new_stat_obj_sift[i], vec_cur_prev_obj_id[i].first, reserve_fea, direct_erase_fea, true); 
+                    rest_sta_obj_fea.erase(iter);
                 }
             }
         }
     }
+
+    rest_sta_obj_fea.clear();
     reserve_new_sift.clear();
     reserve_new_FAST.clear();
     direct_erase_fea.clear();
@@ -6143,6 +6718,8 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
     featureTracker.pixel_objs_prev.clear();
     int gl_obj, local_obj;
     
+    if(!featureTracker.ave_dep_prev_objs.empty()) featureTracker.ave_dep_prev_objs.clear();
+    
     // 对于匹配物体集中，当前帧被一分为二的错误检测的物体，将它们的采样点混合
     if(!FinalTrackObj.empty())
     {
@@ -6153,7 +6730,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
             // 这里取决于需不需要对静态物体也进行像素集合的融合？毕竟这些静态物体在本实验中不需要参与评估，不需要与真值进行匹配。但是下一帧可能还要用到像素点集来进行配对
             if(1)
             {
-                // 部分完成关联的物体，其深度值不满足要求，则上一帧该物体会当作丢失，而所有关联的当前帧物体会被删除。此时该全局物体的匹配物体集已被清空
+                // 部分完成关联的物体，其深度值不满足要求，则上一帧该物体会当作丢失，而所有关联的当前帧物体会被删除（成为新物体）。此时该全局物体的匹配物体集已被清空
                 if (iter.second.size() == 0) continue;
                 // 单个物体匹配关系的留到后面一起处理
                 if (iter.second.size() == 1)
@@ -6163,6 +6740,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                 // 当前帧物体被分为两部分或三部分（一部分漏检）
                 else
                 {
+                    float ave_dep = 0;
                     int obj_1 = iter.second[0];
                     int obj_2 = iter.second[1];
                     // 如果分为2部分，且其中一部分是漏检
@@ -6176,26 +6754,33 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                         else
                         {
                             local_obj = obj_1;
-                        }  
+                        }
+
                         auto iter_ = std::find(valid_detect_obj.begin(),valid_detect_obj.end(),local_obj);
                         if(iter_ == valid_detect_obj.end())
-                            assert(false && "Something weird happened!");
+                        {
+                            // assert(false && "Something weird happened!");
+                            cout << "Weired! Line 6590" << endl;
+                            exit(-1);
+                        }
+                        ave_dep = featureTracker.ave_dep_cur_objs[local_obj];
                         
                         id = distance(valid_detect_obj.begin(),iter_);
                         correct_obj[id] = 1;
                         float* ptr_obj = featureTracker.sampled_pixel[id] + 2;
                         int num_pixel = (int)ptr_obj[-1];
                         
+                        int start_id = 3*NUM_SAMPLED_PIXEL_OBJ;
                         // 如果未漏检部分的采样像素点数量未达到最大值，则从漏检部分的特征点中选择点加入像素点集合中
                         if (num_pixel < NUM_SAMPLED_PIXEL_OBJ)
                         {
-                            float x = ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+4)] * num_pixel;
-                            float y = ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+5)] * num_pixel;
-                            float z = ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+6)] * num_pixel;
-                            float left   = ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ)];
-                            float right  = ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+1)];
-                            float top    = ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+2)];
-                            float bottom = ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+3)];
+                            float x = ptr_obj[(start_id+4)] * num_pixel;
+                            float y = ptr_obj[(start_id+5)] * num_pixel;
+                            float z = ptr_obj[(start_id+6)] * num_pixel;
+                            float left   = ptr_obj[(start_id)];
+                            float right  = ptr_obj[(start_id+1)];
+                            float top    = ptr_obj[(start_id+2)];
+                            float bottom = ptr_obj[(start_id+3)];
                             for(auto &pt: featureTracker.FinalTrackObjFea[prev_id])
                             {
                                 if(num_pixel == NUM_SAMPLED_PIXEL_OBJ) break;
@@ -6250,39 +6835,39 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                                     ++num_pixel;
                                 }
                             }
+                            
                             // 如果该物体是动态物体，且内点中特征点的数量足够多（至少3个），则使用3D特征点的均值来代替像素3D点均值
                             // if(ave_3d_pts_objs.find(prev_id) != ave_3d_pts_objs.end())
                             // {
                             //     if(ave_3d_pts_objs[prev_id](2) != 0.0)
                             //     {
-                            //         ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+4)] = ave_3d_pts_objs[prev_id](0);
-                            //         ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+5)] = ave_3d_pts_objs[prev_id](1);
-                            //         ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+6)] = ave_3d_pts_objs[prev_id](2);
+                            //         ptr_obj[(start_id+4)] = ave_3d_pts_objs[prev_id](0);
+                            //         ptr_obj[(start_id+5)] = ave_3d_pts_objs[prev_id](1);
+                            //         ptr_obj[(start_id+6)] = ave_3d_pts_objs[prev_id](2);
                             //     }
                             //     else
                             //     {
-                            //         ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+4)] = x/num_pixel;
-                            //         ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+5)] = y/num_pixel;
-                            //         ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+6)] = z/num_pixel;
+                            //         ptr_obj[(start_id+4)] = x/num_pixel;
+                            //         ptr_obj[(start_id+5)] = y/num_pixel;
+                            //         ptr_obj[(start_id+6)] = z/num_pixel;
                             //     }
                             // }
                             // else
                             {
                                 if(num_pixel > 0)
                                 {
-                                    ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+4)] = x/num_pixel;
-                                    ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+5)] = y/num_pixel;
-                                    ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+6)] = z/num_pixel;
+                                    ptr_obj[(start_id+4)] = x/num_pixel;
+                                    ptr_obj[(start_id+5)] = y/num_pixel;
+                                    ptr_obj[(start_id+6)] = z/num_pixel;
+                                    ave_dep = z/num_pixel;
                                 }
                             }
                             
-                            ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ)]   = left;
-                            ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+1)] = right;
-                            ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+2)] = top;
-                            ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+3)] = bottom;
+                            ptr_obj[(start_id)]   = left;
+                            ptr_obj[(start_id+1)] = right;
+                            ptr_obj[(start_id+2)] = top;
+                            ptr_obj[(start_id+3)] = bottom;
                             ptr_obj[-1] = num_pixel;
-
-                            
                         }
 
                         if(FinalTrackCurObjCls.find(local_obj) == FinalTrackCurObjCls.end() || FinalTrackCurObjCls[local_obj] == 0)
@@ -6362,32 +6947,35 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                             ptr_put[(3*k+1)] = ptr_get[(3*k+1)];
                             ptr_put[(3*k+2)] = ptr_get[(3*k+2)];
                         }
+
+                        int start_id = 3*NUM_SAMPLED_PIXEL_OBJ;
                         // 这里就不把要覆盖的部分3D点从平均3D点中剔除，直接两部分点的3D点全部相加再取均值即可
                         int final_num = num_pixel_1 + num_pixel_2;
                         // 条件1如果不成立，则条件2不会执行和判断
                         // if(ave_3d_pts_objs.find(prev_id) != ave_3d_pts_objs.end() && ave_3d_pts_objs[prev_id](2) != 0.0)
                         // {
-                        //         final_ptr[(3*NUM_SAMPLED_PIXEL_OBJ+4)] = ave_3d_pts_objs[prev_id](0);
-                        //         final_ptr[(3*NUM_SAMPLED_PIXEL_OBJ+5)] = ave_3d_pts_objs[prev_id](1);
-                        //         final_ptr[(3*NUM_SAMPLED_PIXEL_OBJ+6)] = ave_3d_pts_objs[prev_id](2);
+                        //         final_ptr[(start_id+4)] = ave_3d_pts_objs[prev_id](0);
+                        //         final_ptr[(start_id+5)] = ave_3d_pts_objs[prev_id](1);
+                        //         final_ptr[(start_id+6)] = ave_3d_pts_objs[prev_id](2);
                         // }
                         // else
                         {
-                            x = ptr_obj_1[(3*NUM_SAMPLED_PIXEL_OBJ+4)] * num_pixel_1 + ptr_obj_2[(3*NUM_SAMPLED_PIXEL_OBJ+4)] * num_pixel_2;
-                            y = ptr_obj_1[(3*NUM_SAMPLED_PIXEL_OBJ+5)] * num_pixel_1 + ptr_obj_2[(3*NUM_SAMPLED_PIXEL_OBJ+5)] * num_pixel_2;
-                            z = ptr_obj_1[(3*NUM_SAMPLED_PIXEL_OBJ+6)] * num_pixel_1 + ptr_obj_2[(3*NUM_SAMPLED_PIXEL_OBJ+6)] * num_pixel_2;
-                            final_ptr[(3*NUM_SAMPLED_PIXEL_OBJ+4)] = x/final_num;
-                            final_ptr[(3*NUM_SAMPLED_PIXEL_OBJ+5)] = y/final_num;
-                            final_ptr[(3*NUM_SAMPLED_PIXEL_OBJ+6)] = z/final_num;
+                            x = ptr_obj_1[(start_id+4)] * num_pixel_1 + ptr_obj_2[(start_id+4)] * num_pixel_2;
+                            y = ptr_obj_1[(start_id+5)] * num_pixel_1 + ptr_obj_2[(start_id+5)] * num_pixel_2;
+                            z = ptr_obj_1[(start_id+6)] * num_pixel_1 + ptr_obj_2[(start_id+6)] * num_pixel_2;
+                            final_ptr[(start_id+4)] = x/final_num;
+                            final_ptr[(start_id+5)] = y/final_num;
+                            final_ptr[(start_id+6)] = z/final_num;
+                            ave_dep = z/final_num;
                         }
 
                         // bbox left border
-                        float l_min_1 = ptr_obj_1[(3*NUM_SAMPLED_PIXEL_OBJ)];
-                        float l_min_2 = ptr_obj_2[(3*NUM_SAMPLED_PIXEL_OBJ)];
+                        float l_min_1 = ptr_obj_1[(start_id)];
+                        float l_min_2 = ptr_obj_2[(start_id)];
                         if(l_min_1 == 0 && l_min_2 == 0)
                         {
-                            cout << "Weired!" << endl;
-                            abort();
+                            cout << "Weired! Line 6623" << endl;
+                            exit(-1);
                         }
                         else if(l_min_1 == 0)
                             left = l_min_2;
@@ -6397,23 +6985,23 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                             left = std::min(l_min_1, l_min_2);
                         
                         // bbox right border
-                        float r_max_1 = ptr_obj_1[(3*NUM_SAMPLED_PIXEL_OBJ+1)];
-                        float r_max_2 = ptr_obj_2[(3*NUM_SAMPLED_PIXEL_OBJ+1)];
+                        float r_max_1 = ptr_obj_1[(start_id+1)];
+                        float r_max_2 = ptr_obj_2[(start_id+1)];
                         if(r_max_1 == 0 && r_max_2 == 0)
                         {
-                            cout << "Weired!" << endl;
-                            abort();
+                            cout << "Weired! Line 6638" << endl;
+                            exit(-1);
                         }
                         else
                             right = std::max(r_max_1, r_max_2);
 
                         // bbox top border
-                        float t_min_1 = ptr_obj_1[(3*NUM_SAMPLED_PIXEL_OBJ+2)];
-                        float t_min_2 = ptr_obj_2[(3*NUM_SAMPLED_PIXEL_OBJ+2)];
+                        float t_min_1 = ptr_obj_1[(start_id+2)];
+                        float t_min_2 = ptr_obj_2[(start_id+2)];
                         if(t_min_1 == 0 && t_min_2 == 0)
                         {
-                            cout << "Weired!" << endl;
-                            abort();
+                            cout << "Weired! Line 6649" << endl;
+                            exit(-1);
                         }
                         else if(t_min_1 == 0)
                             top = t_min_2;
@@ -6423,20 +7011,20 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                             top = std::min(t_min_1, t_min_2);
 
                         // bbox right border
-                        float b_max_1 = ptr_obj_1[(3*NUM_SAMPLED_PIXEL_OBJ+3)];
-                        float b_max_2 = ptr_obj_2[(3*NUM_SAMPLED_PIXEL_OBJ+3)];
+                        float b_max_1 = ptr_obj_1[(start_id+3)];
+                        float b_max_2 = ptr_obj_2[(start_id+3)];
                         if(b_max_1 == 0 && b_max_2 == 0)
                         {
-                            cout << "Weired!" << endl;
-                            abort();
+                            cout << "Weired! Line 6664" << endl;
+                            exit(-1);
                         }
                         else
                             bottom = std::max(b_max_1, b_max_2);
 
-                        final_ptr[(3*NUM_SAMPLED_PIXEL_OBJ)]   = left;
-                        final_ptr[(3*NUM_SAMPLED_PIXEL_OBJ+1)] = right;
-                        final_ptr[(3*NUM_SAMPLED_PIXEL_OBJ+2)] = top;
-                        final_ptr[(3*NUM_SAMPLED_PIXEL_OBJ+3)] = bottom;
+                        final_ptr[(start_id)]   = left;
+                        final_ptr[(start_id+1)] = right;
+                        final_ptr[(start_id+2)] = top;
+                        final_ptr[(start_id+3)] = bottom;
 
                         if (final_num < NUM_SAMPLED_PIXEL_OBJ)
                             final_ptr[-1] = final_num;
@@ -6448,6 +7036,8 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
                         final_ptr[-2] = (float)FinalTrackCurObjCls[local_obj];
                         featureTracker.pixel_objs_prev[prev_id] = final_ptr;
                     }
+                    // 记录当前帧最终各个保留的全局物体的平均深度
+                    featureTracker.ave_dep_prev_objs[prev_id] = ave_dep;
                 }
             }
         }
@@ -6458,7 +7048,7 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
     // cout << "num of detected obj: " << _valid_objs << endl;
     for(int i = 0; i < _valid_objs; ++i)
     {
-        // 已经在上面处理过的物体
+        // 已经在上面处理过的物体(即有匹配且被合并了的临时物体们)
         if (correct_obj[i] == 1) 
         {
             continue;
@@ -6473,13 +7063,13 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
         // 但是 上面把 所有没有得到匹配的新物体 也放入其中了
         if(FinalTrackCurObj.find(local_obj) == FinalTrackCurObj.end())
         {
-            assert(false);
-            continue;
+            cout << "Weired! Line 7042" << endl;
+            exit(-1);
         }
         
         gl_obj = FinalTrackCurObj[local_obj];
         // cout << "final tracked gl obj: " << gl_obj << endl;
-        // 当前该物体不是被删除的无效物体（其值为0）
+        // 如果不是被删除的无效物体（其值为0），即剩下的当前帧的一对一被跟踪物体 和 新物体
         if(gl_obj > 0)
         {
             if(FinalTrackCurObjCls.find(local_obj) == FinalTrackCurObjCls.end() || FinalTrackCurObjCls[local_obj] == 0)
@@ -6505,9 +7095,16 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
             //     ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+5)] = ave_3d_pts_objs[(-1*local_obj)](1);
             //     ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+6)] = ave_3d_pts_objs[(-1*local_obj)](2);
             // }
+
+            // todo: 是否优先采用检测的特征点的平均深度值？（因为特征点相比普通像素点其在depth_map的深度值应该更可靠一些，而且部分特征点可能还有严格的立体匹配）
+            float dep_ave_fea = featureTracker.ave_dep_cur_objs[local_obj];
+            if(dep_ave_fea > 0)
+                featureTracker.ave_dep_prev_objs[gl_obj] = dep_ave_fea;
+            else
+                featureTracker.ave_dep_prev_objs[gl_obj] = ptr_obj[(3*NUM_SAMPLED_PIXEL_OBJ+6)];
         }
     }
-
+    
     // 所有当前帧完全漏检物体的采样像素点的内存位置。注意，在sampled_pixel数组中，当前帧的所有有效物体可能不会完全紧密排列，检测物体和漏检物体中可能有部分是上一帧的遗留的物体信息，这部分没有被覆盖
     for(int j = 0; j < sampled_pixel_lost_obj.size(); ++j)
     {
@@ -6521,6 +7118,11 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
             // cout << "id of tracked gl obj that is not detected in cur frame: " << gl_id << endl;
             // 这些当前帧完全漏检的物体的像素点数组的所有信息均已修改，包括3D特征点的均值
             featureTracker.pixel_objs_prev[gl_id] = sampled_pixel_lost_obj[j];
+            float ave_dep = sampled_pixel_lost_obj[j][(3*NUM_SAMPLED_PIXEL_OBJ+6)];
+            int num_pixel = sampled_pixel_lost_obj[j][(-1)];
+            // if(num_pixel > 0 && ave_dep > 0)
+                featureTracker.ave_dep_prev_objs[gl_id] = ave_dep;
+            
             sampled_pixel_lost_obj[j] = nullptr;
         }
     }
@@ -6529,16 +7131,18 @@ void Estimator::parallel_pose_objs_est(int prev_td, int cur_td_old, Matrix3d RCa
     while(!tracker_pts_updated)
     {
         usleep(300);
-    }
+    }   
+
+    bool show_track = (SHOW_TRACK || show_spec_frame);
     // 根据status_sift和statusLeftRIght删除和修改featureTracker中的跟踪点
-    featureTracker.RemoveOutliers();
+    featureTracker.RemoveOutliers(show_track);
     tracker_pts_updated = false;
-    
+
     printf("Finish motion estimation and information correction of objects! It costs %fms \n", t_obj_motion_esti.toc());
 }
 
 // VI初始化成功之后，对滑窗内所有帧进行LBA优化（对于双目-IMU而言，首个滑窗VI初始化失败的情况还没考虑，需要完善），并marg某一帧，为下一个滑窗的LBA提供部分变量的残差先验信息
-void Estimator::optimization()
+bool Estimator::optimization()
 {
     TicToc t_whole, t_prepare;
     // 将vector变量转为ceres需要的C语言数组格式
@@ -6624,7 +7228,7 @@ void Estimator::optimization()
         problem.AddResidualBlock(marginalization_factor, NULL,
                                  last_marginalization_parameter_blocks);
     }
-
+    
     if(USE_IMU)
     {
         // 添加滑窗内每两帧之间的预积分残差
@@ -6646,8 +7250,10 @@ void Estimator::optimization()
     // 总的特征点观测数
     int f_m_cnt = 0;
     int feature_index = -1;
+    vector<int> all_trackers_cur;
+
     // 通过视觉观测建立特征地图点世界坐标与其观测帧相机（IMU）位姿之间的残差约束
-    // 只选择那些至少被4帧相机观测到的图像
+    // 只选择那些至少被TH_NUM_FRAME_FOR_LBA帧相机观测到的图像
     for (auto &it_per_id : f_manager.feature)
     {
         // 需要该点在当前滑窗内至少被连续4帧相机观察到，即连续跟踪3次。但是不要求该点在当前帧仍被跟踪到！
@@ -6658,8 +7264,6 @@ void Estimator::optimization()
 
         // 记录提供约束参与BA优化的特征点的序号，用于在para_Feature结果变量中索引
         ++feature_index;
-        // 记录该点参与了LBA
-        it_per_id.has_LBA = true;
 
         int imu_i = it_per_id.start_frame, imu_j = imu_i - 1;
         
@@ -6704,6 +7308,9 @@ void Estimator::optimization()
             }
             f_m_cnt++;
         }
+
+        if(it_per_id.used_num >= 2 && it_per_id.endFrame() == frame_count)
+            all_trackers_cur.push_back(it_per_id.feature_id);
     }
     // 参与LBA的点一共提供了多少视觉约束
     printf("visual measurement count: %d\n", f_m_cnt);
@@ -6719,12 +7326,15 @@ void Estimator::optimization()
     //options.use_explicit_schur_complement = true;
     //options.minimizer_progress_to_stdout = true;
     //options.use_nonmonotonic_steps = true;
-    // 为什么marg掉老的关键帧时会减小LBA优化时间?
-    if (marginalization_flag == MARGIN_OLD)
+    // 为什么marg掉老的关键帧时会减小LBA优化时间?应该是marg次新帧时才减小优化时间吧（运动变化很小）？
+    // 还是说运动变化大时长跟踪点通常较少，需要的时间也就比较少?
+    // if (marginalization_flag == MARGIN_OLD)
+    if (marginalization_flag != MARGIN_OLD)
         // config文件中SOLVER_TIME给定为0.08，即80ms
         options.max_solver_time_in_seconds = SOLVER_TIME * 4.0 / 5.0;
     else
         options.max_solver_time_in_seconds = SOLVER_TIME;
+    
     TicToc t_solver;
     ceres::Solver::Summary summary;
     // 根据设置options求解此最小二乘问题problem，求解过程的总结存放在summary中
@@ -6736,265 +7346,258 @@ void Estimator::optimization()
     // ROS_DEBUG("Iterations : %d", static_cast<int>(summary.iterations.size()));
     //printf("solver costs: %f \n", t_solver.toc());
 
-    // 将LBA优化后得到的变量结果（数组形式）赋值给当前帧滑窗中的Rs、Ps、td等变量集
-    double2vector();
-    //printf("frame_count: %d \n", frame_count);
+    bool succ_LBA = true;
+    // 基于LBA后的当前最新2帧的位姿 计算 所有当前所有2d-2d跟踪点的平均 极线约束距离，于PnP的结果进行比较，如果LBA的误差明显较大，则放弃LBA的结果！
+    // 如果使用了IMU且是首个滑窗的LBA，则由于系统必须初始化（一定要在首个滑窗初始化完成吗？），因此这里不放弃这次LBA
+    if(!USE_IMU || !first_win)
+    {
+        int i = (frame_count-1);
+        Matrix3d Rs_1 = Quaterniond(para_Pose[i][6], para_Pose[i][3], para_Pose[i][4], para_Pose[i][5]).normalized().toRotationMatrix();
+        Vector3d Ps_1 = Vector3d(para_Pose[i][0], para_Pose[i][1], para_Pose[i][2]);
+        Matrix3d prev_R = Rs_1 * ric[0]; 
+        Vector3d prev_P = Rs_1 * tic[0] + Ps_1;
 
+        ++i;
+        Matrix3d Rs_2 = Quaterniond(para_Pose[i][6], para_Pose[i][3], para_Pose[i][4], para_Pose[i][5]).normalized().toRotationMatrix();
+        Vector3d Ps_2 = Vector3d(para_Pose[i][0], para_Pose[i][1], para_Pose[i][2]);
+        Matrix3d cur_R = Rs_2 * ric[0]; 
+        Vector3d cur_P = Rs_2 * tic[0] + Ps_2;
+
+        Matrix3d new_R_cam_motion = cur_R.transpose() * prev_R;
+        Vector3d new_P_cam_motion = cur_R.transpose() * (prev_P - cur_P);
+
+        Matrix3d t_up;
+        t_up << 0.0, -new_P_cam_motion(2), new_P_cam_motion(1), new_P_cam_motion(2), 0.0, -new_P_cam_motion(0), -new_P_cam_motion(1), new_P_cam_motion(0), 0.0;
+        // 本质矩阵到关键矩阵
+        Matrix3d Mat_F = K_trans_inv * t_up * new_R_cam_motion * K_inv;
+
+        Vector3d prev_pix(0,0,1), cur_pix(0,0,1);
+        float ave_epi_dist_LBA = 0;
+        float cnt_LBA = 0;
+
+        for(auto g_id: all_trackers_cur)
+        {
+            int l_id = featureTracker.gl_id_index_map[g_id];
+            if(l_id > 0)
+            {
+                Point2f &prev_pt = featureTracker.prev_FAST[(l_id-1)];
+                prev_pix(0) = prev_pt.x;
+                prev_pix(1) = prev_pt.y;
+
+                Point2f &cur_pt = featureTracker.cur_FAST[(l_id-1)];
+                cur_pix(0) = cur_pt.x;
+                cur_pix(1) = cur_pt.y;
+            }
+            else
+            {
+                Point2f &prev_pt = featureTracker.prev_sift[(l_id)];
+                prev_pix(0) = prev_pt.x;
+                prev_pix(1) = prev_pt.y;
+
+                Point2f &cur_pt = featureTracker.cur_sift[(l_id)];
+                cur_pix(0) = cur_pt.x;
+                cur_pix(1) = cur_pt.y;
+            }
+
+            float dist = cal_ave_epi_line_dist_pt(Mat_F, prev_pix, cur_pix);
+            if(dist >= 0) 
+            {
+                ave_epi_dist_LBA += dist;
+                ++cnt_LBA;
+            }
+        }
+        
+        if(cnt_LBA > 1) ave_epi_dist_LBA = ave_epi_dist_LBA*1.0/cnt_LBA;
+
+        if(ave_epi_dist_inliers > 0)
+        {
+            if(ave_epi_dist_LBA > 0)
+            {
+                // 如何设置这个比例？
+                // if(ave_epi_dist_LBA < 1.20 * ave_epi_dist_inliers)
+                // if(ave_epi_dist_LBA < 1.20 * ave_epi_dist_inliers || (ave_epi_dist_LBA < 1.8 * ave_epi_dist_inliers && ave_epi_dist_LBA <= 0.4))
+                if(ave_epi_dist_LBA < 1.2 * ave_epi_dist_inliers || (ave_epi_dist_LBA < 0.3))
+                {
+                    cout << "Accept result of LBA!" << endl;
+                }
+                else
+                {
+                    Quaterniond delta_Q(new_R_cam_motion);
+                    double delta_angle = fabs(acos(delta_Q.w()) * 2.0 / 3.1416 * 180.0);
+                    cout << "delta_angle from LBA: " << delta_angle << endl;
+                    cout << "ave_epi_dist of PnP: " << ave_epi_dist_inliers << ", ave_epi_dist of LBA: " << ave_epi_dist_LBA << endl;
+                    cout << "Result of LBA has evident larger epipolar-constraint dist than PnP! Reject result of LBA!" << endl;
+                    succ_LBA = false;
+                }
+            }
+            else
+            {
+                cout << "Reject invalid result of LBA!" << endl;
+                succ_LBA = false;
+            }
+        }
+    }
+
+    if(succ_LBA)
+    {
+        // 将LBA优化后得到的变量结果（数组形式）赋值给当前帧滑窗中的Rs、Ps、td等变量集
+        double2vector();
+    }
+    
     // 如果当前的LBA还不是对于整个滑窗的优化，则到此已完成任务。这只会发生在纯双目系统在首个滑窗还未满帧之前，即每完成一帧的跟踪，就与先前帧一起进行BA
     if(frame_count < WINDOW_SIZE)
-        return;
+    {
+        cout << "Optimization finished!" << endl;
+        return succ_LBA;
+    }
     
     // 下面是针对当前滑窗满帧的情况，则需要marg操作来去除某一帧，并且得到剩下某些变量的先验约束，用于下一滑窗内这些变量的LBA！
     // 注意，当前滑窗marg后形成的先验信息，不会对当前帧的变量的估值再产生影响（因为下面的代码中没有再调用double2vector()函数来更新Rs等变量集），而是直接成为下一滑窗相关变量的优化约束！
-    
-    // marg掉滑窗首帧的变量以及与这些变量相关的所有测量
-    // 因为只选择了那些跟被marg变量相关的测量，所以marg后得到的先验信息H、b是与其他测量没有关系的。下一帧中这些无关的测量按照正常的方式组建H、b和更新相关的变量、J和r。
-    if (marginalization_flag == MARGIN_OLD)
+    // 是否要进行marg
+    if(retain_marg_info)
     {
-        // 是否要进行marg
-        if(use_Marg)
+        // marg掉滑窗首帧的变量以及与这些变量相关的所有测量
+        // 因为只选择了那些跟被marg变量相关的测量，所以marg后得到的先验信息H、b是与其他测量没有关系的。下一帧中这些无关的测量按照正常的方式组建H、b和更新相关的变量、J和r。
+        if (marginalization_flag == MARGIN_OLD)
         {
-            TicToc t_whole_marginalization;
-
-            vector2double();
-
-            // 创建当前滑窗marg之后形成的先验信息。创建此对象时默认其成员变量valid=true
-            // 先验信息类中包含了 HX=b中的H和b，由于H=J‘J。b=-J'r，可以求解出与先验信息相关的雅可比J和残差r，这部分需要与下一帧的新J和r累积（新的J和r来自于新的帧与上一帧剩余变量之间的约束）
-            MarginalizationInfo *marginalization_info = new MarginalizationInfo();
-            
-            // 上一帧是否有先验残差保留下来
-            if (last_marginalization_info && last_marginalization_info->valid)
-            {
-                // 需要被marg的变量在该residual_block的所有相关变量中的序号
-                vector<int> drop_set;
-                // 取出上一帧marg后剩余的信息中属于当前要被marg帧的部分（即当前帧滑窗的首帧，其与上一个滑窗被marg的帧之间可能有关联，则其会出现在上一滑窗marg后的相关信息中）
-                // 被marg的变量会通过与其他帧的相关变量的联系（视觉共视观测或者IMU）来形成新的先验，同时继承自上一帧的先验残差块也会更新（因为与其相关的变量要被marg了，即先验本身也是一种观测形成的！）！
-                for (int i = 0; i < static_cast<int>(last_marginalization_parameter_blocks.size()); i++)
-                {
-                    if (last_marginalization_parameter_blocks[i] == para_Pose[0] ||
-                        last_marginalization_parameter_blocks[i] == para_SpeedBias[0])
-                        drop_set.push_back(i);
-                }
-                // construct new marginlization_factor
-                // 从上一个滑窗继承的先验信息因子，该类继承自ceres::CostFunction，其中会记录残差的维度，优化变量个数以及各个变量的维度大小
-                MarginalizationFactor *marginalization_factor = new MarginalizationFactor(last_marginalization_info);
-                // 从上一个滑窗继承的先验信息所形成的残差块，给定相关的优化变量信息，以及其中需要marg的变量
-                ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(marginalization_factor, NULL,
-                                                                            last_marginalization_parameter_blocks,
-                                                                            drop_set);
-                // 将上一帧的先验残差放进当前帧即将形成的先验信息中
-                marginalization_info->addResidualBlockInfo(residual_block_info);
-            }
-
-            if(USE_IMU)
-            {
-                // 这里是与上面进行LBA时的设置一致，即如果某两帧之间的IMU积分时间过长，则不把期间的IMU观测作为约束加入到LBA中。如果首2帧之间的IMU观测没有参与优化，则这里自然也不会加入首帧的marg操作来形成先验信息
-                // 大于10s的情况应该就是上面所说的物体长时间不运动（或者运动非常小），此时选择抛弃此段预积分
-                if (pre_integrations[1]->sum_dt < 10.0)
-                {
-                    // IMUFactor也是个CostFucntion类
-                    IMUFactor* imu_factor = new IMUFactor(pre_integrations[1]);
-                    // 当前滑窗首帧和第二帧之间的IMU预积分因子，同样给定了残差相关的变量和待marg的变量。先验信息就是由观测提供的，它是观测附加在相关变量当前估计值上的约束
-                    ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(imu_factor, NULL,
-                                                                            vector<double *>{para_Pose[0], para_SpeedBias[0], para_Pose[1], para_SpeedBias[1]},
-                                                                            vector<int>{0, 1});
-                    marginalization_info->addResidualBlockInfo(residual_block_info);
-                }
-            }
-            
-            // 寻找与被marg帧相关的特征点
-            {
-                int feature_index = -1;
-                for (auto &it_per_id : f_manager.feature)
-                {
-                    // 必须与上面进行LBA时一致，只取观测帧数至少4帧的特征点
-                    it_per_id.used_num = it_per_id.feature_per_frame.size();
-                    // todo: 如果某个点参与了LBA，但是优化后深度值变为了负值，那么还要marg该点吗？按照这里的条件，这样的点就不参与marg了，否则会形成负面的先验信息
-                    // 这样的地图点后续是直接删除
-                    if (it_per_id.used_num < TH_NUM_FRAME_FOR_LBA || it_per_id.estimated_depth <= 0)
-                        continue;
-                    // 这里的feature_index是对参与当前滑窗LBA的所有特征点的索引序号，所以每次寻找到一个都必须+1
-                    ++feature_index;
-
-                    int imu_i = it_per_id.start_frame, imu_j = imu_i - 1;
-                    // 只选择那些观测初始帧是滑窗首帧的点，因为首帧的变量要被marg掉，与其相关的测量约束也要marg。
-                    if (imu_i != 0)
-                        continue;
-
-                    // 特征在首帧左相机的归一化平面坐标
-                    Vector3d pts_i = it_per_id.feature_per_frame[0].point;
-
-                    for (auto &it_per_frame : it_per_id.feature_per_frame)
-                    {
-                        imu_j++;
-                        // 非首帧
-                        if(imu_i != imu_j)
-                        {
-                            Vector3d pts_j = it_per_frame.point;
-                            // 与此重投影残差相关的变量是两帧的位姿，左相机与IMU的外参（即名字中的OneCam)，另外还有td，这与残差类型的名字相对应
-                            // marg阶段的视觉观测残差仍然需要td的参与，因为与优化的IMU的时刻对应的相机观测需要通过真实视觉观测和td来推断
-                            // 因此marg得到的先验信息中是包含了对 td的先验约束的！！
-                            // 如果相机与IMU之间的外参不参与优化，则这里marg时还需要形成对它的先验信息吗（如果形成了，不就说明它还是一个随机变量吗）？
-                            ProjectionTwoFrameOneCamFactor *f_td = new ProjectionTwoFrameOneCamFactor(pts_i, pts_j, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocity,
-                                                                            it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
-                            ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(f_td, loss_function,
-                                                                                            vector<double *>{para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]},
-                                                                                            vector<int>{0, 3});
-                            marginalization_info->addResidualBlockInfo(residual_block_info);
-                        }
-                        // 右图像的观测的约束
-                        if(STEREO && it_per_frame.is_stereo)
-                        {
-                            Vector3d pts_j_right = it_per_frame.pointRight;
-                            if(imu_i != imu_j)
-                            {
-                                ProjectionTwoFrameTwoCamFactor *f = new ProjectionTwoFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
-                                                                            it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
-                                ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(f, loss_function,
-                                                                                            vector<double *>{para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]},
-                                                                                            vector<int>{0, 4});
-                                marginalization_info->addResidualBlockInfo(residual_block_info);
-                            }
-                            // 首帧的左右相机之间的特征点重投影约束，这与两个相机的全局位姿均无关，只与左右相机之间的外参（需要通过它们各自与IMU的外参来计算）相关
-                            else
-                            {
-                                ProjectionOneFrameTwoCamFactor *f = new ProjectionOneFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
-                                                                            it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
-                                ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(f, loss_function,
-                                                                                            vector<double *>{para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]},
-                                                                                            vector<int>{2});
-                                marginalization_info->addResidualBlockInfo(residual_block_info);
-                            }
-                        }
-                    }
-                }
-            }
-
-            TicToc t_pre_margin;
-            marginalization_info->preMarginalize();
-            printf("pre marginalization %fms\n", t_pre_margin.toc());
-            // ROS_DEBUG("pre marginalization %f ms", t_pre_margin.toc());
-            
-            TicToc t_margin;
-            marginalization_info->marginalize();
-            printf("marginalization %fms\n", t_margin.toc());
-            // ROS_DEBUG("marginalization %f ms", t_margin.toc());
-
-            // 每个变量以数组的形式存储，这些变量当前帧的全局地址（即数组地址）被用来作为这些变量唯一的识别码（即key），而其真实存储地址则是由double*指出（所有没有被marg的变量在其全局数组中都往前移动）
-            std::unordered_map<long, double *> addr_shift;
-            // 当前滑窗marg首帧的变量，则剩余变量的真实存储地址会往前移动首帧的变量的总size长度；
-            // 而在当前滑窗marg后的先验信息中，剩余变量的唯一标识码(key)没必要改变（因为这些地址虽然被别的变量占据着，但是它们在下一帧的先验信息中不需要被索引），我们只需要把该各剩余变量移动后的真实地址赋给它所对应的value即可！在下一滑窗进行marg时，我们会对新的参与marg的变量更新其key（即其真实的存储地址）
-            // TODO：有没有必要把所有的变量都放进这个临时map中？可不可以在getParameterBlocks函数中根据参与marg的剩余变量在数组中的id，其新的真实地址不就是当前的地址直接减去1个变量的长度？甚至外参和Td的内存地址都是不变的！
-            for (int i = 1; i <= WINDOW_SIZE; i++)
-            {
-                addr_shift[reinterpret_cast<long>(para_Pose[i])] = para_Pose[i - 1];
-                if(USE_IMU)
-                    addr_shift[reinterpret_cast<long>(para_SpeedBias[i])] = para_SpeedBias[i - 1];
-            }
-            for (int i = 0; i < NUM_OF_CAM; i++)
-                addr_shift[reinterpret_cast<long>(para_Ex_Pose[i])] = para_Ex_Pose[i];
-
-            addr_shift[reinterpret_cast<long>(para_Td[0])] = para_Td[0];
-
-            
-            // 当前滑窗marg后剩余变量（每个变量是一个数组，用double*来指明它的存储地址）的索引key和新的存储地址（即在下一个滑窗中该变量所在的地址）
-            vector<double *> parameter_blocks = marginalization_info->getParameterBlocks(addr_shift);
-            
-            // 清除上一个滑窗的先验信息的占用内存
-            if (last_marginalization_info)
-                delete last_marginalization_info;
-            // 将当前滑窗的先验信息留给下一个滑窗进行操作
-            last_marginalization_info = marginalization_info;
-            // 当前滑窗的先验信息所对应的（剩余）变量在下一滑窗中的存储地址
-            last_marginalization_parameter_blocks = parameter_blocks;
-
-            printf("whole marginalization costs: %f \n", t_whole_marginalization.toc());
-        }
-        else
-        {
-            // 每个变量以数组的形式存储，这些变量当前帧的全局地址（即数组地址）被用来作为这些变量唯一的识别码（即key），而其真实存储地址则是由double*指出（所有没有被marg的变量在其全局数组中都往前移动）
-            std::unordered_map<long, double *> addr_shift;
-            // 当前滑窗marg首帧的变量，则剩余变量的真实存储地址会往前移动首帧的变量的总size长度；
-            // 而在当前滑窗marg后的先验信息中，剩余变量的唯一标识码(key)没必要改变（因为这些地址虽然被别的变量占据着，但是它们在下一帧的先验信息中不需要被索引），我们只需要把该各剩余变量移动后的真实地址赋给它所对应的value即可！在下一滑窗进行marg时，我们会对新的参与marg的变量更新其key（即其真实的存储地址）
-            // TODO：有没有必要把所有的变量都放进这个临时map中？可不可以在getParameterBlocks函数中根据参与marg的剩余变量在数组中的id，其新的真实地址不就是当前的地址直接减去1个变量的长度？甚至外参和Td的内存地址都是不变的！
-            for (int i = 1; i <= WINDOW_SIZE; i++)
-            {
-                addr_shift[reinterpret_cast<long>(para_Pose[i])] = para_Pose[i - 1];
-                if(USE_IMU)
-                    addr_shift[reinterpret_cast<long>(para_SpeedBias[i])] = para_SpeedBias[i - 1];
-            }
-
-            // 2维数组，第一个索引[]是指向第几行的一维数组指针
-            for (int i = 0; i < NUM_OF_CAM; i++)
-                addr_shift[reinterpret_cast<long>(para_Ex_Pose[i])] = para_Ex_Pose[i];
-
-            addr_shift[reinterpret_cast<long>(para_Td[0])] = para_Td[0];
-        }
-    }
-    else
-    {
-        if(use_Marg)
-        {
-            // 对于marg掉次新帧的情况，这里默认直接去掉次新帧中的所有变量及其相关视觉测量，而不增加新的关于视觉残差marg的先验信息（认为次新帧的观测所提供的信息不重要？）；
-            // 而与次新帧相关的前后两个IMU预积分则会直接合并为一个；
-            // 最后如果上一个滑窗的先验信息中与当前次新帧（即上一个滑窗的最新帧/尾帧）变量相关（即上一个滑窗marg了首帧（如果上一滑窗也marg次新帧，根据下面的操作，省略掉视觉测量的marg，则它的先验信息不可能与其最新帧有关），且其首帧和最后一帧建立了视觉联系（不可能有其他类型测量能让滑窗首帧和尾帧关联起来！））
-            if (last_marginalization_info &&
-                std::count(std::begin(last_marginalization_parameter_blocks), std::end(last_marginalization_parameter_blocks), para_Pose[WINDOW_SIZE - 1]))
+            // if(retain_marg_info)
             {
                 TicToc t_whole_marginalization;
-                MarginalizationInfo *marginalization_info = new MarginalizationInfo();
+
                 vector2double();
+
+                // 创建当前滑窗marg之后形成的先验信息。创建此对象时默认其成员变量valid=true
+                // 先验信息类中包含了 HX=b中的H和b，由于H=J‘J。b=-J'r，可以求解出与先验信息相关的雅可比J和残差r，这部分需要与下一帧的新J和r累积（新的J和r来自于新的帧与上一帧剩余变量之间的约束）
+                MarginalizationInfo *marginalization_info = new MarginalizationInfo();
+                
+                // 上一帧是否有先验残差保留下来
                 if (last_marginalization_info && last_marginalization_info->valid)
                 {
+                    // 需要被marg的变量在该residual_block的所有相关变量中的序号
                     vector<int> drop_set;
+                    // 取出上一帧marg后剩余的信息中属于当前要被marg帧的部分（即当前帧滑窗的首帧，其与上一个滑窗被marg的帧之间可能有关联，则其会出现在上一滑窗marg后的相关信息中）
+                    // 被marg的变量会通过与其他帧的相关变量的联系（视觉共视观测或者IMU）来形成新的先验，同时继承自上一帧的先验残差块也会更新（因为与其相关的变量要被marg了，即先验本身也是一种观测形成的！）！
                     for (int i = 0; i < static_cast<int>(last_marginalization_parameter_blocks.size()); i++)
                     {
-                        assert(last_marginalization_parameter_blocks[i] != para_SpeedBias[WINDOW_SIZE - 1]);
-                        // ROS_ASSERT(last_marginalization_parameter_blocks[i] != para_SpeedBias[WINDOW_SIZE - 1]);
-                        if (last_marginalization_parameter_blocks[i] == para_Pose[WINDOW_SIZE - 1])
+                        if (last_marginalization_parameter_blocks[i] == para_Pose[0] ||
+                            last_marginalization_parameter_blocks[i] == para_SpeedBias[0])
                             drop_set.push_back(i);
                     }
                     // construct new marginlization_factor
+                    // 从上一个滑窗继承的先验信息因子，该类继承自ceres::CostFunction，其中会记录残差的维度，优化变量个数以及各个变量的维度大小
                     MarginalizationFactor *marginalization_factor = new MarginalizationFactor(last_marginalization_info);
+                    // 从上一个滑窗继承的先验信息所形成的残差块，给定相关的优化变量信息，以及其中需要marg的变量
                     ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(marginalization_factor, NULL,
                                                                                 last_marginalization_parameter_blocks,
                                                                                 drop_set);
-
+                    // 将上一帧的先验残差放进当前帧即将形成的先验信息中
                     marginalization_info->addResidualBlockInfo(residual_block_info);
                 }
 
-                TicToc t_pre_margin;
-                printf("begin marginalization\n");
-                // ROS_DEBUG("begin marginalization");
-                marginalization_info->preMarginalize();
-                printf("end pre marginalization, %fms\n", t_pre_margin.toc());
-                // ROS_DEBUG("end pre marginalization, %f ms", t_pre_margin.toc());
-
-                TicToc t_margin;
-                printf("begin marginalization\n");
-                // ROS_DEBUG("begin marginalization");
-                marginalization_info->marginalize();
-                printf("end marginalization, %fms\n", t_margin.toc());
-                // ROS_DEBUG("end marginalization, %f ms", t_margin.toc());
-                
-                std::unordered_map<long, double *> addr_shift;
-                for (int i = 0; i <= WINDOW_SIZE; i++)
+                if(USE_IMU)
                 {
-                    if (i == WINDOW_SIZE - 1)
-                        continue;
-                    else if (i == WINDOW_SIZE)
-                    {   
-                        // 当前滑窗最新一帧的pose变量的存储地址往前移动，下面对IMU的其他参数同
-                        addr_shift[reinterpret_cast<long>(para_Pose[i])] = para_Pose[i - 1];
-                        if(USE_IMU)
-                            addr_shift[reinterpret_cast<long>(para_SpeedBias[i])] = para_SpeedBias[i - 1];
-                    }
-                    else
+                    // 这里是与上面进行LBA时的设置一致，即如果某两帧之间的IMU积分时间过长，则不把期间的IMU观测作为约束加入到LBA中。如果首2帧之间的IMU观测没有参与优化，则这里自然也不会加入首帧的marg操作来形成先验信息
+                    // 大于10s的情况应该就是上面所说的物体长时间不运动（或者运动非常小），此时选择抛弃此段预积分
+                    if (pre_integrations[1]->sum_dt < 10.0)
                     {
-                        addr_shift[reinterpret_cast<long>(para_Pose[i])] = para_Pose[i];
-                        if(USE_IMU)
-                            addr_shift[reinterpret_cast<long>(para_SpeedBias[i])] = para_SpeedBias[i];
+                        // IMUFactor也是个CostFucntion类
+                        IMUFactor* imu_factor = new IMUFactor(pre_integrations[1]);
+                        // 当前滑窗首帧和第二帧之间的IMU预积分因子，同样给定了残差相关的变量和待marg的变量。先验信息就是由观测提供的，它是观测附加在相关变量当前估计值上的约束
+                        ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(imu_factor, NULL,
+                                                                                vector<double *>{para_Pose[0], para_SpeedBias[0], para_Pose[1], para_SpeedBias[1]},
+                                                                                vector<int>{0, 1});
+                        marginalization_info->addResidualBlockInfo(residual_block_info);
                     }
+                }
+                
+                // 寻找与被marg帧相关的特征点
+                {
+                    int feature_index = -1;
+                    for (auto &it_per_id : f_manager.feature)
+                    {
+                        // 必须与上面进行LBA时一致，只取观测帧数至少4帧的特征点
+                        it_per_id.used_num = it_per_id.feature_per_frame.size();
+                        // todo: 如果某个点参与了LBA，但是优化后深度值变为了负值，那么还要marg该点吗？按照这里的条件，这样的点就不参与marg了，否则会形成负面的先验信息
+                        // 这样的地图点后续是直接删除
+                        if (it_per_id.used_num < TH_NUM_FRAME_FOR_LBA || it_per_id.estimated_depth <= 0)
+                            continue;
+                        // 这里的feature_index是对参与当前滑窗LBA的所有特征点的索引序号，所以每次寻找到一个都必须+1
+                        ++feature_index;
+
+                        int imu_i = it_per_id.start_frame, imu_j = imu_i - 1;
+                        // 只选择那些观测初始帧是滑窗首帧的点，因为首帧的变量要被marg掉，与其相关的测量约束也要marg。
+                        if (imu_i != 0)
+                            continue;
+
+                        // 特征在首帧左相机的归一化平面坐标
+                        Vector3d pts_i = it_per_id.feature_per_frame[0].point;
+
+                        for (auto &it_per_frame : it_per_id.feature_per_frame)
+                        {
+                            imu_j++;
+                            // 非首帧
+                            if(imu_i != imu_j)
+                            {
+                                Vector3d pts_j = it_per_frame.point;
+                                // 与此重投影残差相关的变量是两帧的位姿，左相机与IMU的外参（即名字中的OneCam)，另外还有td，这与残差类型的名字相对应
+                                // marg阶段的视觉观测残差仍然需要td的参与，因为与优化的IMU的时刻对应的相机观测需要通过真实视觉观测和td来推断
+                                // 因此marg得到的先验信息中是包含了对 td的先验约束的！！
+                                // 如果相机与IMU之间的外参不参与优化，则这里marg时还需要形成对它的先验信息吗（如果形成了，不就说明它还是一个随机变量吗）？
+                                ProjectionTwoFrameOneCamFactor *f_td = new ProjectionTwoFrameOneCamFactor(pts_i, pts_j, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocity,
+                                                                                it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
+                                ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(f_td, loss_function,
+                                                                                                vector<double *>{para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]},
+                                                                                                vector<int>{0, 3});
+                                marginalization_info->addResidualBlockInfo(residual_block_info);
+                            }
+                            // 右图像的观测的约束
+                            if(STEREO && it_per_frame.is_stereo)
+                            {
+                                Vector3d pts_j_right = it_per_frame.pointRight;
+                                if(imu_i != imu_j)
+                                {
+                                    ProjectionTwoFrameTwoCamFactor *f = new ProjectionTwoFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
+                                                                                it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
+                                    ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(f, loss_function,
+                                                                                                vector<double *>{para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]},
+                                                                                                vector<int>{0, 4});
+                                    marginalization_info->addResidualBlockInfo(residual_block_info);
+                                }
+                                // 首帧的左右相机之间的特征点重投影约束，这与两个相机的全局位姿均无关，只与左右相机之间的外参（需要通过它们各自与IMU的外参来计算）相关
+                                else
+                                {
+                                    ProjectionOneFrameTwoCamFactor *f = new ProjectionOneFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
+                                                                                it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
+                                    ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(f, loss_function,
+                                                                                                vector<double *>{para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]},
+                                                                                                vector<int>{2});
+                                    marginalization_info->addResidualBlockInfo(residual_block_info);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                TicToc t_pre_margin;
+                marginalization_info->preMarginalize();
+                printf("pre marginalization %fms\n", t_pre_margin.toc());
+                // ROS_DEBUG("pre marginalization %f ms", t_pre_margin.toc());
+                
+                TicToc t_margin;
+                marginalization_info->marginalize();
+                printf("marginalization %fms\n", t_margin.toc());
+                // ROS_DEBUG("marginalization %f ms", t_margin.toc());
+
+                // 每个变量以数组的形式存储，这些变量当前帧的全局地址（即数组地址）被用来作为这些变量唯一的识别码（即key），而其真实存储地址则是由double*指出（所有没有被marg的变量在其全局数组中都往前移动）
+                std::unordered_map<long, double *> addr_shift;
+                // 当前滑窗marg首帧的变量，则剩余变量的真实存储地址会往前移动首帧的变量的总size长度；
+                // 而在当前滑窗marg后的先验信息中，剩余变量的唯一标识码(key)没必要改变（因为这些地址虽然被别的变量占据着，但是它们在下一帧的先验信息中不需要被索引），我们只需要把该各剩余变量移动后的真实地址赋给它所对应的value即可！在下一滑窗进行marg时，我们会对新的参与marg的变量更新其key（即其真实的存储地址）
+                // TODO：有没有必要把所有的变量都放进这个临时map中？可不可以在getParameterBlocks函数中根据参与marg的剩余变量在数组中的id，其新的真实地址不就是当前的地址直接减去1个变量的长度？甚至外参和Td的内存地址都是不变的！
+                for (int i = 1; i <= WINDOW_SIZE; i++)
+                {
+                    addr_shift[reinterpret_cast<long>(para_Pose[i])] = para_Pose[i - 1];
+                    if(USE_IMU)
+                        addr_shift[reinterpret_cast<long>(para_SpeedBias[i])] = para_SpeedBias[i - 1];
                 }
                 for (int i = 0; i < NUM_OF_CAM; i++)
                     addr_shift[reinterpret_cast<long>(para_Ex_Pose[i])] = para_Ex_Pose[i];
@@ -7002,47 +7605,154 @@ void Estimator::optimization()
                 addr_shift[reinterpret_cast<long>(para_Td[0])] = para_Td[0];
 
                 
+                // 当前滑窗marg后剩余变量（每个变量是一个数组，用double*来指明它的存储地址）的索引key和新的存储地址（即在下一个滑窗中该变量所在的地址）
                 vector<double *> parameter_blocks = marginalization_info->getParameterBlocks(addr_shift);
+                
+                // 清除上一个滑窗的先验信息的占用内存
                 if (last_marginalization_info)
                     delete last_marginalization_info;
+                // 将当前滑窗的先验信息留给下一个滑窗进行操作
                 last_marginalization_info = marginalization_info;
+                // 当前滑窗的先验信息所对应的（剩余）变量在下一滑窗中的存储地址
                 last_marginalization_parameter_blocks = parameter_blocks;
-                
+
                 printf("whole marginalization costs: %f \n", t_whole_marginalization.toc());
             }
+            // else
+            // {
+            //     // 每个变量以数组的形式存储，这些变量当前帧的全局地址（即数组地址）被用来作为这些变量唯一的识别码（即key），而其真实存储地址则是由double*指出（所有没有被marg的变量在其全局数组中都往前移动）
+            //     std::unordered_map<long, double *> addr_shift;
+            //     // 当前滑窗marg首帧的变量，则剩余变量的真实存储地址会往前移动首帧的变量的总size长度；
+            //     // 而在当前滑窗marg后的先验信息中，剩余变量的唯一标识码(key)没必要改变（因为这些地址虽然被别的变量占据着，但是它们在下一帧的先验信息中不需要被索引），我们只需要把该各剩余变量移动后的真实地址赋给它所对应的value即可！在下一滑窗进行marg时，我们会对新的参与marg的变量更新其key（即其真实的存储地址）
+            //     // TODO：有没有必要把所有的变量都放进这个临时map中？可不可以在getParameterBlocks函数中根据参与marg的剩余变量在数组中的id，其新的真实地址不就是当前的地址直接减去1个变量的长度？甚至外参和Td的内存地址都是不变的！
+            //     for (int i = 1; i <= WINDOW_SIZE; i++)
+            //     {
+            //         addr_shift[reinterpret_cast<long>(para_Pose[i])] = para_Pose[i - 1];
+            //         if(USE_IMU)
+            //             addr_shift[reinterpret_cast<long>(para_SpeedBias[i])] = para_SpeedBias[i - 1];
+            //     }
+
+            //     // 2维数组，第一个索引[]是指向第几行的一维数组指针
+            //     for (int i = 0; i < NUM_OF_CAM; i++)
+            //         addr_shift[reinterpret_cast<long>(para_Ex_Pose[i])] = para_Ex_Pose[i];
+
+            //     addr_shift[reinterpret_cast<long>(para_Td[0])] = para_Td[0];
+            // }
         }
         else
         {
-            std::unordered_map<long, double *> addr_shift;
-            for (int i = 0; i <= WINDOW_SIZE; i++)
+            // if(retain_marg_info)
             {
-                if (i == WINDOW_SIZE - 1)
-                    continue;
-                else if (i == WINDOW_SIZE)
-                {   
-                    // 当前滑窗最新一帧的pose变量的存储地址往前移动，下面对IMU的其他参数同
-                    addr_shift[reinterpret_cast<long>(para_Pose[i])] = para_Pose[i - 1];
-                    if(USE_IMU)
-                        addr_shift[reinterpret_cast<long>(para_SpeedBias[i])] = para_SpeedBias[i - 1];
-                }
-                else
+                // 对于marg掉次新帧的情况，这里默认直接去掉次新帧中的所有变量及其相关视觉测量，而不增加新的关于视觉残差marg的先验信息（认为次新帧的观测所提供的信息不重要？）；
+                // 而与次新帧相关的前后两个IMU预积分则会直接合并为一个；
+                // 最后如果上一个滑窗的先验信息中与当前次新帧（即上一个滑窗的最新帧/尾帧）变量相关（即上一个滑窗marg了首帧（如果上一滑窗也marg次新帧，根据下面的操作，省略掉视觉测量的marg，则它的先验信息不可能与其最新帧有关），且其首帧和最后一帧建立了视觉联系（不可能有其他类型测量能让滑窗首帧和尾帧关联起来！））
+                if (last_marginalization_info &&
+                    std::count(std::begin(last_marginalization_parameter_blocks), std::end(last_marginalization_parameter_blocks), para_Pose[WINDOW_SIZE - 1]))
                 {
-                    addr_shift[reinterpret_cast<long>(para_Pose[i])] = para_Pose[i];
-                    if(USE_IMU)
-                        addr_shift[reinterpret_cast<long>(para_SpeedBias[i])] = para_SpeedBias[i];
+                    TicToc t_whole_marginalization;
+                    MarginalizationInfo *marginalization_info = new MarginalizationInfo();
+                    vector2double();
+                    if (last_marginalization_info && last_marginalization_info->valid)
+                    {
+                        vector<int> drop_set;
+                        for (int i = 0; i < static_cast<int>(last_marginalization_parameter_blocks.size()); i++)
+                        {
+                            assert(last_marginalization_parameter_blocks[i] != para_SpeedBias[WINDOW_SIZE - 1]);
+                            // ROS_ASSERT(last_marginalization_parameter_blocks[i] != para_SpeedBias[WINDOW_SIZE - 1]);
+                            if (last_marginalization_parameter_blocks[i] == para_Pose[WINDOW_SIZE - 1])
+                                drop_set.push_back(i);
+                        }
+                        // construct new marginlization_factor
+                        MarginalizationFactor *marginalization_factor = new MarginalizationFactor(last_marginalization_info);
+                        ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(marginalization_factor, NULL,
+                                                                                    last_marginalization_parameter_blocks,
+                                                                                    drop_set);
+
+                        marginalization_info->addResidualBlockInfo(residual_block_info);
+                    }
+
+                    TicToc t_pre_margin;
+                    printf("begin marginalization\n");
+                    // ROS_DEBUG("begin marginalization");
+                    marginalization_info->preMarginalize();
+                    printf("end pre marginalization, %fms\n", t_pre_margin.toc());
+                    // ROS_DEBUG("end pre marginalization, %f ms", t_pre_margin.toc());
+
+                    TicToc t_margin;
+                    printf("begin marginalization\n");
+                    // ROS_DEBUG("begin marginalization");
+                    marginalization_info->marginalize();
+                    printf("end marginalization, %fms\n", t_margin.toc());
+                    // ROS_DEBUG("end marginalization, %f ms", t_margin.toc());
+                    
+                    std::unordered_map<long, double *> addr_shift;
+                    for (int i = 0; i <= WINDOW_SIZE; i++)
+                    {
+                        if (i == WINDOW_SIZE - 1)
+                            continue;
+                        else if (i == WINDOW_SIZE)
+                        {   
+                            // 当前滑窗最新一帧的pose变量的存储地址往前移动，下面对IMU的其他参数同
+                            addr_shift[reinterpret_cast<long>(para_Pose[i])] = para_Pose[i - 1];
+                            if(USE_IMU)
+                                addr_shift[reinterpret_cast<long>(para_SpeedBias[i])] = para_SpeedBias[i - 1];
+                        }
+                        else
+                        {
+                            addr_shift[reinterpret_cast<long>(para_Pose[i])] = para_Pose[i];
+                            if(USE_IMU)
+                                addr_shift[reinterpret_cast<long>(para_SpeedBias[i])] = para_SpeedBias[i];
+                        }
+                    }
+                    for (int i = 0; i < NUM_OF_CAM; i++)
+                        addr_shift[reinterpret_cast<long>(para_Ex_Pose[i])] = para_Ex_Pose[i];
+
+                    addr_shift[reinterpret_cast<long>(para_Td[0])] = para_Td[0];
+
+                    
+                    vector<double *> parameter_blocks = marginalization_info->getParameterBlocks(addr_shift);
+                    if (last_marginalization_info)
+                        delete last_marginalization_info;
+                    last_marginalization_info = marginalization_info;
+                    last_marginalization_parameter_blocks = parameter_blocks;
+                    
+                    printf("whole marginalization costs: %f \n", t_whole_marginalization.toc());
                 }
             }
+            // else
+            // {
+            //     std::unordered_map<long, double *> addr_shift;
+            //     for (int i = 0; i <= WINDOW_SIZE; i++)
+            //     {
+            //         if (i == WINDOW_SIZE - 1)
+            //             continue;
+            //         else if (i == WINDOW_SIZE)
+            //         {   
+            //             // 当前滑窗最新一帧的pose变量的存储地址往前移动，下面对IMU的其他参数同
+            //             addr_shift[reinterpret_cast<long>(para_Pose[i])] = para_Pose[i - 1];
+            //             if(USE_IMU)
+            //                 addr_shift[reinterpret_cast<long>(para_SpeedBias[i])] = para_SpeedBias[i - 1];
+            //         }
+            //         else
+            //         {
+            //             addr_shift[reinterpret_cast<long>(para_Pose[i])] = para_Pose[i];
+            //             if(USE_IMU)
+            //                 addr_shift[reinterpret_cast<long>(para_SpeedBias[i])] = para_SpeedBias[i];
+            //         }
+            //     }
 
-            for (int i = 0; i < NUM_OF_CAM; i++)
-                addr_shift[reinterpret_cast<long>(para_Ex_Pose[i])] = para_Ex_Pose[i];
+            //     for (int i = 0; i < NUM_OF_CAM; i++)
+            //         addr_shift[reinterpret_cast<long>(para_Ex_Pose[i])] = para_Ex_Pose[i];
 
-            addr_shift[reinterpret_cast<long>(para_Td[0])] = para_Td[0];
+            //     addr_shift[reinterpret_cast<long>(para_Td[0])] = para_Td[0];
+            // }
         }
     }
 
     cout << "Optimization finished!" << endl;
     
     //printf("whole time for ceres: %f \n", t_whole.toc());
+    return succ_LBA;
 }
 
 void Estimator::slideWindow()
@@ -7122,16 +7832,20 @@ void Estimator::slideWindow()
                 usleep(300);
             }
             slideWindowOld();
+            tracker_pts_updated = true;
         }
     }
     else
     {
         if (frame_count == WINDOW_SIZE)
         {
+            double dt_new = Headers[frame_count] - Headers[frame_count - 1];
+            // 可以直接这样计算吗，需要变换坐标系吗？
+            Vector3d Vs_new = (Ps[frame_count] - Ps[frame_count-1])/dt_new;
             Headers[frame_count - 1] = Headers[frame_count];
             Ps[frame_count - 1] = Ps[frame_count];
             Rs[frame_count - 1] = Rs[frame_count];
-
+            
             if(USE_IMU)
             {
                 // 将当前滑窗倒数第2个和最后一个预积分（即次新帧前后的两个预积分）融合成一个
@@ -7147,8 +7861,10 @@ void Estimator::slideWindow()
                     linear_acceleration_buf[frame_count - 1].push_back(tmp_linear_acceleration);
                     angular_velocity_buf[frame_count - 1].push_back(tmp_angular_velocity);
                 }
-                
-                Vs[frame_count - 1] = Vs[frame_count];
+                // 只有使用IMU时Vs才会参与LBA
+                // 当marg次新帧时，剩下的最后一帧与倒数第2帧之间由于实际不是连续的2帧，其Vs是否应该重新计算？虽然时间间隔几乎翻倍，但是位移也是几乎翻倍，因此速度其实相当于不变？俄日起恶marg次新帧意味着速度值很小（但是不意味着速度变化不大？）
+                // Vs[frame_count - 1] = Vs[frame_count];
+                Vs[frame_count - 1] = Vs_new;
                 // bias为什么直接取当前滑窗最后一帧处的bias？这个其实是作为下一帧预积分的bias的初始值的，如下面的预积分对象创建所示
                 Bas[frame_count - 1] = Bas[frame_count];
                 Bgs[frame_count - 1] = Bgs[frame_count];
@@ -7167,6 +7883,7 @@ void Estimator::slideWindow()
                 usleep(300);
             }
             slideWindowNew();
+            tracker_pts_updated = true;
         }
     }
 }
@@ -7177,7 +7894,7 @@ void Estimator::slideWindowNew()
     // 这个量和下面的sum_of_back一样没被用到
     sum_of_front++;
     // 将最新帧中的新检测的特征地图点的首观测帧id减1；对于被次新帧观测到的点，去除该观测记录，如果去除后就没有了观测帧（或者只剩一帧且不是最新帧？）则删除掉该地图点
-    f_manager.removeFront(frame_count);
+    f_manager.removeFront(frame_count, featureTracker, Headers);
 }
 
 // 需要marg掉当前滑窗中的首帧，前面已经做好了跟Frame相关的变量中元素的地址迁移，这里只需要再处理将受到marg帧影响的地图点进行处理
@@ -7186,6 +7903,7 @@ void Estimator::slideWindowOld()
     // 记录从首个滑窗满帧开始，一共进行了多少次marg最旧帧。当sum_of_back = WINDOW_SIZE+1时，则首个滑窗的所有帧就都已经全部（要）被marg掉了！
     sum_of_back++;
 
+    // 这里的判断条件是否应该改为frame_count == WINDOW_SIZE？毕竟有可能首个滑窗已满时没有初始化成功？
     bool shift_depth = solver_flag == NON_LINEAR ? true : false;
     // VI初始化之后，所有地图点的深度都调整好了。此时如果要marg掉最老的帧，则需要改变那些初始观测帧在最老帧的点的深度
     // 将这些点的的初始观测帧改为当前滑窗的第2帧，计算其在第二帧左图像中的深度作为其深度估计
@@ -7205,13 +7923,13 @@ void Estimator::slideWindowOld()
         // 注意，一个点是否参与LBA与其是否参与marg是等同的！因此一旦某个点不会参与LBA，则可以直接将其删除了！
         // 因此一个点一旦被marg过，则它所有的信息就都转化到其他帧相关变量（位姿和IMU参数）的先验约束上！这个点就应该彻底从点云中被删除了！！因为它无法再提供别的信息了！
         // 那如果某点在当前首帧被marg后剩下的观测帧数还大于等于4帧观测呢？如果还保留在地图中，则下一滑窗岂不是还继续参与LBA和marg？是的，marg掉某一帧只是marg该帧位姿和一些特征点在该帧的观测，但这些点仍然是可以在地图中并被剩余的帧所观测的！
-        f_manager.removeBackShiftDepth(R0, P0, R1, P1);
-
+        f_manager.removeBackShiftDepth(frame_count, R0, P0, R1, P1, featureTracker);
+        
         // f_manager.removeBackShiftDepth();
     }
     else
         // 如果还没有VI初始化成功，则认为地图点的深度还没有计算和校正，与上面的函数操作类似，只是不需要计算点在剩余观测首帧中的深度
-        f_manager.removeBack();
+        f_manager.removeBack(frame_count, featureTracker);
 }
 
 // 得到最新帧的IMU坐标系在参考世界坐标系中的位姿
@@ -7291,17 +8009,18 @@ void Estimator::predictPtsInNextFrame()
 
 // 计算第i帧的特征点重投影到第j帧之后的重投影误差，depth是该地图点在第i帧相机中的深度估计值，rici是第i帧的相机和其IMU之间的外参，uvi是观测点在第i帧相机的归一化平面上的坐标
 // 当计算的是在某一帧的右图像上的重投影误差时，rici/tici和ricj/ticj就会不同，因为代表的是左右相机各自与IMU的外参
-double Estimator::reprojectionError(Matrix3d &Ri, Vector3d &Pi, Matrix3d &rici, Vector3d &tici,
-                                 Matrix3d &Rj, Vector3d &Pj, Matrix3d &ricj, Vector3d &ticj, 
-                                 double depth, Vector3d &uvi, Vector3d &uvj)
-{
-    Vector3d pts_w = Ri * (rici * (depth * uvi) + tici) + Pi;
-    Vector3d pts_cj = ricj.transpose() * (Rj.transpose() * (pts_w - Pj) - ticj);
-    Vector2d residual = (pts_cj / pts_cj.z()).head<2>() - uvj.head<2>();
-    double rx = residual.x();
-    double ry = residual.y();
-    return sqrt(rx * rx + ry * ry);
-}
+// 函数声明和定义放到utils文件
+// double Estimator::reprojectionError(Matrix3d &Ri, Vector3d &Pi, Matrix3d &rici, Vector3d &tici,
+//                                  Matrix3d &Rj, Vector3d &Pj, Matrix3d &ricj, Vector3d &ticj, 
+//                                  double depth, Vector3d &uvi, Vector3d &uvj)
+// {
+//     Vector3d pts_w = Ri * (rici * (depth * uvi) + tici) + Pi;
+//     Vector3d pts_cj = ricj.transpose() * (Rj.transpose() * (pts_w - Pj) - ticj);
+//     Vector2d residual = (pts_cj / pts_cj.z()).head<2>() - uvj.head<2>();
+//     double rx = residual.x();
+//     double ry = residual.y();
+//     return sqrt(rx * rx + ry * ry);
+// }
 
 // 根据参与LBA优化后的各帧位姿和各点（在其首观测帧下的）深度，计算各点在其首观测帧与其他观测帧之间的重投影误差之和，如果大于阈值，则作为外点去除
 // 对于其中在当前帧被跟踪到的sift点，可以选择将其保留为新的sift检测点（但是仍将该点从地图中删除，至于是否将该点再加入地图，取决于它在下一帧是否被跟踪到）
@@ -7351,20 +8070,24 @@ void Estimator::outliersRejection(set<int> &removeIndex)
     bool use_prev_dep;
     
     // 如果当前帧的sift新点是根据下一帧的跟踪情况添加，则当前帧背景中的sift跟踪外点不再保留为新点
-    bool add_new_sift_in_next_frame = featureTracker.add_new_sift_in_next_frame;
+    bool add_new_fea_in_next_frame = featureTracker.add_new_fea_in_next_frame;
 
     vector<int> erase_map_pt;
 
+    int invalid_FAST = 0, invalid_sift = 0;
+
     //int &num_track_fea_stat = featureTracker.num_track_fea_stat;
-    for (auto &it_per_id : f_manager.feature)
+    for(auto &it_per_id : f_manager.feature)
     {
         valid = true;
         pt_id = it_per_id.feature_id;
         
         it_per_id.used_num = it_per_id.feature_per_frame.size();
-        // 首先计算长跟踪点的平均重投影误差。只考察那些在当前滑窗内至少被连续观测4帧的地图点！这与LBA中的标准是一样的，即只有这些点参与了LBA
+        int num_frame = it_per_id.used_num;
+        double depth = it_per_id.estimated_depth;
+        // 首先计算长跟踪点的平均重投影误差。只考察那些在当前滑窗内至少被连续观测n帧的地图点！这与LBA中的标准是一样的，即只有这些点参与了LBA
         // 参与LBA的点还必须是有深度估计的,即首帧下的点深度三角化成功了
-        if (it_per_id.used_num >= TH_NUM_FRAME_FOR_LBA && it_per_id.estimated_depth > 0)
+        if(num_frame >= TH_NUM_FRAME_FOR_LBA && depth > 0 && depth <= mThDepthBg)
         {
             err = 0;
             errCnt = 0;
@@ -7372,7 +8095,6 @@ void Estimator::outliersRejection(set<int> &removeIndex)
             ++feature_index;
             int imu_i = it_per_id.start_frame, imu_j = imu_i - 1;
             Vector3d pts_i = it_per_id.feature_per_frame[0].point;
-            double depth = it_per_id.estimated_depth;
             for (auto &it_per_frame : it_per_id.feature_per_frame)
             {
                 ++imu_j;
@@ -7393,7 +8115,7 @@ void Estimator::outliersRejection(set<int> &removeIndex)
                 if(STEREO && it_per_frame.is_stereo)
                 {
                     Vector3d pts_j_right = it_per_frame.pointRight;
-                    if(imu_i != imu_j)
+                    // if(imu_i != imu_j)
                     {   
                         // 需要给定IMU和右相机之间的外参ric[1], tic[1]
                         // 不计算同一帧下左右匹配的重投影误差吗？         
@@ -7419,39 +8141,49 @@ void Estimator::outliersRejection(set<int> &removeIndex)
 
             ave_err = err / errCnt;
             
-            
-            // 为什么要乘以相机的焦距？ave_err是在归一化平面上的距离误差，乘以焦距以后就是在图像上的像素误差！
-            if(ave_err * FOCAL_LENGTH_X > 3)
+            // ave_err是在归一化平面上的距离误差，乘以焦距以后就是在图像上的像素误差！
+            if(ave_err * FOCAL_LENGTH_X > 3.0)
             {
                 valid = false;
-                
                 // 如果该点是物体点或者背景的sift点，且在当前帧被跟踪到，则可以保留当该点在当前帧的观测作为新点。修改该点的信息留到“物体运动估计”的子线程中进行
                 
                 // 如果当前帧观测已经在地图中
-                if (it_per_id.endFrame() == WINDOW_SIZE)
+                if(it_per_id.endFrame() == frame_count)
                 {
+                    // 如果是当前帧的静态物体物体点，则将其从记录中删除
+                    if(featureTracker.sta_obj_fea_in_map_cur.find(pt_id) != featureTracker.sta_obj_fea_in_map_cur.end())
+                            featureTracker.sta_obj_fea_in_map_cur.erase(pt_id);
+
                     // 加入removeIndex的点，其已加入地图中的现有观测都会被删除
                     removeIndex.insert(pt_id);
 
                     index = gl_id_index_map[pt_id];
+
+                    // 因为要保留为新点，所以用该点的检测类别来作为分辨物体和背景的根据。另外，因为在物体运动估计线程中可能已经对所有静态物体点的obj_cls_id进行了修改，所以这里没法使用其来进行分别
+                    Vector2d &pt = it_per_id.feature_per_frame[(num_frame-1)].uv;
+                    uchar det_cls = full_seg_map.at<Vec2b>(pt(1),pt(0))[0];
+
                     if(index <= 0)
                     {
                         index = -1 * index;
                         // 深度不可靠的静态物体点跳过.
                         // 背景点在每一帧中不一定会有stero match（这部分如果被保留为新背景点，那么就不会有深度估计值，如果它下一帧能被跟踪到，则需要使用三角化来得到其首帧下的深度值）
-                        if(obj_cls_id_sift[index].second > 0)
+                        if(det_cls > 0)
                         {
                             // 物体点只保留有立体匹配的点
                             // if(std::find(id_sift_no_depth.begin(), id_sift_no_depth.end(),index) == sift_no_dep_iter_end)
                             if(status_sift[index] == 1)
                                 reserve_new_sift.push_back(pt_id);
                             else
+                            {
+                                // 跟踪点的删除工作（即status_变量置0）留到物体运动估计线程中完成
                                 direct_erase_fea.push_back(pt_id);
+                            }
                         }
-                        else if(!add_new_sift_in_next_frame)
+                        else
                         {
                             // 如果要保留这些背景点为新点，则也只选择其中有立体匹配的
-                            if(status_sift[index] == 1) 
+                            if(!add_new_fea_in_next_frame && status_sift[index] == 1) 
                                 reserve_new_sift.push_back(pt_id);
                             else
                                 direct_erase_fea.push_back(pt_id);
@@ -7460,8 +8192,8 @@ void Estimator::outliersRejection(set<int> &removeIndex)
                     else
                     {
                         index -= 1;
-                        // 对于FAST点，只保留其中静态物体的有深度值的FAST点为新点？算了，就直接放弃这些点吧
-                        if(obj_cls_id_FAST[index].second > 0)
+                        // 对于FAST点，只保留其中静态物体的有深度值的FAST点为新点？
+                        if(det_cls > 0)
                         {
                             // if(std::find(id_FAST_no_depth.begin(), id_FAST_no_depth.end(),(index)) == FAST_no_dep_iter_end)
                             if(statusLeftRIght[index] == 1)
@@ -7476,11 +8208,11 @@ void Estimator::outliersRejection(set<int> &removeIndex)
                     // it_per_id.feature_per_frame.pop_back();
                     //--num_track_fea_stat;
                 }
-                // 如果上一帧观测还未加入地图，则一定是物体点
+                // 如果当前帧观测还未加入地图，则一定是物体点
                 // 如果该物体静态点在当前帧仍被跟踪到，但是最新观测还没加入地图。则这种情况是该静态物体在当前帧需要后续运动估计才能确认是否仍为静态。这里需要记录其可能被删除的观测点记录，以便后续不往地图中添加观测记录，而是作为当前帧的新特征点
-                // 对于这些最新帧观测还未加入地图的点,使用direct_erase_fea和reserve_new_sift来决定其是否要作为新点加入地图
+                // 对于这些最新帧观测还未加入地图的点,使用direct_erase_fea和reserve_new_sift来决定其是否要作为新点加入地图？也可以只将最新2帧作为该点仅有的观测记录加入地图
                 // else if(it_per_id.endFrame() == WINDOW_SIZE-1 || it_per_id.endFrame() == WINDOW_SIZE-2)
-                else if(it_per_id.endFrame() == WINDOW_SIZE-1)
+                else if(it_per_id.endFrame() == frame_count-1)
                 {   
                     // 如果当前帧没跟踪到该点，则直接从地图中删除该点
                     if (gl_id_index_map.find(pt_id) == gl_id_index_map.end()) 
@@ -7489,56 +8221,9 @@ void Estimator::outliersRejection(set<int> &removeIndex)
                         continue;
                     }
 
-                    // 如果是当前帧观测还未加入的（之前静态点），则直接删除该点在地图中的记录。在物体运动估计函数中如果当前帧该点属于运动估计内点，则将其作为新的跟踪点加入地图（在地图中找不到该点之前的记录，则会创建新的地图点）
-                    
-                    // index = gl_id_index_map[pt_id];
-                    // if(index <= 0)
-                    // {
-                    //     index = -1 * index;
-                        
-                    //     // 深度不可靠的点在当前帧的跟踪点后续也直接删除（这种情况下就不考虑上一帧未加入地图的该点观测的深度是否可靠了，直接从当前帧观测考虑是否改为新点）
-                    //     // 没有立体匹配的背景跟踪点 或 物体跟踪点（这里指的是用sift匹配或者CPU光流得到的右图像匹配点，而不是用flow map得到的近似匹配点）
-                    //     if (obj_cls_id_sift[index].second > 0)
-                    //     {
-                    //         auto iter1 = std::find(id_sift_no_depth.begin(), id_sift_no_depth.end(), index);
-                            
-                    //         if(iter1 == sift_no_dep_iter_end)
-                    //             reserve_new_sift.push_back(pt_id);
-                    //         else
-                    //             direct_erase_fea.push_back(pt_id);
-                    //     }
-                    //     else if(!add_new_sift_in_next_frame)
-                    //     {
-                    //         auto iter2 = std::find(sift_no_stereo_bg.begin(),sift_no_stereo_bg.end(),index);
-                    //         if(iter2 == sift_no_stereo_bg.end())
-                    //             reserve_new_sift.push_back(pt_id);
-                    //         else
-                    //             direct_erase_fea.push_back(pt_id);
-                    //     }
-                    // }
-                    // else
-                    // {
-                    //     index -= 1;
-                    //     if (obj_cls_id_FAST[index].first > 0)
-                    //     {
-                    //         auto iter1 = std::find(id_FAST_no_depth.begin(), id_FAST_no_depth.end(), index);
-                            
-                    //         if(iter1 == FAST_no_dep_iter_end)
-                    //             reserve_new_FAST.push_back(pt_id);
-                    //         else
-                    //             direct_erase_fea.push_back(pt_id);
-                    //     }
-                    //     else
-                    //     {
-                    //         direct_erase_fea.push_back(pt_id);
-                    //     }
-                    // }
-
                     // 如果该点在当前帧被跟踪到，但是又还未加入地图，则在此处直接将该点从地图中删除。后续该点在当前帧的跟踪是否有效取决于 物体运动估计函数中的判断
                     erase_map_pt.push_back(pt_id);
-
                     continue;
-
                     //--num_track_fea_stat;
                 }
                 else
@@ -7550,22 +8235,38 @@ void Estimator::outliersRejection(set<int> &removeIndex)
         }
         else
         {
-            valid = false;
-            // 如果该点在参与LBA之后，其首帧下的深度值变为负的，则删除该地图点
-            if(it_per_id.used_num >= TH_NUM_FRAME_FOR_LBA && it_per_id.has_LBA)
+            // 这里还包含那些只有2帧的当前帧跟踪点，则需要再用LBA后的运动估计来更新其在当前帧的深度？这提前放在了triangulatePoint()函数中进行
+            // todo: 但是对于那些靠三角化测量获得上一帧深度的点，要如何优化其上一帧的深度？这在当前帧中无法优化，要么指望其后续再被跟踪后参与LBA，要么本系统直接不接受使用三角化测量来估计2D-2D点的初始帧深度！
+
+            // 如果该点在参与LBA之后，其首帧下的深度值超出了阈值（<=0或者大于最大阈值），则删除该地图点
+            if(num_frame >= TH_NUM_FRAME_FOR_LBA)
             {
+                valid = false;
+                // 已经参与了LBA但是首帧深度反而变为负的点？直接删除
+                erase_map_pt.push_back(pt_id);
+
+                // 地图点是当前帧的跟踪点，且其在首帧下深度为负，则只可能是该点参与了LBA并在LBA期间深度值被优化为负值
                 if(it_per_id.endFrame() == frame_count)
-                    removeIndex.insert(pt_id);
-                else
                 {
-                    // 删除该地图点的操作是否要在这里进行？
+                    if(!it_per_id.has_LBA)
+                    {
+                        cout << "Weired! Line 8224" <<endl;
+                        exit(-1);
+                    }
+                    else
+                    {
+                        removeIndex.insert(pt_id);
+                        // 加入reserve_new_sift/reserve_new_FAST/direct_erase_fea等变量中
+                    }
                 }
             }
         }
         
         // 如果不需要被（从地图中）完全删除或者修改为新点，且当前帧跟踪到该点且加入了地图，则更新其中的静态物体点在当前相机坐标系的深度
-        // 这里是只更新那些参与了LBA，且在当前帧仍然被跟踪到的点的深度
-        if(valid)
+        // 下面这里是只更新那些参与了LBA，且在当前帧仍然被跟踪到的点的深度
+
+        // 这部分实现也提前放到三角化测量函数中了
+        if(0 && valid)
         {
             // VI初始化之后，当前帧在物体关联阶段就确定为静态的物体的特征点，只有那些观测帧数大于等于3帧的点才会被加入地图；
             // VI初始化之前，所有静态物体的跟踪点都会被加入地图，用于进行每一帧的相机位姿的估计（以便PnP的点数足够多）
@@ -7578,48 +8279,32 @@ void Estimator::outliersRejection(set<int> &removeIndex)
                 {
                     index -= 1;
                     cls = obj_cls_id_FAST[index].first;
-                    // 对于静态物体点，只更新那些用depth_map获取当前帧深度估计的点的深度。最后决定对当前帧的点都更新深度值，因为参与LBA的点在三角化测量函数中没有更新当前帧的深度值
-                    // if(cls > 0 && std::find(id_FAST_no_depth.begin(), FAST_iter_end, index) == FAST_iter_end) continue;
-                    // 对于背景点，更新那些在当前帧没有stereo match的点的深度（方便为该点在下一帧的位置提供预测值）
-                    // if(cls == 0 && statusLeftRIght[index] != 2) continue; 
 
-                    // prev_dep = prev_dep_FAST[index];
-                    // if(cls > 0 && prev_dep <= 0)
-                    //     assert(false && "Something wrong with obj fea depth in prev_dep_FAST!");
-                    
-                    // 如果该点为静态物体点， 或者为背景跟踪点但 还未完成三角化测量（即得到首观测帧下的深度）或者完成了三角化且当前帧为其第二个观测帧，则使用上一帧该点的深度值和当前帧相机位姿来更新当前帧该点的深度值
-                    // use_prev_dep = (prev_dep > 0) && ((cls > 0) || (cls == 0 && (it_per_id.estimated_depth <= 0 || it_per_id.feature_per_frame.size() == 2)));
-                    // 需要使用上一帧点的深度值来更新当前帧深度值的点。
-                    // 用上一帧的深度值来更新当前帧深度，这是在三角化测量函数中进行的，因为这些点不参与LBA，这里不需要再次更新
-                    // if(use_prev_dep)
-                    // {
-                    //     pt_prev(2) = prev_dep;
-                    //     pt_prev(0) = prev_un_Fea_map[pt_id](0) * prev_dep;
-                    //     pt_prev(1) = prev_un_Fea_map[pt_id](1) * prev_dep;
-                    //     motion_R_update = motion_R;
-                    //     motion_P_update = motion_P;
-                    // }
-                    // else
+                    prev_dep = it_per_id.estimated_depth;
+                    // 如果该点仍然未完成三角化测量，且上一帧该点也没有立体匹配，则当前帧该点的深度值仍保留为-1.0，是否等待其继续被跟踪并尝试三角化测量
+                    // 这里其实还包含了仅有2帧观测的2D-2D点，即其在之前没有成功进行三角化测量（要么PnP失败，要么估计的深度值不可靠），那么这些点如果在此处还存在，则说明之前是有意要保留这些点
+                    if(prev_dep <= 0)
                     {
-                        prev_dep = it_per_id.estimated_depth;
-                        // 如果该点仍然未完成三角化测量，且上一帧该点也没有立体匹配，则当前帧该点的深度值仍保留为-1.0，等待其继续被跟踪并尝试三角化测量
-                        if(prev_dep <= 0)
+                        if(it_per_id.used_num > 2)
                         {
-                            removeIndex.insert(pt_id);
-                            continue;
+                            cout << "Weried! Line 7513" << endl;
+                            statusLeftRIght[index] = 0;
+                            erase_map_pt.push_back(pt_id);
                         }
-                        else
-                        {   
-                            pt_prev(2) = prev_dep;
-                            pt_prev(0) = it_per_id.feature_per_frame[0].point.x() * prev_dep;
-                            pt_prev(1) = it_per_id.feature_per_frame[0].point.y() * prev_dep;
-                            // 对于需要从观测首帧的深度来推测当前帧深度的背景点，其观测首帧的相机位姿就不进行插值了
-                            frame_first = it_per_id.start_frame;
-                            first_frame_R = Rs[frame_first] * ric[0];
-                            first_frame_P = Ps[frame_first] + Rs[frame_first] * tic[0];
-                            motion_R_update = cur_cam_R.transpose() * first_frame_R;
-                            motion_P_update = cur_cam_R.transpose() * (first_frame_P - cur_cam_P);
-                        }
+                        
+                        continue;
+                    }
+                    else
+                    {   
+                        pt_prev(2) = prev_dep;
+                        pt_prev(0) = it_per_id.feature_per_frame[0].point.x() * prev_dep;
+                        pt_prev(1) = it_per_id.feature_per_frame[0].point.y() * prev_dep;
+                        // 对于需要从观测首帧的深度来推测当前帧深度的背景点，其观测首帧的相机位姿就不进行插值了
+                        frame_first = it_per_id.start_frame;
+                        first_frame_R = Rs[frame_first] * ric[0];
+                        first_frame_P = Ps[frame_first] + Rs[frame_first] * tic[0];
+                        motion_R_update = cur_cam_R.transpose() * first_frame_R;
+                        motion_P_update = cur_cam_R.transpose() * (first_frame_P - cur_cam_P);
                     }
                     
                     cur_z = (motion_R_update * pt_prev + motion_P_update)(2);
@@ -7629,7 +8314,7 @@ void Estimator::outliersRejection(set<int> &removeIndex)
                         max_depth = mThDepthObj;
                     
                     // if (cur_z < max_depth && cur_z > mMinDepthPt) 
-                    if (cur_z < 1.2 * max_depth && cur_z > 1.2) 
+                    if (cur_z < 1.2 * max_depth && cur_z >= 1.5) 
                         cur_dep_FAST[index] = cur_z;
                     // 如果深度超过了阈值范围，则下一帧不再跟踪该点了。
                     // 但是仍然保留该点的当前帧观测记录在地图中（如果该点的观测帧数小于4，则后续会直接被从地图删除；如果观测帧数已经大于4，则说明在上面的重投影误差检验中通过了，可以等待参与后续滑窗的marg）
@@ -7642,7 +8327,6 @@ void Estimator::outliersRejection(set<int> &removeIndex)
                         {
                             removeIndex.insert(pt_id);
                             // it_per_id.feature_per_frame.pop_back();
-                            
                         }
                     }
                 }
@@ -7651,44 +8335,30 @@ void Estimator::outliersRejection(set<int> &removeIndex)
                     index = -1 * index;
                     cls = obj_cls_id_sift[index].first;
 
-                    // if(cls > 0 && std::find(id_sift_no_depth.begin(), sift_no_dep_iter_end, index) == sift_no_dep_iter_end) continue;
-
-                    // if(cls == 0 && status_sift[index] != 2) continue;
-
-                    // prev_dep = prev_dep_sift[index];
-                    // 其实还有可能是上一帧为背景中的漏检点（且没有深度）！
-                    // if(cls > 0 && prev_dep <= 0)
-                    //     assert(false && "Something wrong with obj fea depth in prev_dep_sift!");
-                    
-                    // use_prev_dep = (prev_dep > 0) && ((cls > 0) || (cls == 0 && (it_per_id.estimated_depth <= 0 || it_per_id.feature_per_frame.size() == 2)));
-                    // if(use_prev_dep)
-                    // {
-                    //     pt_prev(2) = prev_dep;
-                    //     pt_prev(0) = prev_un_Fea_map[pt_id](0) * prev_dep;
-                    //     pt_prev(1) = prev_un_Fea_map[pt_id](1) * prev_dep;
-                    //     motion_R_update = motion_R;
-                    //     motion_P_update = motion_P;
-                    // }
-                    // else
+                    prev_dep = it_per_id.estimated_depth;
+                    if(prev_dep <= 0)
                     {
-                        prev_dep = it_per_id.estimated_depth;
-                        if(prev_dep <= 0)
+                        // 删除地图中的该点
+                        if(it_per_id.used_num > 2)
                         {
-                            removeIndex.insert(pt_id);
-                            continue;
+                            cout << "Weried! Line 7785" << endl;
+                            status_sift[index] = 0;
+                            erase_map_pt.push_back(pt_id);
                         }
-                        else
-                        {
-                            pt_prev(2) = prev_dep;
-                            pt_prev(0) = it_per_id.feature_per_frame[0].point.x() * prev_dep;
-                            pt_prev(1) = it_per_id.feature_per_frame[0].point.y() * prev_dep;
-                            // 对于需要从观测首帧的深度来推测当前帧深度的背景点，其观测首帧的相机位姿就不进行插值了
-                            frame_first = it_per_id.start_frame;
-                            first_frame_R = Rs[frame_first] * ric[0];
-                            first_frame_P = Ps[frame_first] + Rs[frame_first] * tic[0];
-                            motion_R_update = cur_cam_R.transpose() * first_frame_R;
-                            motion_P_update = cur_cam_R.transpose() * (first_frame_P - cur_cam_P);
-                        }
+                        
+                        continue;
+                    }
+                    else
+                    {
+                        pt_prev(2) = prev_dep;
+                        pt_prev(0) = it_per_id.feature_per_frame[0].point.x() * prev_dep;
+                        pt_prev(1) = it_per_id.feature_per_frame[0].point.y() * prev_dep;
+                        // 对于需要从观测首帧的深度来推测当前帧深度的背景点，其观测首帧的相机位姿就不进行插值了
+                        frame_first = it_per_id.start_frame;
+                        first_frame_R = Rs[frame_first] * ric[0];
+                        first_frame_P = Ps[frame_first] + Rs[frame_first] * tic[0];
+                        motion_R_update = cur_cam_R.transpose() * first_frame_R;
+                        motion_P_update = cur_cam_R.transpose() * (first_frame_P - cur_cam_P);
                     }
                     
                     cur_z = (motion_R_update * pt_prev + motion_P_update)(2);
@@ -7699,7 +8369,7 @@ void Estimator::outliersRejection(set<int> &removeIndex)
                         max_depth = mThDepthObj;
                     
                     // if (cur_z < max_depth && cur_z > mMinDepthPt)
-                    if (cur_z < 1.2 * max_depth && cur_z > 1.2)
+                    if (cur_z < 1.2 * max_depth && cur_z >= 1.5)
                         cur_dep_sift[index] = cur_z;
                     else
                     {
@@ -7834,17 +8504,18 @@ void Estimator::velocity_from_poses(const Matrix3d &R1, const Vector3d &p1, cons
     // Convert to axis-angle representation
     Eigen::AngleAxisd angle_axis(R);
     
-    // Compute angular velocity
+    // Compute angular velocity vector
     ang_vel = angle_axis.axis() * angle_axis.angle() / t;
 
-    // Compute linear velocity
+    // Compute linear velocity in world coordinate
     l_vel = (- R * p1 + R2 * gl_trans_P + p2) / t;
     // l_vel = (p2 - p1) / t;
     
-    cout << "p1: " << p1.transpose() << endl;
-    cout << "p2: " << p2.transpose() << endl;
-    cout << "linear velocity: " << l_vel.transpose() << endl;
-    cout << "prev delta_t: " << t << endl;
+    // cout << "p1: " << p1.transpose() << endl;
+    // cout << "p2: " << p2.transpose() << endl;
+    // cout << "linear velocity: " << l_vel.transpose() << endl;
+    // cout << "prev delta_angle: " << angle_axis.angle() << endl;
+    // cout << "prev delta_t: " << t << endl;
 }
 
 bool Estimator::pred_pose_with_vel(const Eigen::Matrix3d &R_1, const Eigen::Vector3d &p_1, const Eigen::Vector3d &ang_vel, const Eigen::Vector3d &l_vel, double t, Eigen::Matrix3d &R_2, Eigen::Vector3d &p_2)
@@ -7905,9 +8576,10 @@ void Estimator::write_result_objs(FILE* outFile_cam, FILE* outFile_objs)
                                                                                                 bbox_info[num_size+4], bbox_info[num_size+5], bbox_info[num_size+6]);                                                                              
         }
     }
-    cout << "Succeed write result of dynamic objects!" << endl;
-    // 相机的位姿估计则需要等到VIO初始化并校正全局位姿后再一起输出
-    if(USE_IMU && solver_flag == INITIAL) return;
+    // cout << "Succeed write result of dynamic objects!" << endl;
+    // 相机的位姿估计则需要首个滑窗已满并初始化后再多帧一起输出，其中对于VIO的情况会在LBA后校正全局位姿（即除了初始帧的yaw角和位置始终为0）
+    // if(USE_IMU && solver_flag == INITIAL) return;
+    if(solver_flag == INITIAL) return;
 
     // 如果当前帧正好完成了初始化，则直接一次性写入已有所有帧的相机位姿结果，因此此时相机位姿已经对齐到新的全局坐标系
     if(initial_succ_first_win)
@@ -7948,5 +8620,6 @@ void Estimator::write_result_objs(FILE* outFile_cam, FILE* outFile_objs)
                                                                       cur_R(1,0), cur_R(1,1), cur_R(1,2), cur_P(1), 
                                                                       cur_R(2,0), cur_R(2,1), cur_R(2,2), cur_P(2));          
     }
-    cout << "Succeed write result of camera!" << endl;
+    // cout << "Succeed write result of camera!" << endl;
+    cout << "Succeed write results!" << endl;
 }

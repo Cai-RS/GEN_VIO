@@ -57,8 +57,8 @@ int main(int argc, char** argv)
 
     readParameters(config_file);
 	
-	bool trans_data = false;
-	if(trans_data)
+	
+	if(trans_result_format || evaluate_reslut)
 	{
 		string result_path(argv[2]);
 		string name(argv[4]);
@@ -67,61 +67,102 @@ int main(int argc, char** argv)
 		{
 			std::cerr << "ERROR: Wrong path to settings" << std::endl;
 		}
-		cv::Mat cv_T;
-		fsSettings["body_T_cam0"] >> cv_T;
-		Eigen::Matrix4f T;
-		cv::cv2eigen(cv_T, T);
-		Matrix3f R_imu_to_cam_gt = T.block<3, 3>(0, 0);
-		Vector3f P_imu_to_cam_gt = T.block<3, 1>(0, 3);
-		
+
 		string Dataset;
 		fsSettings["dataset"] >> Dataset;
-		bool cam_gt = false;
-		string DATA = "KITTI_odometry";
-		if(Dataset == DATA)
-			cam_gt = true;
-		
-		int use_imu = USE_IMU;
 
-		fsSettings.release();
-
-		ifstream file_est_cam;
-		file_est_cam.open((result_path+"/vio(" + name + ").txt").c_str(), ios::in);
-		if(!file_est_cam.is_open())
+		if(trans_result_format)
 		{
-			printf("cannot open file: %s\n", result_path.c_str());
-			// ROS_BREAK();
-			return 0;
-		}
-
-		string line_est_cam;
-		Matrix3f cur_R_est, Corr_R_est, rot_diff;
-		Vector3f cur_P_est, Corr_P_est, trans_diff;
-
-		FILE* outFile;
-		outFile = fopen(("/home/crs/GEN_VIO/src/evaluate/results/" + Dataset + "/" + sequence + "/data/vio.txt").c_str(),"w");
-		if(outFile == NULL)
-			printf("Output path dosen't exist: %s\n", ("/home/crs/GEN_VIO/src/evaluate/results/" + Dataset + "/" + sequence + "/data/vio.txt").c_str());
-		
-		int i = 0;
-		while(getline(file_est_cam, line_est_cam))
-		{
-			istringstream istr_est(line_est_cam);
-			istr_est >> cur_R_est(0,0) >> cur_R_est(0,1) >> cur_R_est(0,2) >> cur_P_est(0)
-					 >> cur_R_est(1,0) >> cur_R_est(1,1) >> cur_R_est(1,2) >> cur_P_est(1)
-					 >> cur_R_est(2,0) >> cur_R_est(2,1) >> cur_R_est(2,2) >> cur_P_est(2);
+			cv::Mat cv_T;
+			fsSettings["body_T_cam0"] >> cv_T;
+			Eigen::Matrix4f T;
+			cv::cv2eigen(cv_T, T);
+			Matrix3f R_imu_to_cam_gt = T.block<3, 3>(0, 0);
+			Vector3f P_imu_to_cam_gt = T.block<3, 1>(0, 3);
 			
-			if(!cam_gt)
+			bool cam_gt = false;
+			string DATA = "KITTI_odometry";
+			if(Dataset == DATA)
+				cam_gt = true;
+			
+			int use_imu = USE_IMU;
+
+			fsSettings.release();
+
+			ifstream file_est_cam;
+			file_est_cam.open((result_path+"/vio(" + name + ").txt").c_str(), ios::in);
+			if(!file_est_cam.is_open())
 			{
-				if(use_imu)
+				printf("cannot open file: %s\n", result_path.c_str());
+				// ROS_BREAK();
+				return 0;
+			}
+			
+			string line_est_cam;
+			Matrix3f cur_R_est, Corr_R_est, rot_diff;
+			Vector3f cur_P_est, Corr_P_est, trans_diff;
+
+			FILE* outFile;
+			outFile = fopen(("/home/crs/GEN_VIO/src/evaluate/results/" + Dataset + "/" + sequence + "/data/vio.txt").c_str(),"w");
+			if(outFile == NULL)
+				printf("Output path dosen't exist: %s\n", ("/home/crs/GEN_VIO/src/evaluate/results/" + Dataset + "/" + sequence + "/data/vio.txt").c_str());
+			
+			int i = 0;
+			while(getline(file_est_cam, line_est_cam))
+			{
+				istringstream istr_est(line_est_cam);
+				istr_est >> cur_R_est(0,0) >> cur_R_est(0,1) >> cur_R_est(0,2) >> cur_P_est(0)
+						>> cur_R_est(1,0) >> cur_R_est(1,1) >> cur_R_est(1,2) >> cur_P_est(1)
+						>> cur_R_est(2,0) >> cur_R_est(2,1) >> cur_R_est(2,2) >> cur_P_est(2);
+				
+				if(!cam_gt)
 				{
-					// 由于有IMU模式下系统首帧的IMU位姿在优化中不是固定的，即会有roll和pitch角，为了和gt标签对齐，需要将首帧直接置为完全的全局参考系
+					if(use_imu)
+					{
+						// 由于有IMU模式下系统首帧的IMU位姿在优化中不是固定的，即会有roll和pitch角，为了和gt标签对齐，需要将首帧直接置为完全的全局参考系
+						if (i == 0)
+						{
+							Matrix3f rot_diff_tmp = cur_R_est.transpose();
+							Corr_R_est = rot_diff_tmp * cur_R_est;
+							Corr_P_est = Vector3f(0.0,0.0,0.0);
+							
+							rot_diff = rot_diff_tmp;
+							trans_diff = -rot_diff * cur_P_est;
+						}
+						else
+						{
+							Corr_R_est = rot_diff * cur_R_est;
+							Corr_P_est = rot_diff * cur_P_est + trans_diff;
+						}
+					}
+					else
+					{
+						// STEREO模式下输出的结果为相机的估计位姿
+						// 转回为IMU的位姿，且初始IMU位姿就是全局位姿
+						Corr_R_est = cur_R_est * R_imu_to_cam_gt;
+						Corr_P_est = cur_R_est * P_imu_to_cam_gt + cur_P_est;
+					}
+				}
+				else
+				{
+					if(use_imu)
+					{
+						// 估计的位姿结果从IMU转化为相机的
+						Matrix3f R_est_cam = cur_R_est * R_imu_to_cam_gt.transpose();
+						Vector3f P_est_cam = -R_est_cam * P_imu_to_cam_gt + cur_P_est;
+
+						cur_R_est = R_est_cam;
+						cur_P_est = P_est_cam;
+					}
+
+					// 如果是odometry数据集，则给定的gt是相机的位姿
+					// 由于gt首帧是全局参考系，因此这里对估计的结果要进行校正
 					if (i == 0)
 					{
 						Matrix3f rot_diff_tmp = cur_R_est.transpose();
 						Corr_R_est = rot_diff_tmp * cur_R_est;
 						Corr_P_est = Vector3f(0.0,0.0,0.0);
-						
+
 						rot_diff = rot_diff_tmp;
 						trans_diff = -rot_diff * cur_P_est;
 					}
@@ -131,54 +172,20 @@ int main(int argc, char** argv)
 						Corr_P_est = rot_diff * cur_P_est + trans_diff;
 					}
 				}
-				else
-				{
-					// STEREO模式下输出的结果为相机的估计位姿
-					// 转回为IMU的位姿，且初始IMU位姿就是全局位姿
-					Corr_R_est = cur_R_est * R_imu_to_cam_gt;
-					Corr_P_est = cur_R_est * P_imu_to_cam_gt + cur_P_est;
-				}
+
+				fprintf(outFile, "%f %f %f %f %f %f %f %f %f %f %f %f\n", Corr_R_est(0,0), Corr_R_est(0,1), Corr_R_est(0,2), Corr_P_est(0),
+																		Corr_R_est(1,0), Corr_R_est(1,1), Corr_R_est(1,2), Corr_P_est(1), 
+																		Corr_R_est(2,0), Corr_R_est(2,1), Corr_R_est(2,2), Corr_P_est(2));
+
+				++i;
 			}
-			else
-			{
-				if(use_imu)
-				{
-					// 估计的位姿结果从IMU转化为相机的
-					Matrix3f R_est_cam = cur_R_est * R_imu_to_cam_gt.transpose();
-					Vector3f P_est_cam = -R_est_cam * P_imu_to_cam_gt + cur_P_est;
-
-					cur_R_est = R_est_cam;
-					cur_P_est = P_est_cam;
-				}
-
-				// 如果是odometry数据集，则给定的gt是相机的位姿
-				// 由于gt首帧是全局参考系，因此这里对估计的结果要进行校正
-				if (i == 0)
-				{
-					Matrix3f rot_diff_tmp = cur_R_est.transpose();
-					Corr_R_est = rot_diff_tmp * cur_R_est;
-					Corr_P_est = Vector3f(0.0,0.0,0.0);
-
-					rot_diff = rot_diff_tmp;
-					trans_diff = -rot_diff * cur_P_est;
-				}
-				else
-				{
-					Corr_R_est = rot_diff * cur_R_est;
-					Corr_P_est = rot_diff * cur_P_est + trans_diff;
-				}
-			}
-
-			fprintf(outFile, "%f %f %f %f %f %f %f %f %f %f %f %f\n", Corr_R_est(0,0), Corr_R_est(0,1), Corr_R_est(0,2), Corr_P_est(0),
-																	  Corr_R_est(1,0), Corr_R_est(1,1), Corr_R_est(1,2), Corr_P_est(1), 
-																	  Corr_R_est(2,0), Corr_R_est(2,1), Corr_R_est(2,2), Corr_P_est(2));
-
-			++i;
+			
+			fclose(outFile);
 		}
-		
-		fclose(outFile);
 
-		bool succ = eval(Dataset + "/" + sequence);
+		if(evaluate_reslut == 1)
+			bool succ = eval(Dataset, sequence);
+		
 		return 1;
 	}
 
@@ -192,7 +199,7 @@ int main(int argc, char** argv)
 	    //ROS_BREAK();
 	    return 0;          
 	}
-
+	
 	double imageTime;
 	vector<double> imageTimeList;
 
@@ -227,16 +234,119 @@ int main(int argc, char** argv)
 
 	bool use_imu = USE_IMU;
 
+	ifstream file_gt_pose;
+	string line_gt_pose;
+	Matrix3d R_gt_1, R_gt_2;
+	Vector3d P_gt_1, P_gt_2;
+	Matrix3d R_gt_motion = Matrix3d::Zero();
+	Vector3d P_gt_motion = Vector3d::Zero();
+
+	if(use_gt_to_show_match)
+	{
+		file_gt_pose.open((dataPath + "label/gt_pose_cam.txt").c_str(), ios::in);
+		if(!file_gt_pose.is_open())
+		{
+			printf("cannot open file: %slabel/gt_pose_cam.txt\n", dataPath.c_str());
+			return 0;          
+		}
+	}
+
+	bool is_cam_gt = false;
+	Matrix3d gt_R_imu_to_cam;
+	Vector3d gt_P_imu_to_cam;
+	if(use_gt_to_show_match)
+	{
+		cv::FileStorage fsSettings(config_file, cv::FileStorage::READ);
+		if(!fsSettings.isOpened())
+		{
+			std::cerr << "ERROR: Wrong path to settings" << std::endl;
+		}
+		cv::Mat cv_T;
+		fsSettings["body_T_cam0"] >> cv_T;
+		Eigen::Matrix4d T;
+		cv::cv2eigen(cv_T, T);
+		gt_R_imu_to_cam = T.block<3, 3>(0, 0);
+		gt_P_imu_to_cam = T.block<3, 1>(0, 3);
+		
+		string Dataset;
+		fsSettings["dataset"] >> Dataset;
+		
+		string DATA = "KITTI_odometry";
+		if(Dataset == DATA)
+			is_cam_gt = true;
+		
+		fsSettings.release();
+	}
+
+	set<int> spec_frame;
+	// spec_frame.insert(885);
+	// spec_frame.insert(886);
+	// spec_frame.insert(887);
+	// spec_frame.insert(888);
+	// spec_frame.insert(909);
+	// spec_frame.insert(910);
+	// spec_frame.insert(911);
+	
     for (size_t i = 0; i < imageTimeList.size(); ++i)
 	{
         printf("\nprocess image %d\n", (int)i);
         stringstream ss;
+		// 6 or 10(for some KITTI_tracking sequence)
         ss << setfill('0') << setw(6) << i;
         leftImagePath = dataPath + "image/image_02/" + ss.str() + ".png";
         rightImagePath = dataPath + "image/image_03/" + ss.str() + ".png";	
-
+		
 		t_cam = imageTimeList[i];
 		
+		if(use_gt_to_show_match)
+		{
+			getline(file_gt_pose, line_gt_pose);
+			istringstream istr_gt_pose(line_gt_pose);
+			if(i == 0)
+			{
+				istr_gt_pose >> R_gt_1(0,0) >> R_gt_1(0,1) >> R_gt_1(0,2) >> P_gt_1(0)
+							>> R_gt_1(1,0) >> R_gt_1(1,1) >> R_gt_1(1,2) >> P_gt_1(1)
+							>> R_gt_1(2,0) >> R_gt_1(2,1) >> R_gt_1(2,2) >> P_gt_1(2);
+				
+				// 如果是KITTI-tracking数据集，则提供的真值文件是IMU的位姿,转换成相机的真实位姿
+				if(!is_cam_gt)
+				{
+					Matrix3d cur_cam_R_gt = R_gt_1 * gt_R_imu_to_cam.transpose();
+					Vector3d cur_cam_P_gt = -cur_cam_R_gt * gt_P_imu_to_cam + P_gt_1;
+
+					R_gt_1 = cur_cam_R_gt;
+					P_gt_1 = cur_cam_P_gt;
+				}
+				
+			}
+			else
+			{
+				istr_gt_pose >> R_gt_2(0,0) >> R_gt_2(0,1) >> R_gt_2(0,2) >> P_gt_2(0)
+							>> R_gt_2(1,0) >> R_gt_2(1,1) >> R_gt_2(1,2) >> P_gt_2(1)
+							>> R_gt_2(2,0) >> R_gt_2(2,1) >> R_gt_2(2,2) >> P_gt_2(2);
+				
+				if(!is_cam_gt)
+				{
+					Matrix3d cur_cam_R_gt = R_gt_2 * gt_R_imu_to_cam.transpose();
+					Vector3d cur_cam_P_gt = -cur_cam_R_gt * gt_P_imu_to_cam + P_gt_2;
+
+					R_gt_2 = cur_cam_R_gt;
+					P_gt_2 = cur_cam_P_gt;
+				}
+				
+				// 得到转换矩阵，用于将上一帧坐标系下的点坐标转换到当前帧坐标系下
+				// gt文件中每一行表示的是首帧坐标系到某一帧坐标系的变换，其作用是将某一帧下的点坐标转换到首帧下坐标下的该点坐标
+				// 要注意区分 坐标系间的变换 和 某个点在两个坐标系下的坐标值间的变换，表示“坐标系A变换到坐标系B“的 欧式变换 也是 用于 “将某点在坐标系B下的坐标值变换到坐标系A下的坐标值“
+				R_gt_motion = R_gt_2.transpose() * R_gt_1;
+				P_gt_motion = R_gt_2.transpose()*(P_gt_1 - P_gt_2);
+
+            	Quaterniond delta_Q(R_gt_motion);
+            	double delta_ang = fabs(acos(delta_Q.w()) * 2.0 / 3.1416 * 180.0);
+				cout << "gt rotation angle: " << delta_ang << ", gt norm of translation: " << P_gt_motion.norm() << endl;
+			}
+
+		}
+
 		if(use_imu)
 		{
 			while(dt < t_cam)
@@ -265,7 +375,7 @@ int main(int argc, char** argv)
 				}
 				//cout << "measure g: " << acc(2) << endl;
 			}
-			// 最新的IMU的时刻需要大于或等于cam的时刻，这里假设比相机时刻已经多出了3帧IMU测量。这对于初始化IMU的初始坐标系比较重要
+			// 最新的IMU的时刻需要大于或等于cam的时刻，这里假设比相机时刻已经多出了3帧IMU测量(注意在组织数据集时不要忘了这点！）。这对于初始化IMU的初始坐标系比较重要
 			for(int k = 0; k < 3; ++k)
 			{
 				if(getline(file_IMU, line_IMU))
@@ -278,7 +388,7 @@ int main(int argc, char** argv)
 					}
 					// 应该使用oxts文件中的哪个坐标系下的imu数据？这里使用ax,ay,az,wx,wy,wz，即跟汽车的前、左、上对齐的IMU数据
 					istr_IMU >> acc(0)   >> acc(1)   >> acc(2)
-								>> elem     >> elem     >> elem
+								>> elem  >> elem     >> elem
 								>> ang_v(0) >> ang_v(1) >> ang_v(2);
 					
 					// 发布IMU数据和图像数据。给定imu到cam的外参矩阵！
@@ -317,8 +427,20 @@ int main(int argc, char** argv)
 		// cout << "psuh back image!" << endl;
         //estimator.inputImage(imageTimeList[i], imLeft, imRight);
 		cout << "Start vio process!" << endl;
-		estimator.Fea_Obj_Extract_Track(t_frame, init_succ, t_cam, imLeft, imRight, imLeft_gray, imRight_gray);
+		if(spec_frame.find(i) != spec_frame.end())
+			estimator.Fea_Obj_Extract_Track(t_frame, init_succ, t_cam, imLeft, imRight, imLeft_gray, imRight_gray, R_gt_motion, P_gt_motion, spec_frame);
+		else
+			estimator.Fea_Obj_Extract_Track(t_frame, init_succ, t_cam, imLeft, imRight, imLeft_gray, imRight_gray, R_gt_motion, P_gt_motion);
 		
+		if(use_gt_to_show_match)
+		{
+			if(i > 0)
+			{
+				R_gt_1 = R_gt_2;
+				P_gt_1 = P_gt_2;
+			}
+		}
+
 		if(i < 2)
 		{
 			printf("Process time for no.%d frame image: %fms\n", i, t_frame);
@@ -359,11 +481,15 @@ int main(int argc, char** argv)
 	estimator._shutdown = false;
 	estimator.clearState();
 	fclose(outFile);
+	file_IMU.close();
+
+	if(use_gt_to_show_match)
+		file_gt_pose.close();
 	
-	printf("Average process time before initialization: %fms\n", ave_t_before_init/num_frame_before_init);
+	if(USE_IMU) printf("Average process time before initialization: %fms\n", ave_t_before_init/num_frame_before_init);
 	printf("Average process time after initialization: %fms\n", ave_t_after_init/num_frame_after_init);
 
-	ifstream file_gt_pose_cam, file_gt_tracking, file_est_cam, file_est_obj, file_calib_1, file_calib_2, file_calib_3;
+	ifstream file_gt_pose_cam, file_gt_tracking, file_est_cam, file_est_obj;
 	
 	// 计算相机轨迹 和 运动物体的运动 的估计误差
 	file_gt_pose_cam.open((dataPath + "label/gt_pose_cam.txt").c_str(), ios::in);
@@ -389,11 +515,7 @@ int main(int argc, char** argv)
 	    // ROS_BREAK();
 	    return 0;
 	}
-
-	// file_calib_1.open((dataPath + "calib/calib_imu_to_velo.txt").c_str(), ios::in);
-	// file_calib_2.open((dataPath + "calib/calib_velo_to_cam.txt").c_str(), ios::in);
-	// file_calib_3.open((dataPath + "calib/calib_cam_to_cam.txt").c_str(), ios::in);
-
+	
 	string line_gt_cam, line_est_cam, line_gt_obj, line_est_obj;
 	// 记录每一帧中少跟踪的动态物体（这是相对于gt的计数，也有可能部分物体是gt中没有3D位姿标注的，例如该物体太远了）
 	vector<uchar> lost_dyn_objs_per_frame(imageTimeList.size(),0);   
@@ -588,6 +710,7 @@ int main(int argc, char** argv)
 		int frame_id, obj_id;
 		string elem;
 		stringstream ss;
+		// 6 or 10
 		ss << setfill('0') << setw(6) << i;
 		bool has_obj_cur_frame = true;
 		// 物体的真值信息
@@ -757,6 +880,10 @@ int main(int argc, char** argv)
 		cur_frame_obj_id_pose.clear();
 		cur_frame_obj_id_est_gt.clear();
 	}
+
+	file_gt_pose_cam.close();
+	file_gt_tracking.close(); 
+	file_est_cam.close();
 
 	float ave_err_cam_R = total_err_cam_R/num_img;
 	float ave_err_cam_P = total_err_cam_P/num_img;

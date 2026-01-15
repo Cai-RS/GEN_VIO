@@ -358,7 +358,7 @@ namespace YoloV8
         }
         // mask用于检测新的FAST点，把概率定的大一些，避免检测到错误地区的点。然后valid物体的像素点prob最低不能低于0.25。
         // 理论上概率小于0.5的点要被视为背景点。为了排除一些检测置信度很低的动态物体的影响，把放入mask_for_obj的背景点的置信度再提高些，则把物体检测置信度限制为大约0.15。反正背景的区域足够大！
-        else if(prob > 56)
+        else if(prob > 38)
         {
             // if(is_valid == 1) full_seg_map_device[index_mask_obj] = 255;
             full_seg_map_device[index_mask_bg] = 0;

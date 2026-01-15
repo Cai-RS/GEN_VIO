@@ -80,7 +80,7 @@ class FeaturePerId
   public:
     // 该特征点的（滑窗内）全局Id
     const int feature_id;
-    // 该地图点被观测到的首帧id
+    // 该地图点被观测到的首帧在当前滑窗中的id
     int start_frame;
     // 指的是该地图点在所有被观测帧上的观测信息（坐标，速度等）
     vector<FeaturePerFrame> feature_per_frame;
@@ -108,39 +108,48 @@ class FeatureManager
     void clearState();
     int getFeatureCount();
     int getFeatureCountLBAcur(int frameCnt);
-    bool addFeatureCheckParallax(int frame_count, double prev_td, double td, FeatureTracker &tracker, int &num_track_add, bool use_fea_no_depth = false);
-    void addStaticFeature(int frame_count, int prev_td, double td, FeatureTracker &tracker, const vector<pair<int,int>> &id_fea, const int id_obj_cur, 
-                          const vector<int> &reserve_new_sift, const vector<int> &ignore_pts, bool add_new_fea = false, int global_cls = 0);
+
+    bool addFeatureCheckParallax(int frame_count, double Headers[], double prev_td, double td, FeatureTracker &tracker, int &num_track_add, int &num_3D2D_track, bool need_LBA);
+
+    int addStaticFeature(int frame_count, int prev_td, double td, FeatureTracker &tracker, Vector3d Ps[], Matrix3d Rs[], Vector3d tic[], 
+                          Matrix3d ric[], const vector<pair<int,int>> &id_fea, const int id_obj_cur, bool need_marg, bool marg_old, 
+                          const vector<int> &reserve_new_sift = vector<int>(), const vector<int> &ignore_pts = vector<int>(), bool add_new_fea = false, int global_cls = 0);
+    
     vector<pair<Vector3d, Vector3d>> getCorresponding(int frame_count_l, int frame_count_r);
     //void updateDepth(const VectorXd &x);
-    void setDepth(const VectorXd &x);
+    void setDepth(int frameCnt, const VectorXd &x);
     void removeFailures();
     void clearDepth();
     VectorXd getDepthVector();
-    bool triangulate(int frameCnt, Vector3d Ps[], Matrix3d Rs[], Vector3d tic[], Matrix3d ric[], FeatureTracker &tracker, Vector3d Ps_cam_pred[], Matrix3d Rs_cam_pred[], bool before_PnP = false,
-                      const Matrix3d &R_from_E = Matrix3d(), Vector3d *norm_t = nullptr, double scale = 1.0, float pred_dist_t = 0.0, const set<int> &reserve_bg_track_pt_id = set<int>());
     
-    void triangulatePoint(Eigen::Matrix<double, 3, 4> &Pose0, Eigen::Matrix<double, 3, 4> &Pose1,
-                            Eigen::Vector2d &point0, Eigen::Vector2d &point1, Eigen::Vector3d &point_3d);
-    int initFramePoseByPnP(int frameCnt, FeatureTracker &tracker, Vector3d Ps[], Matrix3d Rs[], Vector3d tic[], Matrix3d ric[], Matrix3d &pred_R, Vector3d &pred_P, 
-                            const Matrix3d &prev_cam_R, const Vector3d &prev_cam_P, vector<int> &reserve_new_sift, int &num_track_cur_bg, bool use_IMU = true, bool initial_succ = false);
-    bool solvePoseByPnP(int frame_count, Eigen::Matrix3d &R_initial, Eigen::Vector3d &P_initial, vector<cv::Point2d> &pts2D, 
-                        vector<cv::Point3d> &pts3D, vector<int> &pts_id_vec, bool initial_succ);
-    void removeBackShiftDepth(Eigen::Matrix3d marg_R, Eigen::Vector3d marg_P, Eigen::Matrix3d new_R, Eigen::Vector3d new_P);
+    int triangulate(int frameCnt, double Headers[], Vector3d Ps[], Matrix3d Rs[], Vector3d tic[], Matrix3d ric[], FeatureTracker &tracker, int &num_track_3D_2D, bool good_est_RT = false, 
+                    bool marg_old = true, bool before_PnP = false, bool try_tria = true, bool try_update_dep = false, bool LBA_succ = false, 
+                    const Matrix3d &R_from_E = Matrix3d(), Vector3d *norm_t = nullptr, double scale = 1.0, float pred_dist_t = 0.0, const set<int> &reserve_bg_track_pt_id = set<int>());
+    
+    void triangulatePoint(Eigen::Matrix<double, 3, 4> &Pose0, Eigen::Matrix<double, 3, 4> &Pose1, Eigen::Vector2d &point0, Eigen::Vector2d &point1, Eigen::Vector3d &point_3d);
+    
+    float cal_ave_epi_line_dist_pts(const Matrix3d &R_cam_motion, const Vector3d &P_cam_motion, const vector<list<FeaturePerId>::iterator> &fea_iters, const vector<uchar> &status);
+    
+    bool initFramePoseByPnP(int frameCnt, FeatureTracker &tracker, Vector3d Ps[], Matrix3d Rs[], Vector3d tic[], Matrix3d ric[], Matrix3d &pred_R, Vector3d &pred_P, const Matrix3d &prev_cam_R, const Vector3d &prev_cam_P, 
+                            float &ave_epi_dist, vector<int> &reserve_new_sift, vector<int> &reserve_new_FAST, int &num_track_cur_bg, int &num_inlier_fea_PnP, bool comp_with_prev_esti = false, bool initial_succ = false);
+    
+    bool solvePoseByPnP(int frame_count, Eigen::Matrix3d &R_initial, Eigen::Vector3d &P_initial, vector<cv::Point2d> &pts2D, vector<cv::Point3d> &pts3D, vector<int> &pts_id_vec, bool initial_succ);
+    void removeBackShiftDepth(int frameCnt, Eigen::Matrix3d marg_R, Eigen::Vector3d marg_P, Eigen::Matrix3d new_R, Eigen::Vector3d new_P, FeatureTracker &tracker);
     void removeBackShiftDepth();
-    void removeBack();
-    void removeFront(int frame_count);
+    void removeBack(int frame_cnt, FeatureTracker &tracker);
+    void removeFront(int frame_cnt, FeatureTracker &tracker, double Headers[]);
     void removeOutlier(set<int> &outlierIndex);
+    void find_long_track_fea_in_map(int frameCnt, set<int> &fea_with_more_frames_in_map, set<int> &fea_with_3_frames_in_map);
 
     // 这是最新窗口内的静态特征点
     // 每个元素FeaturePerId就是一个特征地图点，其中会记录观测到该点的所有帧中的信息
     // 添加新的特征地图点和增加某地图点的观测帧记录的操作都是在FeatureManager::addFeatureCheckParallax()函数中
     // 用map是不是更好？把点的全局id作为key，索引起来效率是否更高？但是内存要求会高很多！
     list<FeaturePerId> feature;
-
+    
     // 存储最新窗口内的所有物体的特征点
-    map<int,list<FeaturePerId>> fea_objs_win;
-
+    // map<int,list<FeaturePerId>> fea_objs_win;
+    
     int last_track_num;
     double last_average_parallax;
     int new_feature_num;
@@ -150,6 +159,8 @@ class FeatureManager
     double compensatedParallax2(const FeaturePerId &it_per_id, int frame_count);
     const Matrix3d *Rs;
     Matrix3d ric[2];
+    
+    int pts_id_bloc[36][NUM_FEA_IN_BIG_BLOC];
 };
 
 #endif

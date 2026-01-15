@@ -25,6 +25,8 @@
 #include <g2o/types/slam3d/types_slam3d.h>
 #include <g2o/types/slam3d_addons/types_slam3d_addons.h>
 
+#include "parameters.h"
+
 struct RawImageData{
   size_t index;
   double time;
@@ -120,22 +122,30 @@ cv::Mat DrawFeatures(const cv::Mat& image, const std::vector<cv::KeyPoint>& keyp
 void GetFileNames(std::string path, std::vector<std::string>& filenames);
 bool FileExists(const std::string& file);
 bool PathExists(const std::string& path);
-void ConcatenateFolderAndFileName(
-    const std::string& folder, const std::string& file_name,
-    std::string* path);
+void ConcatenateFolderAndFileName(const std::string& folder, const std::string& file_name, std::string* path);
 
-std::string ConcatenateFolderAndFileName(
-    const std::string& folder, const std::string& file_name);
+std::string ConcatenateFolderAndFileName(const std::string& folder, const std::string& file_name);
 
 void MakeDir(const std::string& path);
 
-void ReadTxt(const std::string& file_path, 
-    std::vector<std::vector<std::string> >& lines, std::string seq);
+void ReadTxt(const std::string& file_path, std::vector<std::vector<std::string> >& lines, std::string seq);
 
-void WriteTxt(const std::string file_path, 
-    std::vector<std::vector<std::string> >& lines, std::string seq);
+void WriteTxt(const std::string file_path, std::vector<std::vector<std::string> >& lines, std::string seq);
 
-bool epipolarConstrain(const std::vector<cv::Point2f> &kp1, const std::vector<cv::Point2f> &kp2, const Eigen::Matrix3d& Mat_F, 
-                            std::vector<uchar> &is_inlier, const float &Th_score, float &score, const float &Th_dist = 4.0);
+int check_flow_with_H(const Eigen::Matrix3d &cam_H, const cv::Point2f &pt1, const cv::Point2f &pt2, float thres_dist = 0.0);
+
+int check_flow_with_F(const Eigen::Matrix3d &cam_F, const cv::Point2f &pt1, const cv::Point2f &pt2, float thres_dist = 0.0);
+
+float HomographyConstrain(const std::vector<cv::Point2f> &kp1, const std::vector<cv::Point2f> &kp2, const Eigen::Matrix3d& Mat_H, const Eigen::Matrix3d& Mat_H_inv,  
+                            std::vector<uchar> &is_inlier, const float &Th_score, float &score, int &has_outlier, const float &Th_dist = 5.0);
+
+float epipolarConstrain(const std::vector<cv::Point2f> &kp1, const std::vector<cv::Point2f> &kp2, const Eigen::Matrix3d& Mat_F, 
+                        std::vector<uchar> &is_inlier, const float &Th_score, float &score, int &has_outlier, const float &Th_dist = 4.0);
+
+double reprojectionError(const Eigen::Matrix3d &Ri, const Eigen::Vector3d &Pi, const Eigen::Matrix3d &rici, const Eigen::Vector3d &tici,
+                        const Eigen::Matrix3d &Rj, const Eigen::Vector3d &Pj, const Eigen::Matrix3d &ricj, const Eigen::Vector3d &ticj, 
+                        double depth, const Eigen::Vector3d &uvi, const Eigen::Vector3d &uvj);
+
+float cal_ave_epi_line_dist_pt(const Eigen::Matrix3d &Mat_F, const Eigen::Vector3d &pt1, const Eigen::Vector3d &pt2);
 
 #endif  // UTILS_H_

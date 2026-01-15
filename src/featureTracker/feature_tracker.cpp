@@ -20,7 +20,6 @@ int thres_num_fea_lose_obj = 4;
 // 对于当前帧的某个obj上的所有点，其所匹配的上一帧的物体中，匹配点最多的物体与第二多的物体间的匹配点数的比例，高于这个阈值则把当前帧物体匹配到最大匹配点数的上一帧物体
 float thres_rel_ratio_match_1_2 = 2.5;
 
-
 class Cmp_depth_stat_objs 
 {
     public:
@@ -38,94 +37,196 @@ void cal_centre_and_dist_pts(const vector<T> &pts, const set<int> &outliers, vec
 {
     int num = pts.size();
     if(num == 0) return;
-    dist_pts.clear();
+    // dist_pts.clear();
 
     float dist_pt;
     if(!has_cent)
     {
         // 注意，这里要先初始化该变量（不知道其之前被初始化了没有!）！
         cent_pt = 0.0;
+        int num_valid = 0;
         for(int i = 0; i < num; ++i)
         {
             if(outliers.find(i) != outliers.end()) continue;
             cent_pt = cent_pt + pts[i];
+            ++num_valid;
         }
-        cent_pt = cent_pt * factor_ / num;
+        if(num_valid > 0) cent_pt = cent_pt * factor_ / num_valid;
     }
     
-    for (int i = 0; i < pts.size(); ++i)
+    if(dist_pts.empty())
     {
-        dist_pt = norm(pts[i] * factor_- cent_pt);
-        dist_pts.push_back(dist_pt);
+        for (int i = 0; i < num; ++i)
+        {
+            if(outliers.find(i) != outliers.end()) 
+            {
+                // dist_pts.push_back(0);
+                continue;
+            }
+
+            dist_pt = norm(pts[i] * factor_- cent_pt);
+            dist_pts.push_back(dist_pt);
+        }
     }
 }
 
 template<typename T> 
-float cal_rubust_norm_stderr_pts_dist(vector<float> &orig_pts_dist, bool need_cal_dist, const vector<T> &pts, float factor_, set<int> &outliers_pts, bool has_cent, T &cent_pt, bool need_normalized, bool cal_std_dist)
+float cal_rubust_norm_stderr_pts_dist(const vector<float> &orig_pts_dist, bool need_cal_dist, const vector<T> &pts, float factor_, set<int> &outliers_pts, bool has_cent, 
+                                        T &cent_pt, bool cal_std_dist, bool need_normalized, bool more_try_find_outlier, bool one_dimen_pts, bool cout_MAD)
 {
-    outliers_pts.clear();
-    // 可以在一个模板函数内部再调用其它的模板函数！！
-    if(need_cal_dist) cal_centre_and_dist_pts(pts, outliers_pts, orig_pts_dist, factor_, has_cent, cent_pt);
-
-    // orig_pts_dist的点距离顺序是和pts对应的
-    vector<float> pts_dist = orig_pts_dist;
-
-    float dist_MAD = 0.0, dist_median = 0.0;
-    vector<float> abs_dist;
-    std::sort(pts_dist.begin(),pts_dist.end());
-    int num = pts_dist.size();
-    if (num % 2 == 0)
-    {
-        int second = num / 2;
-        int first = second - 1;
-        dist_median = (pts_dist[first] + pts_dist[second])/2; 
-        for (int i = 0; i < num; ++i)
-        {
-            abs_dist.push_back(abs(pts_dist[i] - dist_median));
-        }
-        std::sort(abs_dist.begin(),abs_dist.end());
-        // 1.4826是经验值，乘上它得到的dist_MAD是作为正态分布标准差的一种鲁棒的替代（即对极端异常值更为鲁棒，可以较大概率排除它）
-        dist_MAD = 1.4826 * (abs_dist[first] + abs_dist[second])/2; 
-    }
-    else
-    {
-        int index = num / 2;
-        dist_median = pts_dist[index];
-        for (int i = 0; i < num; ++i)
-        {
-            abs_dist.push_back(abs(pts_dist[i] - dist_median));
-        }
-        std::sort(abs_dist.begin(),abs_dist.end());
-        dist_MAD = 1.4826 * abs_dist[index];
-    }
-
-    float up_boundary = dist_median + 3 * dist_MAD;
-    float low_boundary = dist_median - 3 * dist_MAD;
+    // outliers_pts可以给定点集pts中已有的外点，后续在从剩下的点集中获取的新外点可以加入outliers_pts。前提是outliers_pts中的元素必须严格表示pts中某个点的序号！
+    // outliers_pts.clear();
     
-    for (int i = 0; i < num; ++i)
+    int num = pts.size();
+    int num_valid = num - outliers_pts.size();
+    // 至少要有2个元素，才能计算平均和标准差
+    if(num_valid < 2) return 0.0;
+
+    if(!need_cal_dist)
     {
-        if (orig_pts_dist[i] > up_boundary || orig_pts_dist[i] < low_boundary)
-            outliers_pts.insert(i);
+        if(num_valid != orig_pts_dist.size())
+        {
+            cout << "Weried! Line 89" << endl;
+            exit(-1);
+        }
+    }
+    
+    int cnt_iter = 0, max_iter = 1;
+    if(more_try_find_outlier) max_iter = 2;
+    bool has_new_outlier = false;
+
+    vector<float> pts_dist = orig_pts_dist;
+    set<int> new_outliers;
+    vector<uchar> status_dist;
+
+    bool need_re_cal = true;
+
+    while(cnt_iter < max_iter)
+    {
+        ++cnt_iter;
+
+        float dist_MAD = 0.0, dist_median = 0.0;
+        // 可以在一个模板函数内部再调用其它的模板函数！！
+        // orig_pts_dist的点距离的序号不一定是和pts对应的，因为pts中可能有外点，这些点的距离不会加入orig_pts_dist中
+        if(!pts_dist.empty()) 
+        {
+            if(cnt_iter == 1)
+            {
+                if(need_cal_dist)
+                    pts_dist.clear();
+            }
+            else
+            {
+                // 如果pts是一维点（如深度值），则直接把点的大小作为距离，不需要重新计算点距离，而是从原值中选取
+                if(!one_dimen_pts) pts_dist.clear();
+            }
+        }
+
+        if(cnt_iter > 1 || (need_cal_dist || !has_cent)) cal_centre_and_dist_pts(pts, outliers_pts, pts_dist, factor_, has_cent, cent_pt);
+        // 计算有效点集的MAD和median
+        cal_MAD_value(pts_dist, dist_MAD, dist_median);
+        
+        float up_boundary = dist_median + 3 * dist_MAD;
+        float low_boundary = dist_median - 3 * dist_MAD;
+        if(cout_MAD && cnt_iter >= max_iter) cout << "mdeian: " << dist_median << ", up_boundary: " << up_boundary << ", low_boundary: " << low_boundary << endl;
+        
+        int cnt = 0;
+        bool got_dist_status = (more_try_find_outlier && cnt_iter < max_iter && one_dimen_pts);
+        for (int i = 0; i < num; ++i)
+        {
+            if(outliers_pts.find(i) != outliers_pts.end()) 
+            {
+                continue;
+            }
+            
+            if(pts_dist[cnt] > up_boundary || pts_dist[cnt] < low_boundary)
+            {
+                new_outliers.insert(i);
+                if(got_dist_status) status_dist.push_back(0);;
+            }
+            else
+            {
+                if(got_dist_status) status_dist.push_back(1);
+            }
+            ++cnt;
+        }
+        
+        if(new_outliers.empty())
+        {
+            need_re_cal = false;
+            break;
+        }
+        else
+        {
+            int num_new_outlier = new_outliers.size();
+            // > 0?
+            if((num_valid - num_new_outlier) > 1)
+            {
+                num_valid -= num_new_outlier;
+                // 再次去除外点的影响，并计算新的中点
+                has_new_outlier = true;
+                for(auto &iter: new_outliers)
+                {
+                    outliers_pts.insert(iter);
+                }
+
+                // 如果pts是一维点（如深度值），则直接把点的大小作为距离，不需要重新计算点距离，而是从原值中选取
+                if(!status_dist.empty())
+                {
+                    reduceVector(pts_dist, status_dist);
+                    status_dist.clear();
+                }
+
+                new_outliers.clear();
+            }
+            else
+            {
+                need_re_cal = false;
+                break;
+            }
+        }
     }
 
-    if(!cal_std_dist) return 0.0;
-    // 再次去除外点的影响
-    if (!outliers_pts.empty())
-        cal_centre_and_dist_pts(pts, outliers_pts, pts_dist, factor_, false, cent_pt);
-    float ave_dist_pts = std::accumulate(pts_dist.begin(),pts_dist.end(),0)/pts_dist.size();
-    float std_pts = 0.0;
-    std::for_each(pts_dist.begin(),pts_dist.end(),[&](const float d){
-        std_pts += (d-ave_dist_pts)*(d-ave_dist_pts);
-    });
-    if(need_normalized)
-        return sqrt(std_pts)/ave_dist_pts;
+    // 最终至少要有2个有效的距离
+    if(num_valid > 1)
+    {
+        if(cal_std_dist)
+        {
+            if(need_re_cal)
+            {
+                pts_dist.clear();
+                // 计算新的中心 和 有效点到中心的距离
+                cal_centre_and_dist_pts(pts, outliers_pts, pts_dist, factor_, false, cent_pt);
+            }
+            
+            float ave_dist_pts = std::accumulate(pts_dist.begin(),pts_dist.end(),0)/pts_dist.size();
+            float std_pts = 0.0;
+            std::for_each(pts_dist.begin(),pts_dist.end(),[&](const float d){
+                std_pts += (d-ave_dist_pts)*(d-ave_dist_pts);
+            });
+            
+            if(need_normalized)
+                return sqrt(std_pts)/ave_dist_pts;
+            else
+                return sqrt(std_pts);
+        }
+        else
+        {
+            // 只计算新的中心
+            if(need_re_cal) cal_centre_and_dist_pts(pts, outliers_pts, pts_dist, factor_, false, cent_pt);
+            return 0.0;
+        }
+    }
     else
-        return sqrt(std_pts);
+    {
+        return 0.0;
+    }
 }
 
 // 函数内需要对pts进行修改，但是不允许对原变量有影响，因此用值传递
-void cal_MAD_value(vector<float> pts, float &dist_MAD, float &dist_median)
+void cal_MAD_value(vector<float> pts, float &dist_MAD, float &dist_median, set<int> outliers_pts)
 {
+    bool has_outlier = (!outliers_pts.empty());
     std::sort(pts.begin(),pts.end());
     int num = pts.size();
     if (num % 2 == 0)
@@ -135,6 +236,10 @@ void cal_MAD_value(vector<float> pts, float &dist_MAD, float &dist_median)
         dist_median = (pts[first] + pts[second])/2; 
         for (int i = 0; i < num; ++i)
         {
+            if(has_outlier)
+            {
+                if(outliers_pts.find(i) != outliers_pts.end()) continue;
+            }
             pts[i] = abs(pts[i] - dist_median);
         }
         std::sort(pts.begin(),pts.end());
@@ -147,20 +252,45 @@ void cal_MAD_value(vector<float> pts, float &dist_MAD, float &dist_median)
         dist_median = pts[index];
         for (int i = 0; i < num; ++i)
         {
+            if(has_outlier)
+            {
+                if(outliers_pts.find(i) != outliers_pts.end()) continue;
+            }
             pts[i] = abs(pts[i] - dist_median);
         } 
         std::sort(pts.begin(),pts.end());
         dist_MAD = 1.4826 * pts[index];
     }
-
 }
 
-bool FeatureTracker::inBorder(const cv::Point2f &pt)
+// 基于MAD值计算对给定的一个点集的深度进行离群值筛除
+void use_MAD_to_filter_dep_outlier(vector<float> &dep_pts, set<int> &outliers, float &cent_dep, bool more_iter, bool cout_MAD)
 {
-    const int BORDER_SIZE = 5; // 1
-    int img_x = cvRound(pt.x);
-    int img_y = cvRound(pt.y);
-    return BORDER_SIZE <= img_x && img_x < col - BORDER_SIZE && BORDER_SIZE <= img_y && img_y < row - BORDER_SIZE;
+    int num_pts = dep_pts.size();
+    if(num_pts < 3) return;
+    if(!outliers.empty()) outliers.clear();
+
+    set<int> outliers_pts;
+    // 可以多次计算MAD以排除更多离群值？
+    float succ = cal_rubust_norm_stderr_pts_dist(dep_pts, false, dep_pts, 1.0, outliers_pts, false, cent_dep, false, false, more_iter, true, cout_MAD);
+
+    // 设定相对于计算的median值的上下限深度距离，则在这个范围内的深度值的点仍当作内点（防止物体上的点大部分集中在某个小深度范围而将其他内点排除，例如一辆小轿车的长度大致是3-4m）
+    if(!outliers.empty())
+    {   
+        float low_dep_th = cent_dep - 0.5, high_dep_th = cent_dep + 1.5;
+        if(cent_dep <= 5.5) low_dep_th = cent_dep - 0.5, high_dep_th = cent_dep + 2.0;
+
+        for(auto &iter: outliers_pts)
+        {
+            float out_dep = dep_pts[iter];
+            // 认为在距离平均深度的较小范围内深度的点不应该是外点（车辆的正常长度范围，且一般观测较多的点是车辆的后半部，所以适当提高远点范围）
+            // 这种被相距较近但仍被当作外点的原因一般是某个深度的点过于多，导致点深度的MAD值太小！
+            if(out_dep > low_dep_th && out_dep < high_dep_th) 
+                continue;
+            else
+                outliers.insert(iter);
+        }
+    }
 }
 
 double distance(cv::Point2f pt1, cv::Point2f pt2)
@@ -200,8 +330,11 @@ FeatureTracker::FeatureTracker()
 
     total_frame = 0;
 
+    IMU_init_succ = false;
+
     USE_TRIANGULATE_TWO_FRAME = true;
-    
+
+    add_stereo_for_bg_fea_cur_frame = false;
     has_motion_pred_first_two_frame = false;
 
     FAST_pred_motion = false;
@@ -220,19 +353,34 @@ FeatureTracker::FeatureTracker()
 
     show_tracked_fea = true;
     
-    reject_with_F = true;
+    use_MAD_to_fliter_flow = true;
+    // 是否允许使用极线约束来过滤静态跟踪点。包含了 直接使用预测运动值来构建F矩阵并过滤 或者 通过基于2d-2d点估计F/H矩阵并筛除其中的外点
+    // reject_with_F = true;
+    reject_with_F = (REJECT_WITH_F == 1);
+    // 最终是否进行F/H估计取决于是否处于纯时觉阶段
+    need_cal_FH = false;
+    before_cal_FH = true;
     only_use_track_sift_for_F = false;
-    // 当前帧是否要根据对极约束用前后帧的2d-2d sift匹配点估计F矩阵
-    EASI_RANSAC_FH = true;
-    // 如果要用sift匹配点估计F，是否估计成功
+    // 在过滤静态跟踪的方法中，是否选择通过估计F或H矩阵的方法
+    ESTI_RANSAC_FH = true;
+    // 如果要攨sift匹配点估计F，是否估计成功
     cal_Mat_F_H = false;
     // F的计算还可以使用已知的2帧间的相机运动（如用IMU积分或者相机运动模型）。当前帧是否有有效的F矩阵
     has_valid_F = false;
     has_valid_H = false;
     fea_filtered = false;
 
+    small_p = false;
+    ave_flow_len_sta_fea = 0;
+
+    // 下面两个参数其实应该放在config中由用户自定义
+    // 每个时刻是否临时从上一帧中检测点并匹配到当前帧，再选择保留哪些点
+    add_new_fea_in_next_frame = true;
+    // 是否要将临时检测到的上一帧有立体匹配的sift点改为FAST点并跟踪
     add_new_FAST_from_sift = false;
-    add_new_sift_in_next_frame = true;
+    // 是否已经将背景或静态物体的sift跟踪点加入NCC_matching_all中
+    done_select_sift_bg = false;
+    wait_done = false;
 
     ave_dep_bg_cur_frame = 0.0;
     num_bg_with_dep = 0;
@@ -245,6 +393,11 @@ FeatureTracker::FeatureTracker()
     num_track_sift = 0;
     num_track_FAST_bg = 0;
     num_track_sift_bg = 0;
+    num_track_sift_obj = 0;
+    num_new_sift_obj = 0; 
+    num_track_FAST_obj = 0; 
+    num_new_FAST_obj = 0;
+    
     last_id_track_fea_prev = 0;
     num_track_FAST_static = 0;
     num_track_sift_static = 0;
@@ -253,12 +406,98 @@ FeatureTracker::FeatureTracker()
     num_long_track_fea_stat = 0;
     num_track_fea_static = 0;
 
-    num_sta_objs_found = 0;
-
     num_sift_bg_prev = 0;
     num_sift_bg_cur = 0;
 
     has_lost_obj_prev = false;
+
+    pred_trans_cam = 0.0;
+    pred_delta_angle_cam = -1.0;
+
+    K_cv = (cv::Mat_<float>(3, 3) << K(0, 0), K(0, 1), K(0, 2), K(1, 0), K(1, 1), K(1, 2), K(2, 0), K(2, 1), K(2, 2));
+
+    {
+        id_small_bloc_in_big_bloc[0][0] = 0;
+        id_small_bloc_in_big_bloc[0][1] = 1;
+        id_small_bloc_in_big_bloc[0][2] = 2;
+        id_small_bloc_in_big_bloc[0][3] = 6;
+        id_small_bloc_in_big_bloc[0][4] = 7;
+        id_small_bloc_in_big_bloc[0][5] = 8;
+        id_small_bloc_in_big_bloc[0][6] = 12;
+        id_small_bloc_in_big_bloc[0][7] = 13;
+        id_small_bloc_in_big_bloc[0][8] = 14;
+
+        id_small_bloc_in_big_bloc[1][0] = 3;
+        id_small_bloc_in_big_bloc[1][1] = 4;
+        id_small_bloc_in_big_bloc[1][2] = 5;
+        id_small_bloc_in_big_bloc[1][3] = 9;
+        id_small_bloc_in_big_bloc[1][4] = 10;
+        id_small_bloc_in_big_bloc[1][5] = 11;
+        id_small_bloc_in_big_bloc[1][6] = 15;
+        id_small_bloc_in_big_bloc[1][7] = 16;
+        id_small_bloc_in_big_bloc[1][8] = 17;
+
+        id_small_bloc_in_big_bloc[2][0] = 18;
+        id_small_bloc_in_big_bloc[2][1] = 19;
+        id_small_bloc_in_big_bloc[2][2] = 20;
+        id_small_bloc_in_big_bloc[2][3] = 24;
+        id_small_bloc_in_big_bloc[2][4] = 25;
+        id_small_bloc_in_big_bloc[2][5] = 26;
+        id_small_bloc_in_big_bloc[2][6] = 30;
+        id_small_bloc_in_big_bloc[2][7] = 31;
+        id_small_bloc_in_big_bloc[2][8] = 32;
+
+        id_small_bloc_in_big_bloc[3][0] = 21;
+        id_small_bloc_in_big_bloc[3][1] = 22;
+        id_small_bloc_in_big_bloc[3][2] = 23;
+        id_small_bloc_in_big_bloc[3][3] = 27;
+        id_small_bloc_in_big_bloc[3][4] = 28;
+        id_small_bloc_in_big_bloc[3][5] = 29;
+        id_small_bloc_in_big_bloc[3][6] = 33;
+        id_small_bloc_in_big_bloc[3][7] = 34;
+        id_small_bloc_in_big_bloc[3][8] = 35;
+
+        limit_num_track_per_bloc.resize(36, NUM_FEA_IN_BLOC);
+
+        vector<int> id_set = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+        vector<int> num_limit = {8, 4, 4, 4, 4, 8, 9, 8, 5, 5, 8, 9};
+        int i = 0;
+        for(auto &iter: id_set)
+        {
+            limit_num_track_per_bloc[iter] = num_limit[i++];
+        }
+
+        // 上半图像的大bloc中允许点少一些，因为好的点一般比较少？
+        max_num_track_big_bloc[0] = 3.0/4.0 * NUM_FEA_IN_BIG_BLOC;
+        max_num_track_big_bloc[1] = 3.0/4.0 * NUM_FEA_IN_BIG_BLOC;
+        max_num_track_big_bloc[2] = 5.0/4.0 * NUM_FEA_IN_BIG_BLOC;
+        max_num_track_big_bloc[3] = 5.0/4.0 * NUM_FEA_IN_BIG_BLOC;
+
+        max_num_track_for_FH_big_bloc[0] = 6;
+        max_num_track_for_FH_big_bloc[1] = 6;
+        max_num_track_for_FH_big_bloc[2] = 14;
+        max_num_track_for_FH_big_bloc[3] = 14;
+    }
+
+    for(int i = 0; i < 4; ++i)
+    {
+        // 每一帧跟踪的第一次3D-2D检测时对各个bloc的近处和总的3D-2D点数的最低要求（近点总数16，总点数24）
+        if(i < 2)
+        {
+            // 上半图像由于一般都是远点，因此对近点的数量不做要求
+            min_num_near_3D2D[i] = 0;
+            // min_total_num_3D2D[i] = max(5, Min_total_3D2D_track/4);
+            min_total_num_3D2D[i] = 4;
+        }
+        else
+        {
+            min_num_near_3D2D[i] = max(6, Min_total_near_3D2D_track/2);
+            // min_total_num_3D2D[i] = max(5, Min_total_3D2D_track/4);
+            min_total_num_3D2D[i] = 8;
+        }
+
+        num_sta_obj_track_per_bloc[i] = 0;
+    }
     
     // 初始化openMP的锁
     omp_init_lock(&mylock);
@@ -269,17 +508,28 @@ FeatureTracker::~FeatureTracker()
     omp_destroy_lock(&mylock);
 }
 
-// 给上一帧图像中的物体
+bool FeatureTracker::inBorder(const cv::Point2f &pt)
+{
+    // 注意，这里的Border的取值要参考 后续优化特征点匹配时所取样的邻近点范围 以及 计算NCC时的窗口大小！
+    const int BORDER_SIZE = (3 + Len_edge_win/2 + 4); // 10
+    int img_x = cvRound(pt.x);
+    int img_y = cvRound(pt.y);
+    return BORDER_SIZE <= img_x && img_x < col - BORDER_SIZE && BORDER_SIZE <= img_y && img_y < row - BORDER_SIZE;
+}
+
+// 给上一帧的obj_mask绘制物体点
 void FeatureTracker::draw_mask_fea_prev_obj(const double &cur_time_)
 {
     use_prev_fea = false;
     cur_time = cur_time_;
+    if(frame_cnt > 0) cur_dt = cur_time- prev_time;
 
     // copy_mask_bg = false;
     // 要复制的不是上一帧标记了物体和背景点的mask_bg，而是仅标记物体区域的mask_bg。因此复制放在了每一帧的mask_bg刚建立时的
-    if(add_new_sift_in_next_frame)
+    if(add_new_fea_in_next_frame)
     {
         // 上一帧的原始背景mask
+        // 拷贝该mask，用于后续
         mask_bg_prev = mask_bg.clone();
         // 与其保留这些信息，不如在遍历每个有效跟踪点时就直接在mask_prev_fea_objs上画圈
         // vector<pair<uchar,int>> temp_obj_id_prev_FAST = obj_cls_id_FAST;
@@ -295,7 +545,7 @@ void FeatureTracker::draw_mask_fea_prev_obj(const double &cur_time_)
     mask_prev_fea_objs.setTo(255);
 
     // 如果待跟踪FAST点 需要在当前帧才能确定，则暂时先不标注mask_prev_fea_objs
-    if(add_new_sift_in_next_frame) return;
+    if(add_new_fea_in_next_frame) return;
 
     for(int i = 0; i < prev_FAST.size(); ++i)
     {
@@ -318,7 +568,7 @@ void FeatureTracker::draw_mask_fea_prev_obj(const double &cur_time_)
         }
     }
     use_prev_fea = true;
-    cout << "Succeeded set mask for fea in prev frame!" << endl;
+    cout << "Succeeded set mask for obj-fea in prev frame!" << endl;
 }
 
 // 新版的mask设置函数，不考虑是否使用IMU或者是否已经完成初始化
@@ -327,16 +577,16 @@ void FeatureTracker::draw_mask_fea_prev_obj(const double &cur_time_)
 // 如果当前帧没有有效的F（例如位移为0)，则2d-2d匹配没有经过筛选，则先添加剩下的sift跟踪点（匹配较为准确），再添加剩下的FAST跟踪点
 // 最后，是否要在此处 添加当前帧新检测的sift点（新检测的sift点必须要有立体匹配，没有立体匹配的点由下一帧的cudasift中的前后帧匹配结果来获取）？
 // 如果是纯视觉，或者使用IMU且还未初始化，则选择先添加sift新点标注（其实有深度估计的点也不太多）；否则，先添加FAST新点，再添加sift新点
-void FeatureTracker::setMask(bool initial_succ, bool use_IMU)
+void FeatureTracker::setMask()
 {
     uchar status;
     int gl_id;
     // 先添加上一帧有立体匹配的背景跟踪FAST点.
     // 如果是跟踪后再选取sift点，则有另外一套标注逻辑。
     // 如果所有的背景点跟踪已经结束，且最新帧中不会添加新的背景点，则背景部分不需要标注了
-    if(!add_new_sift_in_next_frame)
+    if(!add_new_fea_in_next_frame)
     {
-        for (int i = 0; i < cur_FAST.size(); ++i)
+        for(int i = 0; i < cur_FAST.size(); ++i)
         {
             // 先添加上一帧有深度值的跟踪点
             if (status_FAST[i] == 0) continue;
@@ -364,71 +614,74 @@ void FeatureTracker::setMask(bool initial_succ, bool use_IMU)
     }
 
     // 再添加上一帧有深度值的背景和物体跟踪sift点
-    if(num_track_sift > 0)
-    {
-        for (int i = 0; i < num_track_sift; ++i)
-        {   
-            status = status_sift[i];
-            // 如果不是有效跟踪点，则放弃标注该点。0为无效跟踪点，3只能为背景的新检测点
-            if(status != 1 && status != 2) continue;
+    // 当前帧有效sift跟踪点大于0
+    int num_size_pt = prev_sift.size();
+    int num_total = cur_sift.size();
+    for (int i = 0; i < num_total; ++i)
+    {   
+        status = status_sift[i];
+        // 如果不是有效跟踪点，则放弃标注该点。0为无效跟踪点，3只能为背景的新检测点
+        if(status == 0) continue;
 
-            gl_id = ids_sift[i];
-            // 对于新增加的上一帧的跟踪点，如果在上一帧有立体匹配，此时其深度值也可能还是-1.0
-            // if(prev_sift_dep[i] <= 0) continue;
+        gl_id = ids_sift[i];
 
-            if(prev_sift_dep[i] <= 0 && prevRightFeaMap.find(gl_id) == prevRightFeaMap.end()) continue;
-
-            Point2f &sift = cur_sift[i];
-            if (obj_cls_id_sift[i].second == 0)
+        Point2f &sift = cur_sift[i];
+        if (obj_cls_id_sift[i].second == 0)
+        {
+            if(add_new_fea_in_next_frame) continue;
+            // 注意，由于use_tria_stereo的使用和当前帧临时添加的上一帧的新点，上一帧的点即使有立体匹配，此时其深度值也可能为-1.0
+            // 最后，所有背景跟踪点在上一帧的立体匹配都是在当前帧才进行搜寻！
+            if(i < num_size_pt)
             {
-                if(add_new_sift_in_next_frame) continue;
-                if (mask_bg_cur.at<uchar>(sift.y,sift.x) == 255)
-                    cv::circle(mask_bg_cur, sift, MIN_DIST_BG, 0, -1);
-                else
-                    status_sift[i] = 0;
+                if(prev_sift_dep[i] <= 0 && prevRightFeaMap.find(gl_id) == prevRightFeaMap.end()) 
+                    continue;
+            }
+            
+            if (mask_bg_cur.at<uchar>(sift.y,sift.x) == 255)
+                cv::circle(mask_bg_cur, sift, MIN_DIST_BG, 0, -1);
+            else
+                status_sift[i] = 0;
+        }
+        else
+        {
+            // MIN_DIST_OBJ的值要比较小，因为物体的区域一般很小
+            if (mask_solid_objs.at<uchar>(sift.y,sift.x) == 255)
+            {
+                cv::circle(mask_solid_objs, sift, MIN_DIST_OBJ, 0, -1);
+                ++num_track_sift_obj;
             }
             else
-            {
-                // MIN_DIST_OBJ的值要比较小，因为物体的区域一般很小
-                if (mask_solid_objs.at<uchar>(sift.y,sift.x) == 255)
-                    cv::circle(mask_solid_objs, sift, MIN_DIST_OBJ, 0, -1);
-                else
-                    status_sift[i] = 0;
-            }
+                status_sift[i] = 0;
         }
     }
     
+    num_size_pt = cur_FAST.size();
     // 再添加上一帧物体跟踪FAST点,物体跟踪点必须有深度值
-    for (int i = 0; i < cur_FAST.size(); ++i)
+    for (int i = 0; i < num_size_pt; ++i)
     {
         if (status_FAST[i] == 0) continue;
         Point2f &FAST = cur_FAST[i];
         gl_id = ids_FAST[i];
-        
-        // 再添加上一帧有深度值的物体FAST跟踪点
-        // 注意，由于use_tria_stereo的使用和当前帧临时添加的上一帧的新点，上一帧的点即使有立体匹配，此时其深度值也可能为-1.0
-        // 但是对于物体点，其上一帧的点即使是新添加的，只要其有立体匹配，则会立即给出其有效深度值（即认为立体校正的精度还可以接受）
-        if (prev_FAST_dep[i] > 0)
+
+        // 如果当前帧匹配点为物体点
+        if(obj_cls_id_FAST[i].second > 0)
         {
-            // 如果当前帧匹配点为物体点
-            if (obj_cls_id_FAST[i].second > 0)
+            // 如果当前帧的FAST的匹配点跟已添加的FAST点过近，则放弃此FAST匹配
+            if (mask_solid_objs.at<uchar>(FAST.y,FAST.x) == 0)
             {
-                // 如果当前帧的FAST的匹配点跟已添加的FAST点过近，则放弃此FAST匹配
-                if (mask_solid_objs.at<uchar>(FAST.y,FAST.x) == 0)
-                {
-                    status_FAST[i] = 0;
-                    continue;
-                }
-                else
-                {
-                    cv::circle(mask_solid_objs, FAST, MIN_DIST_OBJ, 0, -1);
-                }
+                status_FAST[i] = 0;
+                continue;
+            }
+            else
+            {
+                ++num_track_FAST_obj;
+                cv::circle(mask_solid_objs, FAST, MIN_DIST_OBJ, 0, -1);
             }
         }
         // 同时添加上一帧没有立体匹配的背景FAST跟踪点
         else
         {
-            if(add_new_sift_in_next_frame) continue;
+            if(add_new_fea_in_next_frame) continue;
             // 此处用cls来判断背景跟踪点
             // 上一帧没有深度的点，即使其是上一帧的漏检物体上的点，也放弃（因为后续没法参与物体的运动估计）
             if (obj_cls_id_FAST[i].first == 0)
@@ -469,87 +722,6 @@ void FeatureTracker::setMask(bool initial_succ, bool use_IMU)
     //     }
     // }
     
-    // 添加剩下的sift跟踪点和部分新点
-    // 最后选择优先FAST新点，因为当前帧的sift跟踪点和新点在下一帧中大部分都没法被跟踪
-    if(0)
-    {
-        for (int i = 0; i < cur_sift.size(); ++i)
-        {   
-            status = status_sift[i];
-            if(status == 0) continue;
-            // 再添加上一帧没有深度值的背景sift跟踪点
-            if(i < num_track_sift)
-            {
-                // 已经标注
-                if(prev_sift_dep[i] > 0) continue;
-                // 如果是跟踪点
-                if(status == 1 || status == 2) 
-                {
-                    Point2f &sift = cur_sift[i];
-                    if (obj_cls_id_sift[i].second == 0)
-                    {
-                        if (mask_bg_cur.at<uchar>(sift.y,sift.x) == 255)
-                            cv::circle(mask_bg_cur, sift, MIN_DIST_BG, 0, -1);
-                        else
-                            status_sift[i] = 0;
-                    }
-                }
-            }
-            // sift新点是否要在这里添加标注？
-            // 最后的版本中在每一帧的背景集中不添加有立体匹配的新点，而是根据下一帧的跟踪结果再去寻找其中有立体匹配的点，这样可以避免消耗太多本用于FAST的点
-            else
-            {
-                Point2f &sift = cur_sift[i];
-                // 物体新点必须有立体匹配
-                if(obj_cls_id_sift[i].second > 0)
-                {
-                    assert(status == 1 && "Why new sift of obj has no depth?");
-                    if(mask_solid_objs.at<uchar>(sift.y,sift.x) == 0)
-                    {
-                        status_sift[i] = 0;
-                        continue;
-                    }
-                    else
-                    {
-                        cv::circle(mask_solid_objs, sift, MIN_DIST_OBJ, 0, -1);
-                    }
-                }
-                // 背景新点可以没有立体匹配
-                else
-                {
-                    // 背景中有立体匹配的sift新点，在此直接添加
-                    if(status == 1)
-                    {
-                        // 如果是纯视觉 或者 VI但还未初始化，则先添加有立体匹配的背景sift新点（这部分点其实比较少）
-                        if(!use_IMU || (use_IMU && !initial_succ))
-                        {
-                            if (mask_bg_cur.at<uchar>(sift.y,sift.x) == 255)
-                                cv::circle(mask_bg_cur, sift, MIN_DIST_BG, 0, -1);
-                            else
-                                status_sift[i] = 0;
-                        }
-                    }
-                    else
-                    {
-                       assert(status == 3 && "Why new sift of bg has other status besieds 1 and 3?");
-                        
-                        // if(!use_IMU || (use_IMU && !initial_succ))
-                        // {
-                        //     if (mask_bg.at<uchar>(sift.y,sift.x) == 255)
-                        //         cv::circle(mask_bg, sift, MIN_DIST_BG, 0, -1);
-                        //     else
-                        //         status_sift[i] = 0;
-                        // }
-                        // else
-                        //     continue;
-
-                        // 没有深度的新点中，先添加FAST再添加sift。（最新版本中不保留没有立体匹配的sift新点，因为哪些sift点会被跟踪需要等到下一帧才知道，其中很多点根本不再当前帧的stereo匹配点集中）
-                        continue;
-                    }
-                }
-            }
-        }
-    }
     // 删除无效的sift点（包括跟踪点和新点）。如果sift点还包含没有立体匹配的新点，则先不再这里删除，而是等到FAST新点检测之后，先标注FAST新点，可能还有需要删除的新sift点。
     // reduce_invalid_fea(true);
 
@@ -833,6 +1005,9 @@ void FeatureTracker::reduce_invalid_fea(bool for_sift)
         int valid_prev_num = prev_num;
         int cur_num = ids_sift.size();
         int num_cur_right = cur_right_sift.size();
+
+        int num_long_track = num_old_track_sift;
+
         for (int i = 0; i < cur_num; ++i)
         {
             if (status_sift[i] > 0)
@@ -847,7 +1022,7 @@ void FeatureTracker::reduce_invalid_fea(bool for_sift)
                         prev_sift_dep[j] = prev_sift_dep[i];
                         //prev_un_sift[j] = prev_un_sift[i];
                     }
-                    // 这个变量虽然写着prev，但是其长度和所有cur_变量是一直的，因为它是在继承自上一帧的同时添加了新的点
+                    // 这个变量虽然写着prev，但是其长度和所有cur_变量是一致的，因为它是在继承自上一帧的同时添加了新的点
                     prev_sift_global_obj_id[j] = prev_sift_global_obj_id[i];
                     obj_cls_id_sift[j] = obj_cls_id_sift[i];
                     ids_sift[j] = ids_sift[i];
@@ -861,13 +1036,19 @@ void FeatureTracker::reduce_invalid_fea(bool for_sift)
             }
             else
             {
-                if(i < prev_num) --valid_prev_num;
+                if(i < prev_num) 
+                {
+                    --valid_prev_num;
+
+                    // 长期跟踪点数目减少
+                    if(i < num_long_track) --num_old_track_sift;
+                }
             }
         }
 
         if(j < cur_num)
         {
-            // resize会去除前j个元素之后的所有元素
+            // resize会去除前⁪个元素之后的所有元素
             if(valid_prev_num < prev_num)
             {
                 prev_sift.resize(valid_prev_num);
@@ -890,6 +1071,8 @@ void FeatureTracker::reduce_invalid_fea(bool for_sift)
         // 注意，FAST是否还有部分变量需要reduce？
         int cur_num = ids_FAST.size();
         int num_cur_right = cur_right_FAST.size();
+        int num_long_track = num_old_track_FAST; 
+
         for (int i = 0; i < cur_num; ++i)
         {
             // 这里要用status_FAST吗？而不是用statusLeftRIght?
@@ -921,9 +1104,15 @@ void FeatureTracker::reduce_invalid_fea(bool for_sift)
             }
             else
             {
-                if(i < prev_num) --valid_prev_num;
+                if(i < prev_num) 
+                {
+                    --valid_prev_num;
+                    // 长期跟踪点数目减少
+                    if(i < num_long_track) --num_old_track_FAST;
+                }
             }
         }
+
         if(j < cur_num)
         {
             // resize会去除前j个元素之后的所有元素
@@ -945,12 +1134,12 @@ void FeatureTracker::reduce_invalid_fea(bool for_sift)
 }
 
 // 先标注新的FAST点，然后查看新sift是否跟已有点重叠，如果是，则放弃该新sift点
-void FeatureTracker::set_new_fea_in_mask(bool initial_succ)
+void FeatureTracker::set_new_fea_in_mask()
 {
     int num = cur_FAST.size();
     uchar status;
     
-    if(!add_new_sift_in_next_frame)
+    if(!add_new_fea_in_next_frame)
     {
         for (int i = num_track_FAST; i < num; ++i)
         {   
@@ -984,7 +1173,7 @@ void FeatureTracker::set_new_fea_in_mask(bool initial_succ)
     uchar cls_pt;
     
     // 跟踪点中那些在上一帧中没有深度值的
-    if(!add_new_sift_in_next_frame)
+    if(!add_new_fea_in_next_frame)
     {
         if(1)
         {
@@ -1009,7 +1198,7 @@ void FeatureTracker::set_new_fea_in_mask(bool initial_succ)
     
 
         // 如果是VI且已经初始化，则所有的sift新点均没有添加(包括有立体匹配的新sift点)
-        bool has_all = USE_IMU && initial_succ;
+        bool has_all = USE_IMU && IMU_init_succ;
         for (int i = num_track_sift; i < num; ++i)
         {   
             status = status_sift[i];
@@ -1029,6 +1218,38 @@ void FeatureTracker::set_new_fea_in_mask(bool initial_succ)
             else
                 // 新点的圈设得小一点，因为要为下一帧的sift跟踪点多争取一些空间（另外这些新点不一定会被下一帧跟踪到）
                 cv::circle(mask_bg_cur, sift, MIN_DIST_BG, 0, -1);
+        }
+    }
+}
+
+// 往上一帧的背景mask中标注跟踪成功的sift背景点，以及上一帧保留的FAST背景点
+void FeatureTracker::draw_bg_fea_in_mask_prev(Mat &prev_bg_mask, vector<Point2f> &pts_prev, int start_index, const vector<uchar> &track_status)
+{
+    int num_pt = pts_prev.size();
+    bool check_status = (!track_status.empty());
+    for(int i = start_index; i < num_pt; ++i)
+    {
+        Point2f &pt = pts_prev[i];
+        
+        if (prev_bg_mask.at<uchar>(pt.y,pt.x) != 0)
+        {
+            if(check_status)
+            {
+                if(track_status[i] == 0) continue;
+            }
+
+            // cv::circle(prev_bg_mask, pt, MIN_DIST_BG, 0, -1);
+
+            int radi = 18;
+            // if(pt.x < 20 || pt.x >= col-20 || pt.y < 20 || pt.y >= row-20)
+            // {
+            //     int min_y = (int)min((pt.y), (ROW-pt.y));
+            //     int min_x = (int)min(pt.x, COL-pt.x);
+            //     int min_xy = min(min_x, min_y);
+            //     radi = min(20, min_xy) - 1;
+            // }
+            
+            cv::circle(prev_bg_mask, pt, radi, 0, -1);
         }
     }
 }
@@ -1100,9 +1321,14 @@ float FeatureTracker::cal_dist_img_center_to_flow_line(cv::Point2f &pt1, cv::Poi
     // float c_x = COL/2.0;
     // float c_y = ROW/2.0;
 
-    // x1和x2，y1和y2不会同时相等
+    // x1和x2，y1和y2会不会同时相等？除非相机处于静止状态
     float proj_vec = (x1 - x2) * (c_x - x2) + (y1 - y2) * (c_y - y2);
     // >= 0? = 0意味着 pt1和pt2的连线 与 pt2和中点的连线 相垂直 或者 pt2和图像中点重合
+    // ！！注意，如果汽车本身向前运动的同时还有向上或向下的运动（即斜坡），那么点的光流（上一帧点指向下一帧点）不一定都是呈现从中心向边缘的辐射状！！！
+    // 例如，如果汽车在下坡路面运动，则图像下半部分的光流向量不一定都有向下的分量！因为同一个3D点在后一帧的相机坐标系下的Y坐标相对而言是抬高了，其在后一帧图像中的v坐标会更靠上。且相机Z方向运动引起的点的v坐标变化值对所有点均是相同的！
+    // 对于近处的点，相机前向运动造成的深度减小，会对其在图像中的投影点的v坐标值影响较大（Y/Z，所有点的Z值都减去相同的数，原Z值小的点影响更大）！而远处的点，相机前向运动造成的对点的v坐标的影响则较小！
+    // 下坡情况下，对于下半图像的点，这样的v坐标的相对减小 与 由于相对深度减小带来的投影v坐标相对增大 相互低效，最小像素点的v坐标是变大还是变小是不一定的！相反地，对于上坡而言，上半图像的点的v坐标增减变化则是不明的！
+    // 但是这些v坐标增减不明的点不能放弃，因为它们正是用来估计相机在z方向的位移的关键点！否则，所有特征点在v坐标的变换容易都被归为相机前向位移的影响！！！
     if (proj_vec <= 0)
     {
         if(x1 != x2)
@@ -1122,168 +1348,242 @@ float FeatureTracker::cal_dist_img_center_to_flow_line(cv::Point2f &pt1, cv::Poi
     return dist;
 }
 
-// 更新相机和各个物体的位姿预测，并预测其特征点在当前帧中的像素位置
-// 静态点的位置预测就用像素光流；动态点才采用运动模型估计！
-void FeatureTracker::Ptspredict_motion(const int &frame_count, const Matrix3d &RCam_prev, const Vector3d &PCam_prev, const Matrix3d &RCam_cur_pred, const Vector3d &PCam_cur_pred, bool motion_pred_for_new_objs, bool use_motion)
+// 更新相机和各个物体的位姿预测，并预测旧的背景或物体特征点在当前帧中的像素位置
+// 动态点只能采用运动模型估计，而静态点的位置预测可以选择用像素光流或运动模型
+void FeatureTracker::Ptspredict_motion(bool for_sift, bool motion_pred_for_new_objs, bool use_motion)
 {
-    int num_pt = prev_FAST.size();
-    // cur_FAST.clear();
-    predict_dep_FAST.clear();
-    cur_FAST.resize(num_pt,Point2f(0.0,0.0));
-    
-    // FAST_new_objs.clear();
-    
-    // 如果是系统的第2帧，则上一帧的所有点都是新物体的点，没有运动模型可以预测当前帧该点的位置，后续需要使用flow map提供预测值
-    if(frame_count == 1 || !use_motion)
-    {
-        FAST_new_objs.resize(num_pt);
-        std::iota(FAST_new_objs.begin(), FAST_new_objs.end(), 0);
-        // 第二帧的点的深度预测要怎么给出？这里直接用上一帧该点的深度值是否合理。后面直接用了depth_map？
-        // predict_dep_FAST = prev_FAST_dep;
-        FAST_pred_motion = true;
-        
-        // 需要为sift光流和立体匹配 提供预测参考值吗？使用参考值也许可以筛选掉sift暴力匹配中的少数错误匹配？但如果flow_map误差大，那不是可能反而会浪费很多精确匹配的sift点？
-        // 如果是系统第2帧，则跟FAST一样，需要flow_map来提供光流预测值
-        // 这里暂时是不需要
-        // if(cal_pred_for_sift_track)
-        // {
-        //     //todo
-        // }
-
-        return;
-    }
-
-    predict_dep_FAST.resize(num_pt,-1.0);
-    int obj_id, pt_id;
+    int obj_id, pt_id, num_pt;
     Vector3d pt1, pt2;
     cv::Point2f pixel;
     float prev_dep, depth;
-    // 两帧之间相机的位姿变换，表达在相机坐标系下。只能用于静态点
-    Matrix3d RCam_motion = RCam_cur_pred.transpose() * RCam_prev;
-    Vector3d PCam_motion = RCam_cur_pred.transpose() * (PCam_prev - PCam_cur_pred);
 
-    for(int i = 0; i < prev_FAST.size(); ++i)
+    if(for_sift)
     {
-        prev_dep = prev_FAST_dep[i];
-        // 如果该点上一帧没有深度估计，这里需要如何赋值?
-        // 选择后续使用flow_map和depth_map获取
-        if(prev_dep <= 0) 
+        if(!predict_dep_sift.empty()) predict_dep_sift.clear();
+        
+        if(frame_cnt > 1 && use_motion)
         {
-            // 可以选择直接用上一帧的点坐标，或者使用上一帧点的2维速度来推算预测坐标（但如果上一帧为新点，则无法使用）
-            // predict_dep_FAST[i] = -1.0;
-            // cur_FAST[i] = prev_FAST[i];
+            num_pt = prev_sift.size();
+            predict_dep_sift.resize(num_pt,-1.0);
 
-            FAST_new_objs.push_back(i);
-            continue;
+            // 对于sift点不需要提供其在当前帧的跟踪点位置预测，只需要提供当前帧的深度预测（用于寻找在当前帧的立体匹配）
+            for(int i = 0; i < num_pt; ++i)
+            {
+                obj_id = prev_sift_global_obj_id[i];
+                // 如果在当前帧不需要获取背景点的深度，则这里不为背景点设置深度预测值
+                // 物体点是否用其预测的运动模型来给定flow值和深度值？
+                // 最好还是使用flow_map和depth_map设置当前帧跟踪点的位置和视差，因为其运动估计的精度很难保证（尤其用了较多像素匹配得到的估计），反而flow_map和depth_map的精度更可靠些（因为区域集中）
+                if(add_new_fea_in_next_frame && obj_id != 0) continue;
+
+                prev_dep = prev_sift_dep[i];
+                if(prev_dep <= 0) continue;
+
+                pt_id = ids_sift[i];
+                pt1(2) = prev_dep;
+                pt1(0) = prev_un_Fea_map[pt_id](0) * prev_dep;
+                pt1(1) = prev_un_Fea_map[pt_id](1) * prev_dep;
+
+                if(obj_id != 0 && status_objs_prev.find(obj_id) == status_objs_prev.end())
+                {
+                    cout << "Weired! Line 1231" << endl;
+                    exit(-1);
+                }
+
+                if(obj_id != 0 && status_objs_prev[obj_id] == 0)
+                {
+                    // 要提前更新上一帧物体的运动模型
+                    // 对于动态物体，就不考虑使用其观测首帧的3D点了，因为物体点的深度值没有经过优化，用哪一帧的点深度都差不多...
+                    Vector3d &motion_P = RP_objs_pred[obj_id].second;
+                    Matrix3d &motion_R = RP_objs_pred[obj_id].first;
+                    
+                    pt2 = motion_R * pt1 + motion_P;
+                    depth = pt2(2);
+                    if(depth <= 0)
+                    {
+                        predict_dep_sift[i] = prev_dep;
+                        continue;
+                    }
+
+                    spaceToPlane(pt2, pixel, m_camera[0]);
+                    if (!inBorder(pixel))
+                    {
+                        predict_dep_sift[i] = prev_dep;
+                        continue;
+                    }
+
+                    predict_dep_sift[i] = depth;
+                }
+                // 如果上一帧是背景，静态物体或者新物体，统一使用相机运动模型来估计该点在当前帧的深度，像素坐标则可以有别的方式
+                else
+                {
+                    bool is_obj_fea = false;
+                    
+                    // 如果该物体上一帧为新物体，且不使用相机运动模型来预测其跟踪点位置，则使用optical flow map
+                    if(obj_id != 0 && status_objs_prev[obj_id] == 2 && !motion_pred_for_new_objs)
+                    {
+                        predict_dep_sift[i] = prev_dep;
+                    }
+                    // 如果上一帧是背景或者静态物体;或者上一帧为新物体，但是允许使用相机的运动来预测该物体点（新物体是否也可以直接使用上一帧的深度值来作为预测值？）
+                    else
+                    {
+                        pt2 = R_cam_motion * pt1 + P_cam_motion;
+                        depth = pt2(2);
+                        // 估计的深度值无效，则后续使用flow_map和depth_map来给定
+                        if(depth <= 0)
+                        {
+                            predict_dep_sift[i] = prev_dep;
+                            continue;
+                        }
+                        
+                        spaceToPlane(pt2, pixel, m_camera[0]);
+                        // 也可以选择使用相机的运动预测模型来预估该物体在当前帧左图像的位置，即假设该物体是静态的
+                        if(inBorder(pixel))
+                        {
+                            predict_dep_sift[i] = depth;
+                            continue;
+                        }
+                        else
+                        {
+                            predict_dep_sift[i] = prev_dep;
+                        }
+                    }
+                }
+            }
         }
-        
-        obj_id = prev_FAST_global_obj_id[i];
-        
-        // 物体点是否用其预测的运动模型来给定flow值和深度值？
-        // 最好还是使用flow_map和depth_map设置当前帧跟踪点的位置和视差，因为其运动估计的精度很难保证（尤其用了较多像素匹配得到的估计），反而flow_map和depth_map的精度更可靠些（因为区域集中）
-        if(obj_id != 0) continue;
+    }
+    else
+    {
+        num_pt = prev_FAST.size();
 
-        pt_id = ids_FAST[i];
-        pt1(2) = prev_dep;
-        pt1(0) = prev_un_Fea_map[pt_id](0) * prev_dep;
-        pt1(1) = prev_un_Fea_map[pt_id](1) * prev_dep;
-
-        // 对于动态物体
-        if(obj_id != 0 && status_objs_prev[obj_id] == 0)
+        if(!predict_dep_FAST.empty()) predict_dep_FAST.clear();
+        if(!cur_FAST.empty()) cur_FAST.clear();
+        
+        // 如果是系统的第2帧，则上一帧的所有点都是新物体的点，没有运动模型可以预测当前帧该点的位置，后续需要使用flow map提供预测值
+        if(frame_cnt == 1 || !use_motion)
         {
-            // 要提前更新上一帧物体的运动模型
-            // 对于动态物体，就不考虑使用其观测首帧的3D点了，因为物体点的深度值没有经过优化，用哪一帧的点深度都差不多...
-            Vector3d &motion_P = RP_objs_pred[obj_id].second;
-            Matrix3d &motion_R = RP_objs_pred[obj_id].first;
+            FAST_pred_by_flow_map.resize(num_pt);
+            std::iota(FAST_pred_by_flow_map.begin(), FAST_pred_by_flow_map.end(), 0);
+            // 第二帧的点的深度预测要怎么给出？这里直接用上一帧该点的深度值是否合理。后面直接用了depth_map？
+            // predict_dep_FAST = prev_FAST_dep;
+            FAST_pred_motion = true;
+            return;
+        }
+
+        if(use_motion_to_pred_fea_dep) predict_dep_FAST.resize(num_pt,-1.0);
+        if(use_motion_to_pred_fea_pos) cur_FAST.resize(num_pt,Point2f(0.0,0.0));
+
+        for(int i = 0; i < prev_FAST.size(); ++i)
+        {
+            prev_dep = prev_FAST_dep[i];
+            // 如果该点上一帧没有深度估计，这里需要如何赋值?
+            // 选择后续使用flow_map和depth_map获取
+            if(prev_dep <= 0) 
+            {
+                // 可以选择直接用上一帧的点坐标，或者使用上一帧点的2维速度来推算预测坐标（但如果上一帧为新点，则无法使用）
+                // predict_dep_FAST[i] = -1.0;
+                // cur_FAST[i] = prev_FAST[i];
+
+                FAST_pred_by_flow_map.push_back(i);
+                continue;
+            }
             
-            pt2 = motion_R * pt1 + motion_P;
-            depth = pt2(2);
-            if(depth <= 0)
-            {
-                cur_FAST[i] = prev_FAST[i];
-                predict_dep_FAST[i] = prev_FAST_dep[i];
-                continue;
-            }
-            spaceToPlane(pt2, pixel, m_camera[0]);
-            if (!inBorder(pixel))
-            {
-                cur_FAST[i] = prev_FAST[i];
-                predict_dep_FAST[i] = prev_FAST_dep[i];
-                continue;
-            }
-            predict_dep_FAST[i] = depth;
-            cur_FAST[i] = pixel;
-        }
-        // 如果上一帧是背景，静态物体或者新物体，统一使用相机运动模型来估计该点在当前帧的深度，像素坐标则可以有别的方式
-        else
-        {
-            bool is_obj_fea = false;
+            obj_id = prev_FAST_global_obj_id[i];
+            
+            if(obj_id != 0) continue;
+
+            pt_id = ids_FAST[i];
+            pt1(2) = prev_dep;
+            pt1(0) = prev_un_Fea_map[pt_id](0) * prev_dep;
+            pt1(1) = prev_un_Fea_map[pt_id](1) * prev_dep;
+            
             if(obj_id != 0 && status_objs_prev.find(obj_id) == status_objs_prev.end())
             {
-                cout << "Weired!" << endl;
+                cout << "Weired! Line 1492" << endl;
                 abort();
             }
 
-            // 如果该物体上一帧为新物体，且不使用相机运动模型来预测其跟踪点位置，则使用optical flow map
-            if(obj_id != 0 && status_objs_prev[obj_id] == 2 && !motion_pred_for_new_objs)
+            // 对于动态物体
+            if(obj_id != 0 && status_objs_prev[obj_id] == 0)
             {
-                // 如果需要使用光流网络的结果作为新物体的特征点像素坐标的预测值。我们设定只有系统第2帧才使用光流网络的结果提供预测值
-                FAST_new_objs.push_back(i);
-                assert(prev_FAST_dep[i] > 0 && "Obj fea should has valid depth estimation in every frame!");
+                // 要提前更新上一帧物体的运动模型
+                // 对于动态物体，就不考虑使用其观测首帧的3D点了，因为物体点的深度值没有经过优化，用哪一帧的点深度都差不多...
+                Vector3d &motion_P = RP_objs_pred[obj_id].second;
+                Matrix3d &motion_R = RP_objs_pred[obj_id].first;
                 
-                // predict_dep_FAST[i] = prev_FAST_dep[i];
-            }
-            // 如果上一帧是背景或者静态物体;或者上一帧为新物体，但是允许使用相机的运动来预测该物体点
-            else
-            {
-                pt2 = RCam_motion * pt1 + PCam_motion;
+                pt2 = motion_R * pt1 + motion_P;
                 depth = pt2(2);
-                // 估计的深度值无效，则后续使用flow_map和depth_map来给定
                 if(depth <= 0)
                 {
                     // cur_FAST[i] = prev_FAST[i];
                     // predict_dep_FAST[i] = prev_FAST_dep[i];
+                    FAST_pred_by_flow_map.push_back(i);
+                    continue;
+                }
 
-                    FAST_new_objs.push_back(i);
-                    
-                    continue;
-                }
-                
                 spaceToPlane(pt2, pixel, m_camera[0]);
-                // 也可以选择使用相机的运动预测模型来预估该物体在当前帧左图像的位置，即假设该物体是静态的
-                if(inBorder(pixel))
-                {
-                    cur_FAST[i] = pixel;
-                    predict_dep_FAST[i] = depth;
-                    continue;
-                }
-                else
+                if (!inBorder(pixel))
                 {
                     // cur_FAST[i] = prev_FAST[i];
                     // predict_dep_FAST[i] = prev_FAST_dep[i];
-
-                    FAST_new_objs.push_back(i);
-                    
+                    FAST_pred_by_flow_map.push_back(i);
                     continue;
+                }
+
+                if(use_motion_to_pred_fea_dep) predict_dep_FAST[i] = depth;
+                if(use_motion_to_pred_fea_pos) cur_FAST[i] = pixel;
+            }
+            // 如果上一帧是背景，静态物体或者新物体，统一使用相机运动模型来估计该点在当前帧的深度，像素坐标则可以有别的方式
+            else
+            {
+                // 如果该物体上一帧为新物体，且不使用相机运动模型来预测其跟踪点位置，则使用optical flow map
+                if(obj_id != 0 && status_objs_prev[obj_id] == 2 && !motion_pred_for_new_objs)
+                {
+                    // 如果需要使用光流网络的结果作为新物体的特征点像素坐标的预测值。我们设定只有系统第2帧才使用光流网络的结果提供预测值
+                    FAST_pred_by_flow_map.push_back(i);
+                    assert(prev_FAST_dep[i] > 0 && "Obj fea should has valid depth estimation in every frame!");
+                    
+                    // predict_dep_FAST[i] = prev_FAST_dep[i];
+                }
+                // 如果上一帧是背景或者静态物体;或者上一帧为新物体，但是允许使用相机的运动来预测该物体点
+                else
+                {
+                    pt2 = R_cam_motion * pt1 + P_cam_motion;
+                    depth = pt2(2);
+                    // 估计的深度值无效，则后续使用flow_map和depth_map来给定cur_FAST和cur_FAST_dep的预测值
+                    if(depth <= 0)
+                    {
+                        // cur_FAST[i] = prev_FAST[i];
+                        // predict_dep_FAST[i] = prev_FAST_dep[i];
+
+                        FAST_pred_by_flow_map.push_back(i);
+                        // predict_dep_FAST中的值保留为-1.0即可
+                        continue;
+                    }
+                    
+                    spaceToPlane(pt2, pixel, m_camera[0]);
+                    // 也可以选择使用相机的运动预测模型来预估该物体在当前帧左图像的位置，即假设该物体是静态的
+                    if(inBorder(pixel))
+                    {
+                        if(use_motion_to_pred_fea_pos) cur_FAST[i] = pixel;
+                        if(use_motion_to_pred_fea_dep) predict_dep_FAST[i] = depth;
+                        continue;
+                    }
+                    else
+                    {
+                        // cur_FAST[i] = prev_FAST[i];
+                        // predict_dep_FAST[i] = prev_FAST_dep[i];
+                        FAST_pred_by_flow_map.push_back(i);
+                        continue;
+                    }
                 }
             }
         }
+        FAST_pred_motion = true;
     }
-    FAST_pred_motion = true;
-
-    // 是否需要为sift点估计预测位置
-    // if(frame_count > 1)
-    // {
-    //     // 需要用运动模型为
-    //     if(cal_pred_for_sift_track)
-    //     {
-    //         // todo
-    //     }
-    // }
 }
 
 // 使用光流模型来给出上一帧新物体在当前帧的预测点位置！
-void FeatureTracker::Ptspredict_flow(const cv::Mat &flow_map, const cv::Mat &seg_map)
+void FeatureTracker::Pts_pred_by_flow_map(const vector<Point2f> &all_pts_prev, const vector<int> &id_pts_select, vector<Point2f> &pts_cur, const cv::Mat &flow_map, const cv::Mat &seg_map)
 {
     if (seg_map.cols != flow_map.cols || seg_map.rows != flow_map.rows){
         fprintf(stderr, "seg_map and flow_map should have the same dimension!"); 
@@ -1294,11 +1594,11 @@ void FeatureTracker::Ptspredict_flow(const cv::Mat &flow_map, const cv::Mat &seg
     float up_border_u = col - 0.1;
 
     float low_border = 0.0;
-    for (auto &id:FAST_new_objs)
+    for (auto &id:id_pts_select)
     {
         // 上一帧的FAST点是经过严格筛选的，位于边界区域的点都不会选取！
-        float prev_x = prev_FAST[id].x;
-        float prev_y = prev_FAST[id].y;
+        float prev_x = all_pts_prev[id].x;
+        float prev_y = all_pts_prev[id].y;
         // !!要注意，at的坐标索引是(row, col)！flow_map的值代表 后一帧点坐标 - 前一帧点坐标
         float flow_x = flow_map.at<Vec2f>(int(prev_y), int(prev_x))[0];
         float flow_y = flow_map.at<Vec2f>(int(prev_y), int(prev_x))[1];
@@ -1309,59 +1609,5272 @@ void FeatureTracker::Ptspredict_flow(const cv::Mat &flow_map, const cv::Mat &seg
         // 不管点的label值，因为可能存在误检或漏检等情况，而且这里也只是匹配点的预测值
         // uchar cls_label = seg_map.at<Vec2f>(int(pred_x), int(pred_y))[0];
 
-        cur_FAST[id].x = pred_x;
-        cur_FAST[id].y = pred_y;
+        pts_cur[id].x = pred_x;
+        pts_cur[id].y = pred_y;
     }
-    // sift点直接使用暴力匹配，不需要预测值。但是似乎有的话会更好？这样可以帮忙筛选那些可能暴力匹配错误得比较离谱的点？？
-    // for (int i = 0; i < prev_sift.size(); ++i){
-    //     float prev_x = prev_sift[i].x;
-    //     float prev_y = prev_sift[i].y;
-    //     float flow_x = flow_map.at<Vec2f>(int(prev_y), int(prev_x))[0];
-    //     float flow_y = flow_map.at<Vec2f>(int(prev_y), int(prev_x))[1];
-    //     float pred_x = max(low_border, min(prev_x+flow_x, up_border_u));
-    //     float pred_y = max(low_border, min(prev_y+flow_y, up_border_v));
+}
 
-    //     // uchar cls_label = seg_map.at<Vec2f>(int(pred_x), int(pred_y))[0];
-    //     cv::Point2f pred_pts(pred_x, pred_y);
-    //     pred_sift.emplace_back(pred_pts);
-    // }
+void FeatureTracker::track_pred_for_new_det_prev_fea(const vector<Point2f> &all_pts_prev, vector<Point2f> &pts_cur, const cv::Mat &flow_map, const cv::Mat &seg_map)
+{
+    if(!pts_cur.empty()) pts_cur.clear();
+
+    int num_pt = all_pts_prev.size();
+    pts_cur.resize(num_pt,Point2f(0.0,0.0));
+
+    vector<int> id_pts_to_pred(num_pt);
+    std::iota(id_pts_to_pred.begin(), id_pts_to_pred.end(), 0);
+
+    if (!seg_map.empty() && !flow_map.empty())
+    {
+        // 用flow_map来给出上一帧的某些点提供跟踪预测点
+        Pts_pred_by_flow_map(all_pts_prev, id_pts_to_pred, pts_cur, flow_map, seg_map);
+    }
+    else
+    {
+        fprintf(stderr, "For predict of FAST in the second frame should provide the seg_map and flow_map!");
+        exit(-1); 
+    }
+}
+
+// 计算检测的特征点的局部NCC值的ambi。是否需要这种计算量极大的方法来衡量特征点的质量？
+// 是否直接用Shi-Tomasi检测时给的点quality来排除差的点？但是sift点没有给出检测的quality（只有match的ambi）
+int FeatureTracker::check_ambi_detected_fea(const Mat &_img, const Point2f &fea, const bool is_sift_match, const float Th_ambi_min, int len_win)
+{
+    float cent_u = fea.x;
+    float cent_v = fea.y;
+    
+    // 选择特征点为中心的7*7窗口的边上的8个点，分别与特征点计算NCC值，如果max_NCC/1.0和min_NCC/1.0均小于阈值，则该点为高质量点
+    // 9*9
+    float step_u = 3;
+    float step_v = 3;
+
+    int half_len_win = len_win/2.0;
+    // float隐转int时会直接省略小数部分
+    if(cent_u < (step_u + half_len_win) || cent_u >= (col - step_u - half_len_win) || cent_v < (step_v + half_len_win) || cent_v >= (row - step_v - half_len_win)) 
+        return 0;
+
+    float u_start = -step_u;
+    float u_end = step_u;
+    float v_start = -step_v;
+    float v_end = step_v;
+
+    float val_NCC;
+    // 0.975 - 0.99
+    float th_ambi_max = 0.985;
+    float ambi_max = 0, ambi_min = 0;
+
+    // vector<float> all_NCC;
+    int cnt = 0;
+    for(float shift_u = u_start; shift_u <= u_end; shift_u += step_u)
+    {
+        for(float shift_v = v_start; shift_v <= v_end; shift_v += step_v)
+        {
+            if(shift_u == 0 && shift_v == 0) continue;
+            ++cnt;
+
+            Point2f pt_shift(cent_u+shift_u, cent_v+shift_v);
+
+            // todo:取像素点灰度值时是否需要插值？
+            val_NCC = cal_NCC(_img, cur_img, fea, pt_shift, len_win);
+
+            if(val_NCC > ambi_max) 
+            {
+                // 如果现有最大的NCC已经大于最大阈值，则直接放弃该特征点（比如是路面标志线的非角点，这样的点很难被正确匹配），这样可以减少这里循环中后续不必要的计算
+                // 此外，返回-1表示该点不应该再被检测，需要在全局图像mask中标注该点
+                if(val_NCC > th_ambi_max)
+                    return -1;
+                else
+                {
+                    if(cnt == 2) ambi_min = ambi_max;
+                    ambi_max = val_NCC;
+                }
+            }
+            else
+            {
+                if(cnt == 2 || val_NCC < ambi_min) ambi_min = val_NCC;
+            }
+
+            // all_NCC.push_back(val_NCC);
+        }
+    }
+
+    // sort(all_NCC.begin(),all_NCC.end(),[](float &a, float &b)
+    //     {return a > b;});
+
+    // ambi_max = all_NCC[0];
+    // float ambi_min = all_NCC.back();
+    
+    float th_ambi_min = Th_ambi_min;
+    if(th_ambi_min <= 0) th_ambi_min = Base_max_th_ambi_NCC;
+
+    float Up_th_ambi_min = 0.95;
+    if(th_ambi_min > Up_th_ambi_min) th_ambi_min = Up_th_ambi_min;
+    // FAST点可以适当降低NCC的要求,最大值0.965
+    if(!is_sift_match) 
+    {
+        th_ambi_min += 0.015;
+        Up_th_ambi_min += 0.015;
+    }
+    
+    // cout << "min_ambi: " << ambi_min << endl;
+    // cout << "max_ambi: " << ambi_max << endl;
+
+    // 需要标注不再被检测的点
+    if(ambi_max > th_ambi_max || (ambi_min > th_ambi_min && th_ambi_min >= Up_th_ambi_min))
+        return -1;
+    else if(ambi_min > th_ambi_min)
+        return 0;
+    else
+        return 1;
+}
+
+// 计算某对匹配点的NCC
+float FeatureTracker::cal_NCC(const Mat &prev_img, const Mat &cur_img, const Point2f &prev_pt, const Point2f &cur_pt, int len_win)
+{
+    if(len_win <= 0) 
+        return -1.0;
+    
+    float ave_1 = 0;
+    float ave_2 = 0;
+    float squa_1 = 0;
+    float squa_2 = 0;
+    float CC = 0;
+    // 窗口长度应该是奇数
+    if(len_win/2 == 0) len_win += 1;
+    int num_pix = len_win * len_win;
+    int radi = len_win/2;
+
+    float r1, r2;
+    float NCC;
+
+    float min_1 = 0, min_2 = 0;
+    // float max_1 = 0, max_2 = 0;
+
+    vector<float> val_per_pix_win_1(num_pix,0), val_per_pix_win_2(num_pix,0);
+
+    int cnt = 0;
+    // 窗口在x的shift
+    for(int i = -radi; i < radi; ++i)
+    {
+        // 窗口在y的shift
+        for(int j = -radi; j < radi; ++j)
+        {
+            // todo: 这里pt的坐标都是浮点，那么取像素灰度值时是否应该插值？？
+            int x1 = prev_pt.x + i;
+            int x2 = cur_pt.x + i;
+
+            int y1 = prev_pt.y + j;
+            int y2 = cur_pt.y + j;
+            
+            r1 = (float)prev_img.at<uchar>(y1, x1);
+            r2 = (float)cur_img.at<uchar>(y2, x2);
+
+            val_per_pix_win_1[cnt] = r1;
+            val_per_pix_win_2[cnt] = r2;
+
+            if(cnt == 0)
+            {
+                min_1 = r1;
+                min_2 = r2;
+
+                // 如果要计算小窗口内各个像素点的归一化亮度值（实际亮度值/小窗口内最大亮度值），则需要记录最大值
+                // 光照变化导致的亮度值变化应该是加性的？所以这里应该采用 实际亮度值-小窗口内最小亮度值 来作为规范化比较，即假设绝大多数情况下小窗口内的各个像素之间的亮度差值不会有大变化（少部分情况有噪声影响）
+                // max_1 = r1;
+                // max_2 = r2;
+            }
+            else
+            {
+                if(r1 < min_1)
+                    min_1 = r1;
+
+                if(r2 < min_2)
+                    min_2 = r2;
+
+                // if(r1 > max_1)
+                //     max_1 = r1;
+
+                // if(r2 > max_2)
+                //     max_2 = r2;
+            }
+            ++cnt;
+        }
+    }
+    
+    for(int i = 0; i < num_pix; ++i)
+    {
+        r1 = val_per_pix_win_1[i] - min_1;
+        r2 = val_per_pix_win_2[i] - min_2;
+
+        // r1 = val_per_pix_win_1[i]/max_1;
+        // r2 = val_per_pix_win_2[i]/max_2;
+
+        ave_1 += r1;
+        ave_2 += r2;
+
+        squa_1 += r1*r1;
+        squa_2 += r2*r2;
+
+        CC += r1*r2;
+    }
+
+    ave_1 = ave_1/num_pix;
+    ave_2 = ave_2/num_pix;
+
+    NCC = (CC - num_pix * ave_1 * ave_2)/sqrt((squa_1 - num_pix*ave_1*ave_1)*(squa_2 - num_pix*ave_2*ave_2));
+    
+    return NCC;
+}
+
+// 这个是计算原本匹配点周围的点 与 上一帧点 之间的NCC是否有足够的差异性，如果没有，说明该点不是好的特征点，其匹配质量比较难保证
+// 最终保留的也是原本的匹配点，即不会寻找将周围NCC最高的点作为匹配点
+// 这个函数只对 flow matching进行，是为了筛选出较好的特征点，即与周围点的差异较大
+float FeatureTracker::cal_check_by_ambi_NCC(const Mat &prev_img, const Mat &cur_img, const Point2f &prev_pt, const Point2f &cur_pt, int len_win, 
+                                            float &ambi_NCC, const bool is_sift_match, const float NCC_cen, const float Th_ambi_min_max)
+{
+    float value_NCC;
+    
+    if(NCC_cen != 0)
+        value_NCC = NCC_cen;
+    else
+        value_NCC = cal_NCC(prev_img, cur_img, prev_pt, cur_pt, len_win);
+
+    ambi_NCC = 1.0;
+    
+    // if(value_NCC <= 0.88 || value_NCC >= 0.99)
+    if(value_NCC < 0.88)
+        return value_NCC;
+    else
+    {
+        float max_NCC = value_NCC;
+        float min_NCC = value_NCC;
+        // int best_shift_x = 0;
+        // int best_shift_y = 0;
+        
+        float cent_u = cur_pt.x;
+        float cent_v = cur_pt.y;
+        float val_NCC;
+        
+        // 7*7下 窗口
+        float step_u = 3;
+        float step_v = 3;
+
+        float u_start = -step_u;
+        float u_end = step_u;
+        float v_start = -step_v;
+        float v_end = step_v;
+        
+        // 如果原始匹配点NCC值较小，则增大搜索范围
+        // if(max_NCC >= 0.98)
+        // {
+        //     u_start = -2;
+        //     u_end = 2;
+        //     v_start = -1;
+        //     v_end = 1;
+        // }
+        
+        vector<float> all_NCC;
+        all_NCC.push_back(value_NCC);
+
+        // 移动匹配点，计算在中心点和附近8个位置处的最大NCC和次大NCC值，如果次大/最大 大于阈值，则说明不是一个好的角点？
+        for(float shift_u = u_start; shift_u <= u_end; shift_u += step_u)
+        {
+            for(float shift_v = v_start; shift_v <= v_end; shift_v += step_v)
+            {
+                if(shift_u == 0 && shift_v == 0) continue;
+
+                Point2f pt_shift(cent_u+shift_u, cent_v+shift_v);
+
+                // todo:取像素点灰度值时是否需要插值？
+                val_NCC = cal_NCC(prev_img, cur_img, prev_pt, pt_shift, len_win);
+
+                all_NCC.push_back(val_NCC);
+                // if(val_NCC > max_NCC)
+                // {
+                //     // best_shift_x = shift_u;
+                //     // best_shift_y = shift_v;
+
+                //     max_NCC = val_NCC;
+                // }
+
+                // if(val_NCC < min_NCC)
+                // {
+                //     min_NCC = val_NCC;
+                // }
+            }
+        }
+
+        float sub_max_NCC = max_NCC, mid_max_NCC = max_NCC;
+        
+        sort(all_NCC.begin(),all_NCC.end(),[](float &a, float &b)
+        {return a > b;});
+        
+        max_NCC = all_NCC[0];
+
+        int num = all_NCC.size();
+
+        if(num > 1)
+        {
+            // 取次最小值来作为考核
+            min_NCC = all_NCC.back();
+            // 取次最大值来作为考核
+            sub_max_NCC = all_NCC[1];
+
+            // 包含中心点在内是9个点，取中值来作为考核？
+            // mid_max_NCC = all_NCC[4];
+        }
+
+        // 比值越小，则点的可区分性越大
+        // float th_ambi_sub_max = 0.975;
+        // if(!is_sift_match) th_ambi_sub_max = 0.985;
+
+        float th_ambi_sub_max = 0.99;
+        
+        float th_ambi_min_max = Th_ambi_min_max;
+        if(th_ambi_min_max <= 0) th_ambi_min_max = Base_max_th_ambi_NCC;
+        if(th_ambi_min_max > 0.95) th_ambi_min_max = 0.95;
+        // FAST点可以适当降低NCC的要求
+        if(!is_sift_match) th_ambi_min_max = min(th_ambi_min_max+0.02, 0.97);
+        
+        float ambi_min_max, ambi_first_two_max, ambi_mid_max;
+        
+        // todo: 是要比较最大/最小，还是最大/次最大？
+        // max_NCC小于0则说明该区域根本不相似
+        if(max_NCC > 0)
+        {
+            // 应该选择 最小值、次最大值还是中值来与最大值进行比较？
+            ambi_first_two_max = sub_max_NCC/max_NCC;
+            // ambi_mid_max = mid_max_NCC/max_NCC;
+            ambi_min_max = min_NCC/max_NCC;
+        }
+        else
+        {
+            ambi_first_two_max = 1.0;
+            // ambi_mid_max = 1.0;
+            ambi_min_max = 1.0;
+            return 0.0;
+        }
+        
+        // cout << "Min NCC: " << min_NCC << endl;
+        // cout << "Max NCC: " << max_NCC << endl;
+        // cout << "ratio of min/max NCC: " << min_NCC/max_NCC << endl;
+        
+        // 同时要求该点的NCC的次大/最大比 和 最小/最大比 都要符合要求
+
+        // if(ambi_mid_max > thres_ambi)
+        if(ambi_first_two_max > th_ambi_sub_max || ambi_min_max > th_ambi_min_max)
+        // if(ambi_min_max > th_ambi_min_max)
+            return 0.0;
+        else
+        {
+            ambi_NCC = ambi_min_max;
+            // ambi_NCC = ambi_first_two_max;
+            return value_NCC;
+        }
+    }
+}
+
+// 在原匹配点的周围寻找NCC值最大的局部匹配点，并且还可以根据min/max的比值来决定是否保留该匹配
+float FeatureTracker::cal_best_NCC(const Mat &prev_img, const Mat &cur_img, const Point2f &prev_pt, const Point2f &cur_pt, int len_win, float &shift_x, float &shift_y, 
+                                    const bool check_ambi, const bool is_SIFT, const float Th_ambi_min_max, const bool is_flow_match, const float u_shift_max, const float v_shift_max)
+{
+    float value_NCC = cal_NCC(prev_img, cur_img, prev_pt, cur_pt, len_win);
+
+    shift_x = 0;
+    shift_y = 0;
+
+    // 如果原匹配点的NCC值太小或足够大，则不再进行小区域搜索最佳匹配点了
+    // 局部搜索最佳匹配对于立体匹配比较重要，尤其是shift点！
+    if(value_NCC <= 0.88)
+    {
+        // cout << "value NCC: " << value_NCC << endl;
+        return value_NCC;
+    }
+    else if(value_NCC > 0.98 && !check_ambi)
+    {
+        // cout << "value NCC: " << value_NCC << endl;
+        return value_NCC;
+    }
+    else
+    {
+        // todo: 检查ambi应该在优化前还是优化后执行？？
+        // if(check_ambi)
+        // {
+        //     float ambi_NCC = 0;
+        //     float NCC = cal_check_by_ambi_NCC(prev_img, cur_img, prev_pt, cur_pt, len_win, ambi_NCC, is_SIFT, value_NCC, Th_ambi_min_max);
+
+        //     if(NCC != value_NCC)
+        //         return 0.0;
+        //     else if(value_NCC >= 0.99)
+        //         return value_NCC;
+        // }
+        
+        float max_NCC = value_NCC;
+
+        if(value_NCC < 0.98)
+        {
+            float best_shift_x = 0;
+            float best_shift_y = 0;
+
+            float cent_u = cur_pt.x;
+            float cent_v = cur_pt.y;
+            float val_NCC;
+
+            float u_start = -1;
+            float u_end = 1;
+            float v_start = -1;
+            float v_end = 1;
+            
+            // 如果原始匹配点NCC值较小，则增大搜索范围
+            if(max_NCC <= 0.96)
+            {
+                // 如果指定了优化搜寻的范围
+                if(u_shift_max > 0 || v_shift_max > 0)
+                {
+                    u_start = -u_shift_max;
+                    u_end = u_shift_max;
+                    v_start = -v_shift_max;
+                    v_end = v_shift_max;
+                }
+                else
+                {
+                    v_start = -2;
+                    v_end = 2;
+                    if(is_flow_match)
+                    {
+                        // u方向上所有范围放大一些
+                        u_start = -2;
+                        u_end = 2;
+                    }
+                    else
+                    {
+                        u_start = -4;
+                        u_end = 4;
+                    }
+                }
+            }
+            
+            // float min_NCC = value_NCC;
+            vector<float> all_NCC;
+
+            // 移动匹配点，在5*5或者3*5范围内寻找NCC值最大的匹配点
+            // 寻求亚像素级别的匹配，因此步长为0.5
+            for(float shift_u = u_start; shift_u <= u_end; shift_u += 0.5)
+            {
+                for(float shift_v = v_start; shift_v <= v_end; shift_v += 0.5)
+                {
+                    if(shift_u == 0 && shift_v == 0) continue;
+
+                    Point2f pt_shift(cent_u+shift_u, cent_v+shift_v);
+
+                    // todo:取像素点灰度值时是否应该插值？
+                    val_NCC = cal_NCC(prev_img, cur_img, prev_pt, pt_shift, len_win);
+
+                    if(val_NCC > max_NCC)
+                    {
+                        best_shift_x = shift_u;
+                        best_shift_y = shift_v;
+
+                        max_NCC = val_NCC;
+                    }
+
+                    // if(val_NCC < min_NCC)
+                    // {
+                    //     min_NCC = val_NCC;
+                    // }
+                }
+            }
+            
+            // cout << "Min NCC: " << min_NCC << endl;
+            // cout << "Max NCC: " << max_NCC << endl;
+            
+            shift_x = best_shift_x;
+            shift_y = best_shift_y;
+        }
+        
+        float thres_NCC = 0.90;
+        
+        // todo:立体匹配的NCC阈值是否要小一些，例如0.85？ 近处的点在左右图像之间的成像块可能差别较大？
+        if(!is_flow_match) thres_NCC = 0.92;
+        
+        // 如果该点的最佳匹配在原有的基础上有了较大的偏移，且NCC值还不够大，则放弃该匹配点
+        // if((abs(shift_x) == u_end || abs(shift_y)== v_end) && max_NCC < 0.94)
+        // if((abs(shift_x) == u_end) && max_NCC < 0.95)
+        if(max_NCC < thres_NCC)
+        {
+            // cout << "max NCC: " << max_NCC << endl;
+            return 0.0;
+        }
+        else
+        {
+            if(check_ambi)
+            {
+                // cout << "max NCC: " << max_NCC << endl;
+                float ambi_NCC = 0;
+                Point2f best_cur_pt(cur_pt.x+shift_x, cur_pt.y+shift_y);
+
+                float NCC = cal_check_by_ambi_NCC(prev_img, cur_img, prev_pt, best_cur_pt, len_win, ambi_NCC, is_SIFT, max_NCC, Th_ambi_min_max);
+
+                if(NCC != max_NCC)
+                    return 0.0;
+            }
+            
+            return max_NCC;
+        }
+    }
+}
+
+// 对FAST点匹配计算NCC
+void FeatureTracker::sort_match_by_NCC(const Mat &prev_img, const Mat &cur_img, vector<Point2f> &FAST_prev, vector<Point2f> &FAST_cur, vector<uchar> &status_fea, 
+                                        vector<pair<float,int>> &value_id_FAST, map<int,Vec2f> &shift, map<int,float> &id_ambi_NCC, const int check_ambi, const float Th_ambi_min_max)
+{
+    int num_pt = FAST_prev.size();
+    float shift_x, shift_y;
+    float value_NCC, value_ambi;
+    
+    // todo:可以采用多线程来计算所有点匹配的NCC
+    for(int i = 0; i < num_pt; ++i)
+    {
+        if(status_fea[i] == 0) continue;
+
+        Point2f &prev_pt = FAST_prev[i];
+        Point2f &cur_pt  = FAST_cur[i];
+        if(!inBorder(prev_pt) || !inBorder(cur_pt))
+        {
+            // value_id_FAST.emplace_back(-1.0,i);
+            status_fea[i] = 0;
+            continue;
+        }
+        
+        // 用于计算NCC的方块的边长（其半径不能大于inBorder中规定的边缘区域大小）
+        // Len_edge_win  9 11 13 15
+        // 在匹配点的周围9*9的区域内进行移动，以查找该区域内NCC值最大的匹配点
+        
+        if(refine_matching_flow)
+        {
+            // 对于flow matching的优化，在u和v方向上一致，范围取大一点
+            value_NCC = cal_best_NCC(prev_img, cur_img, prev_pt, cur_pt, Len_edge_win, shift_x, shift_y, check_ambi, false, Th_ambi_min_max, true, 2.0, 2.0);
+            shift[i] = Vec2f(shift_x,shift_y);
+        }
+        else
+        {
+            if(check_ambi)
+            {
+                float cen_NCC = 0;
+                value_NCC = cal_check_by_ambi_NCC(prev_img, cur_img, prev_pt, cur_pt, Len_edge_win, value_ambi, false, cen_NCC, Th_ambi_min_max);
+            }
+            else
+                value_NCC = cal_NCC(prev_img, cur_img, prev_pt, cur_pt, Len_edge_win);
+        }
+        
+        value_id_FAST.emplace_back(value_NCC,i);
+
+        if(check_ambi)
+        {
+            id_ambi_NCC[i] = value_ambi;
+        }
+    }
+}
+
+// 检测新FAST点
+void FeatureTracker::detect_new_FAST_prev(int num_detect, Mat &mask_bg, vector<Mat> &mask_img_to_draw_invalid_pt, vector<Point2f> &addad_new_FAST_prev, float quality_level, 
+                                            bool sort_by_point_quality, bool sort_by_bloc, int check_ambi, float Th_ambi_min, int radi)
+{
+    if(num_detect > 0)
+    {
+        int thres_pt_id;
+        
+        vector<Point2f> new_FAST_bg_temp;
+
+        vector<float> quality_FAST;
+
+        if(sort_by_point_quality)
+            // 使用此版本的函数，其中会输出各个角点的质量(问题是给出的点的quality是一个相对于0的绝对值，还是以所有检测点中的最大quality为标准（设为1）的比例（入quality_level值的设置）)
+            // 如果是相对最大quality的比例，则这个值无法在多轮检测下的所有点中进行比较。
+            cv::goodFeaturesToTrack(prev_img, new_FAST_bg_temp, num_detect * 1.5, quality_level, radi, mask_bg, quality_FAST);
+        else
+            cv::goodFeaturesToTrack(prev_img, new_FAST_bg_temp, num_detect * 1.5, quality_level, radi, mask_bg, 3);
+        
+        int num_new = new_FAST_bg_temp.size();
+        // cout << "original num of new detected fea: " << num_new << endl;
+
+        if(num_new == 0) return;
+        
+        float l_x, l_y;
+        Point2f prev_un_pt;
+        int num_fea = 0;
+
+        // 是否要根据检测点的quality先进行排序?点的检测质量意义不大，关键还是匹配的质量？？？
+        if(sort_by_point_quality)
+        {
+            multimap<float,int,greater<float>> fea_qua_id;
+            float quality;
+            for(int j = 0; j < num_new; ++j)
+            {
+                quality = quality_FAST[j];
+                // map不允许有多个相同的key，如果相同，这里后插入的会把之前的替换
+                // 因此使用multimap
+                fea_qua_id.insert(make_pair(quality,j));
+
+                // cout << "quality of detected FAST: " << quality << endl;
+            }
+
+            // 新点中最高的quality数值
+            float max_quality = fea_qua_id.begin()->first;
+            auto last_it = fea_qua_id.end();
+            // 注意，从后往前数的时候是--
+            last_it--;
+            // 最低的quality数值
+            // float min_quality = last_it->first;
+            // 直接用最高分和最低分的调和比例来获取阈值的话，容易导致参与F矩阵估计的点太少。应该使用中位数
+            // float thres_qua = max_quality * 1.0/2 + min_quality * 2.0/2;
+            int thres_num = 3.0/5 * num_new;
+            
+            multimap<float,int,greater<float>>::iterator it, iter;
+            // 点的quality已经从大到小排列，质量越高的点越先加入
+            // upper_bound(k)的意思是跳到比 给定key值k 大的key的第一个元素的iterator或者直接整个multimap的end()
+            // 因为不同key值的之间的元素的iterator不能直接用++来连接
+            for(it = fea_qua_id.begin(); it != fea_qua_id.end(); it = fea_qua_id.upper_bound(it->first))
+            {
+                if(thres_num <= 0) break;
+                --thres_num;
+                
+                auto iter = it;
+                quality = iter->first;
+
+                if(quality < 0.01) break;
+                
+                int nums = fea_qua_id.count(quality);
+                while(nums--)
+                {
+                    Point2f &p = new_FAST_bg_temp[iter->second];
+                    // 位于左图像最左和最右边小部分区域的点暂不考虑
+                    if (!inBorder(p)) continue;
+                    // 记录之后需要检测右观测点的上一帧点!
+                    // new_FAST_bg.push_back(p);
+                    
+                    int row_bloc = p.y/60;
+                    int col_bloc = p.x/200;
+
+                    if(col_bloc == 6) col_bloc = 5;
+                    if(row_bloc == 6) row_bloc = 5;
+
+                    if(num_new_FAST_detect[row_bloc][col_bloc] == 0) continue;
+
+                    num_new_FAST_detect[row_bloc][col_bloc] -= 1;
+                    
+                    // 将所有的点加入cur_FAST，进行前后2帧的跟踪
+                    addad_new_FAST_prev.push_back(p);
+                }
+            }
+        }
+        else
+        {
+            // 注意，goodFeaturesToTrack()函数检测的点都是整数坐标！！如果需要进一步获得角点的亚像素坐标，则要用cornerSubPix()函数！！
+            cv::TermCriteria cirteria = cv::TermCriteria(cv::TermCriteria::MAX_ITER + cv::TermCriteria::EPS, 30, 0.01);
+
+            cv::cornerSubPix(prev_img, new_FAST_bg_temp, cv::Size(4,4), cv::Size(-1,-1), cirteria);
+
+            vector<Point2f> bad_pt_to_mask;
+
+            for(auto &p: new_FAST_bg_temp)
+            {
+                // 位于左图像边界区域的点暂不考虑
+                if (!inBorder(p)) continue;
+                // 记录之后需要检测右观测点的上一帧点!
+                // new_FAST_bg.push_back(p);
+                
+                // cout << "detected FAST: (" << p.x << ", " << p.y << ")" << endl;
+                
+                if(sort_by_bloc)
+                {
+                    int row_bloc = p.y/60;
+
+                    int col_bloc = p.x/200;
+                    if(col_bloc == 6) col_bloc = 5;
+                    if(row_bloc == 6) row_bloc = 5;
+
+                    if(num_new_FAST_detect[row_bloc][col_bloc] == 0) continue;
+                    
+                    num_new_FAST_detect[row_bloc][col_bloc] -= 1;
+                }
+                
+                int good_fea = 1;
+                // 如果需要通过计算该特征点的局部ambi_NCC来判断其其质量。如果不满足条件，则该放弃该特征点
+                if(check_ambi)
+                    good_fea = check_ambi_detected_fea(prev_img, p, false, Th_ambi_min);
+
+                if(good_fea > 0)
+                {
+                    // 将该符合质量要求的点加入新增点集，用于前后2帧的跟踪
+                    addad_new_FAST_prev.push_back(p);
+                    ++num_fea;
+                }
+                else if(good_fea < 0)
+                {
+                    // 如果该特征点不符合具体的条件，则可以将其在mask_full_img中进行标注，免得其后续再被检测
+                    bad_pt_to_mask.push_back(p);
+                }
+            }
+
+            if(!bad_pt_to_mask.empty())
+            {
+                // 具体该大bloc的mask中也需要标记该点，因为可能在该大bloc中进行多次检测
+                draw_bg_fea_in_mask_prev(mask_bg, bad_pt_to_mask, 0);
+
+                if(!mask_img_to_draw_invalid_pt.empty())
+                {
+                    int num_mask = mask_img_to_draw_invalid_pt.size();
+                    for(int i = 0; i < num_mask; ++i)
+                    {
+                        Mat mask_img = mask_img_to_draw_invalid_pt[i];
+                        draw_bg_fea_in_mask_prev(mask_img, bad_pt_to_mask, 0);
+                    }
+                }
+            }
+        }
+        // cout << "final num of new detected fea: " << num_fea << endl;
+    }
+}
+
+// 对上一帧的FAST点进行跟踪，并过滤不满足要求的跟踪
+int FeatureTracker::Track_and_Filter_FAST(vector<Point2f> &FAST_prev, vector<Point2f> &FAST_cur, vector<uchar> &status_fea_track, const bool HasPrediction, const cv::Mat &seg_map,  
+                                            const bool add_up, int num_need_to_save, float thres_high, float thres_low, const bool has_FH_est, const float Th_ambi_min_max)
+{   
+    if(FAST_prev.empty()) return 0;
+    
+    bool need_LBA = (USE_IMU || Use_LBA_for_puer_V);
+
+    // 之后对匹配进行排序
+    // KLT光流得到的匹配，如果给定了预测值，则其匹配err是没有太大意义的，因为其表示的是最终匹配点相对预测值的偏差，但预测值本身就是不准确的....
+    // 但是如果不给定预测值，光流结果又不太准确...
+    // 所以使用基于预测值的KLT，然后对匹配结果计算NCC，按照NCC从大到小（其值域为-1到1）进行排序
+
+    vector<float> err;
+    // 是否有对当前帧特征点所在位置的预测（可以是根据上一帧中计算的特征点的二维速度来推测，但是由于KITTI等数据集中的相机帧率低，且可能有动态物体，所以最好是使用物体的3D运动模型来投影上一帧的点作为预测）
+    // 针对背景点 和 动态物体点，分别进行flow估计。如果都能有预估位置，则可以统一使用相同的参数（窗口大小 和 最大层数），否则（应该是指前两帧）对于动态物体，应该一开始就增大窗口？
+    if(HasPrediction)
+    {
+        // 如果是旧点，则其可通过恒速运动的预测运动值来投影得到当前帧的匹配点预测，则金字塔只需要2层；否则，增加到3层
+        int num_scale = 1;
+        if(add_up) num_scale = 2;
+        // 参数1表示所要使用的最大的图像金字塔层数，0意味着不使用金字塔，1表示最多有2层的金字塔（可以拥有一定的尺度不变性）。因为有预测值，所以一开始尝试层数较少的金字塔
+        // status和prev_pts的长度是一样的，表征上一帧每个点在当前帧中是否能被光流追踪到
+        // todo:可以根据err的大小来作为匹配质量的排序
+        cv::calcOpticalFlowPyrLK(prev_img, cur_img, FAST_prev, FAST_cur, status_fea_track, err, cv::Size(9, 9), num_scale, 
+        cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.02), cv::OPTFLOW_USE_INITIAL_FLOW);
+        
+        // int succ_num = 0;
+        // for (size_t i = 0; i < status_fea_track.size(); ++i)
+        // {
+        //     if (status_fea_track[i])
+        //         ++succ_num;
+        // }
+        // 如果跟踪的点数太少，则增加金字塔的最大层数到4层
+        // if (succ_num < 5)
+        //     //  重新计算时，是否要重新为cur_FAST赋值？
+        //     // 如果不设置cv::OPTFLOW_USE_INITIAL_FLOW，则默认是copy FAST_prev到FAST_cur作为初始值
+        //    cv::calcOpticalFlowPyrLK(prev_img, cur_img, FAST_prev, FAST_cur, status_fea_track, err, cv::Size(15, 15), 3);
+        
+    }
+    else
+    {
+        FAST_cur = FAST_prev;
+        cv::calcOpticalFlowPyrLK(prev_img, cur_img, FAST_prev, FAST_cur, status_fea_track, err, cv::Size(11, 11), 3);
+    }
+    
+    // reverse check  逆向光流计算，用上面光流计算出的当前帧中特征点位置 再 计算到上一帧的光流匹配，如果得到检测位置和上一帧的点原始位置距离相差很小，则认为光流成功
+    if(FLOW_BACK)
+    {
+        vector<float> err_c_p;
+        vector<uchar> reverse_status;
+        vector<cv::Point2f> reverse_pts;
+
+        // 对于反向光流，是否要设置预测值？
+        
+        // if(sort_by_NCC)
+        // {
+        //     reverse_pts = prev_FAST;
+        //     cv::calcOpticalFlowPyrLK(cur_img, prev_img, cur_FAST, reverse_pts, reverse_status, err_c_p, cv::Size(15, 15), 2, 
+        //                                 cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
+        // }
+        // else
+        //     cv::calcOpticalFlowPyrLK(cur_img, prev_img, cur_FAST, reverse_pts, reverse_status, err_c_p, cv::Size(21, 21), 3); 
+
+        // 统一的设置预测值
+        reverse_pts = FAST_prev;
+        // 2？ 1？
+        cv::calcOpticalFlowPyrLK(cur_img, prev_img, FAST_cur, reverse_pts, reverse_status, err_c_p, cv::Size(9, 9), 1, 
+                                    cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
+        
+        int num_track_fea = status_fea_track.size();
+        // 如果设置了预测值，则逆向err是没有意义的
+        for(size_t i = 0; i < num_track_fea; ++i)
+        {
+            float dist = distance(FAST_prev[i], reverse_pts[i]);
+            if(status_fea_track[i] && reverse_status[i] && dist < 0.8)
+            {
+                // 设置了预测值后，反向err不使用
+                // if(!sort_by_NCC)
+                //     err[i] = err[i] + err_c_p[i];
+                continue;
+            }
+            else
+            {
+                // cout << "status_1: " << (int)status_fea_track[i] << " status_2: " << (int)reverse_status[i] << " distance of reverse_pt: " << dist << endl;
+                status_fea_track[i] = 0;
+            }
+        }
+    }
+    
+    // 如果所有待跟踪点在上一帧就已经确定（VINS的思路），则需要等待其他线程把这些点在上一帧的mask中进行标注
+    if(!add_up && !add_new_fea_in_next_frame)
+    {
+        // 等待完成绘制上一帧特征点的mask，因此其中需要使用到obj_cls_id_FAST等变量，这些变量在下面会被修改为存储当前帧点的信息
+        while(!use_prev_fea)
+        {
+            usleep(300);
+        }
+    }
+
+    // 保存各个匹配的value和id。这里的value可以是NCC值，也可以是err
+    vector<pair<float,int>> value_id_FAST;
+    map<int, Vec2f> shift;
+    map<int,float> id_ambi_NCC;
+    if(sort_by_NCC)
+    {
+        sort_match_by_NCC(prev_img, cur_img, FAST_prev, FAST_cur, status_fea_track, value_id_FAST, shift, id_ambi_NCC, check_match_by_ambi_NCC, Th_ambi_min_max);
+        // 按NCC从大到小排序
+        sort(value_id_FAST.begin(), value_id_FAST.end(), [](const pair<float, int> &a, const pair<float, int> &b)
+        {
+            return a.first > b.first;
+        });
+    }
+    else
+    {
+        float error;
+        int num_track = FAST_cur.size();
+        for(int j = 0; j < num_track; ++j)
+        {
+            if(status_fea_track[j] == 0) continue;
+            error = err[j];
+            // map不允许有多个相同的key，如果相同，这里后插入的会把之前的替换
+            // 使用vector和pair
+            value_id_FAST.emplace_back(error,j);
+        }
+
+        // 按err从小到大排序
+        sort(value_id_FAST.begin(), value_id_FAST.end(), [](const pair<float, int> &a, const pair<float, int> &b)
+        {
+            return a.first < b.first;
+        });
+    }
+    
+    float x, y, disp_x, disp_y;
+    Vec2b pt_info;
+    int num_total_track = value_id_FAST.size();
+    int num_valid_static_track = 0, num_valid_track_bg = 0;
+    
+    // 0.9？ 0.6？通过统计可以发现正确批评的NCC值均很高,一般都大于0.9！
+    // 理想情况下要求保留的track的NCC不小于0.95。
+    // 同时为了防止所有的点都不满足，应该要尽量保留最小数量的跟踪点，但是最终所有点的NCC值均不能低于0.90
+    // todo:是要按最小比例来保留跟踪点，还是按照最小数量来保留跟踪点？
+    if(sort_by_NCC)
+    {
+        // int id_2_3 = (2.0/3 * num_total_track + 1);
+        // thres_high = max((float)0.90, min(value_id_FAST[id_2_3].first, (float)0.94));
+        // 如果是长跟踪点，则对其要求较高？
+        if(!add_up)
+        {
+            // 如果需要LBA，则需要保留较多的长跟踪点，适当降低NCC阈值
+            if(need_LBA)
+            {
+                thres_high = 0.985;
+                thres_low = 0.965;
+            }
+            else
+            {
+                thres_high = 0.99;
+                thres_low = 0.97;
+            }
+        }
+    }
+    
+    // 等待sift线程使用完NCC_matching_all和添加完新的sift点
+    while(!done_select_sift)
+        usleep(300);
+
+    // 基于极线约束，使用预测的相机运动构建F矩阵来过滤静态点的匹配（注意，这对动态物体点无效，因为动态点仍可能满足相机的极线约束，参考rigidmask）
+    bool check_flow_with_epi = false, check_dep_with_reproj_err = false;
+
+    // 是否要使用相机运动预测值来提前过滤匹配点！
+    // 如果已经成功进行了F/H估计，则可以用分解F/H得到的R和预测的P（变化较小）进行过滤
+    if(Check_flow_with_pred_motion || has_FH_est)
+    {
+        // 如果已经用运动预测值（来自IMU或者恒速运动模型）来设置FAST匹配点的位置预测，则这里就不再用极线约束来筛选！
+        if(use_motion_to_pred_fea_pos && !has_FH_est) 
+            check_flow_with_epi = false;
+        else
+        {
+            if(frame_cnt > 1)
+            {
+                // 构建有效的F矩阵需要非0位移
+                if(!small_p)
+                {
+                    // Matrix3d t_up;
+                    // t_up << 0.0, -P_cam_motion(2), P_cam_motion(1), P_cam_motion(2), 0.0, -P_cam_motion(0), -P_cam_motion(1), P_cam_motion(0), 0.0;
+                    // // 本质矩阵到关键矩阵
+                    // F_cam = K_trans_inv * t_up * R_cam_motion * K_inv;
+
+                    // if(USE_IMU && init_succ)
+                        check_flow_with_epi = true;
+                }
+            }
+            else
+            {
+                // 第2帧只能用估计的F矩阵进行极线约束过滤
+                if(has_FH_est)
+                    check_flow_with_epi = true;
+            }
+        }
+    }
+
+    // 如果允许用相机的运动预测（来自恒速模型或者IMU积分的完整预测，或者来自F/H估计的R与运动预测的P）进行重投影误差
+    check_dep_with_reproj_err = frame_cnt > 1 && (Check_dep_with_reproj_err || has_FH_est);
+
+    float val_NCC;
+    int num_orig_track = 0;
+
+    // 上一帧就保留的点数
+    if(!add_up)
+    {
+        if(num_need_to_save <= 0)
+        {
+            num_need_to_save = 1.0 * MIN_CNT_PTS_TRACK_BG;
+            // num_need_to_save = 30;
+        }
+    }
+    else
+    {
+        if(num_need_to_save <= 0)
+        {
+            // num_need_to_save = MIN_CNT_PTS_TRACK_BG;
+            num_need_to_save = 15;
+        }
+        num_orig_track = prev_FAST.size();
+    }
+    
+    Point2f prev_un_pt;
+    int l_id, cnt_track;
+    int row_in_bloc, col_in_bloc, id_small_bloc, row_big_bloc, col_big_bloc, id_big_bloc;
+    // 遍历已经排序好了的点匹配
+    for (int k = 0; k < num_total_track; ++k)
+    {
+        int i = value_id_FAST[k].second;
+
+        if(status_fea_track[i])
+        {
+            Point2f &pt_prev = FAST_prev[i];
+
+            row_in_bloc = pt_prev.y/60;
+            col_in_bloc = pt_prev.x/200;
+            if(col_in_bloc == 6) col_in_bloc = 5;
+            if(row_in_bloc == 6) row_in_bloc = 5;
+
+            id_small_bloc = row_in_bloc * 6 + col_in_bloc;
+
+            Point2f &pt_cur = FAST_cur[i];
+
+            if(!shift.empty())
+            {
+                Vec2f &pt_shift = shift[i];
+                
+                // 展示局部搜索结果
+                if(0 && total_frame == 909)
+                {
+                    if(pt_shift(0) != 0 || pt_shift(1) != 0)
+                    {
+                        // if(pt_prev.x > col*2.0/3 && pt_prev.y < row/3 && Mat_img_for_show.data == nullptr)
+                        if(Mat_img_for_show.data == nullptr)
+                        {
+                            // 前后2幅左彩色图像上下排列，中间隔20个像素宽度
+                            Mat_img_for_show.create(row*2+20, col, CV_8UC3);
+                            Mat_img_for_show.setTo(255);
+
+                            cv::Rect targetRectBloc1(0, 0, col, row);
+                            Mat dest_zone_bloc1 = Mat_img_for_show(targetRectBloc1);
+                            prev_color_img_l.copyTo(dest_zone_bloc1);
+                            
+                            cv::Rect targetRectBloc2(0, row+20, col, row);
+                            Mat dest_zone_bloc2 = Mat_img_for_show(targetRectBloc2);
+                            cur_color_img_l.copyTo(dest_zone_bloc2);
+
+                            // 红色点
+                            circle(Mat_img_for_show, pt_prev, 3, Scalar(0,0,255), 1, 16);
+                            // 绿色框是进行NCC计算的小窗口
+                            rectangle(Mat_img_for_show, Point2f(pt_prev.x-12.0, pt_prev.y-12.0), Point2f(pt_prev.x+12.0, pt_prev.y+12.0), Scalar(0,255,0));
+
+                            // 故意拉开优化前后点的距离，否则不好显示
+                            Point2f orig_p(pt_cur.x-7*pt_shift(0), pt_cur.y+20+row-7*pt_shift(1));
+                            // 蓝色点是错误原始匹配点
+                            circle(Mat_img_for_show, orig_p, 3, Scalar(255,0,0), 1, 16);
+                            // 蓝色小框是搜索的范围
+                            rectangle(Mat_img_for_show, Point2f(orig_p.x-6.0, orig_p.y-6.0), Point2f(orig_p.x+6.0, orig_p.y+6.0), Scalar(255,0,0));
+                            
+                            Point2f new_p(pt_cur.x+pt_shift(0), pt_cur.y+20+row+pt_shift(1));
+                            circle(Mat_img_for_show, new_p, 3, Scalar(0,0,255), 1, 16);
+                            rectangle(Mat_img_for_show, Point2f(new_p.x-12.0, new_p.y-12.0), Point2f(new_p.x+12.0, new_p.y+12.0), Scalar(0,255,0));
+                            
+                            line(Mat_img_for_show, pt_prev, new_p, Scalar(0,0,0), 1, 16);
+
+                            // while(true)
+                            // {
+                            //     cv::imshow("final all tracked fea in prev left image", Mat_img_for_show);
+                            //     // 一直等待用户按下ESC键（ASCI码为27）
+                            //     if(waitKey(0) == 27)
+                            //     {
+                            //         break;
+                            //     }
+                            // }
+                        }
+                    }
+                }
+
+                // 修改为最佳的匹配点
+                pt_cur.x = pt_cur.x + pt_shift(0);
+                pt_cur.y = pt_cur.y + pt_shift(1);
+            }
+
+            x = pt_cur.x;
+            y = pt_cur.y;
+
+            pt_info = seg_map.at<Vec2b>(y, x);
+            // 使用seg_map来查询点的类别
+            uchar cls_label = pt_info[0];
+            uchar prev_cls = 0;
+            int gl_id, prev_obj_state = 0;
+
+            // 点所在的小bloc或大bloc中的静态点数是否已经足够
+            bool full_cur_bloc = false;
+            bool is_old_track = false;
+            cnt_track = 1;
+            if(!add_up) 
+            {
+                prev_cls = obj_cls_id_FAST[i].first;
+                prev_obj_state = obj_cls_id_FAST[i].second;
+                cnt_track = track_cnt_FAST[i];
+                gl_id = ids_FAST[i];
+
+                if(frame_cnt > 1)
+                    is_old_track = (fea_with_more_frames_in_map.find(gl_id) != fea_with_more_frames_in_map.end());
+            }
+            
+            bool is_bg_track = (prev_cls == 0 && cls_label == 0);
+            bool is_sta_obj_track = (!add_up && prev_obj_state == 0 && prev_cls > 0 && cls_label == prev_cls);
+            // 各个小bloc和大bloc中的静态（纯背景或有效的静态物体）跟踪点数(3D-2D或2D-2D）不应该超过规定值！即整张图像全部静态跟踪点不应该超过规定值
+            if(is_bg_track || is_sta_obj_track)
+            {
+                // 然而在bloc中点数足够时，只放弃背景点，而不放弃物体点（因为它们后续还是要用于估计物体在当前帧的运动）
+                if(pt_2d_2d_small_bloc[id_small_bloc] >= limit_num_track_per_bloc[id_small_bloc]) 
+                {
+                    full_cur_bloc = true;
+                    if(is_bg_track)
+                    {
+                        // 如果需要长跟踪点，且其点数还不足，则不放弃该跟踪
+                        if(!(need_LBA && num_old_track_fea < (Min_num_old_track_per_frame + 5) && is_old_track))
+                        {
+                            status_fea_track[i] = 0;
+                            continue;
+                        }
+                    }
+                }
+
+                row_big_bloc = row_in_bloc/3;
+                col_big_bloc = col_in_bloc/3;
+                id_big_bloc = row_big_bloc * 2 + col_big_bloc;
+                int num_pts = num_fea_2D2D_big_bloc[id_big_bloc];
+
+                // 将静态物体点也算在该大bloc的静态跟踪点数内，因为如果近处有物体，则其可能占据了大部分图像区域，强行检测得到的背景点很可能不是好的点
+                // if(is_bg_track && num_pts >= max_num_track_big_bloc[id_big_bloc]) 
+                if(num_pts >= max_num_track_big_bloc[id_big_bloc]) 
+                {   
+                    full_cur_bloc = true;
+                    if(is_bg_track)
+                    {
+                        if(!(need_LBA && num_old_track_fea < (Min_num_old_track_per_frame + 5) && is_old_track))
+                        {
+                            status_fea_track[i] = 0;
+                            continue;
+                        }
+                    }
+                }
+                
+                if(is_sta_obj_track && num_sta_obj_track_per_bloc[id_big_bloc] >= NUM_FEA_IN_BLOC)
+                {
+                    full_cur_bloc = true;
+                }
+            }
+
+            if(!add_up && prev_cls == 0 && cls_label > 0)
+            {
+                num_long_track_FAST_in_bloc[row_in_bloc][col_in_bloc] -= 1;
+            }
+            
+            if (cls_label == 1 || cls_label == 2 || cls_label == 4 || cls_label == 7) 
+            {
+                status_fea_track[i] = 0;
+                continue;
+            }
+
+            // 如果上一帧为背景点，且该点之前已经被跟踪了至少2帧（则上上帧也最终一定是背景点），则认为其当前帧不可能变为物体点
+            // 本质上是不认为会在某物体上的点在被最开始检测和跟踪的2帧时就完全漏检
+            // ！注意，如果系统使用LBA，则会在滑窗每次marg次新帧时将所有背景跟踪点的track_cnt减1，因此这里不宜使用track_cnt来判断该点是否为上一帧新点
+            // 其实用add_new_fea_in_next_frame来判断也不是好方法，因为如果允许每一帧立即添加新背景点，则在cnt减1后这里还是无法判断该点之前的跟踪帧数。
+            // 所以，唯一完善的办法还是彻底放弃在当前帧加入新背景点，即add_new_fea_in_next_frame永远为true！！
+            // if (!add_up && prev_cls == 0 && cls_label != 0 && track_cnt_FAST[i] > 1) 
+            if (!add_up && prev_cls == 0 && cls_label != 0 && (add_new_fea_in_next_frame || track_cnt_FAST[i] > 1)) 
+            {
+                status_fea_track[i] = 0;
+                continue;
+            }
+
+            if((prev_cls > 0 || cls_label > 0) && x <= obj_left_border_left_img)
+            {
+                status_fea_track[i] = 0;
+                continue;
+            }
+            
+            // 如果使用了NCC排序，则放弃那些值太小的匹配，2个点之间的相似性太低
+            if(sort_by_NCC)
+            {
+                val_NCC = value_id_FAST[k].first;
+                // cout << "value NCC: " << value_id_FAST[k].first << endl;
+                
+                if(is_bg_track)
+                {
+                    if(val_NCC <= thres_high)
+                    {
+                        float Thres_low = thres_low;
+                        // 如果该点是相机正前方的最近处的4个小bloc区域的点，则大概率是地面点，降低其flow matching的NCC阈值。
+                        // 因为近点在前后2帧中的成像比例改变会较大
+                        if(col_in_bloc >= 1 && col_in_bloc <= 4 && row_in_bloc >= 4) Thres_low = 0.955;
+                        
+                        // 如果总的2d-2d点需求、长跟踪点需求已满足 或者 点的NCC低于最小阈值，则放弃该点
+                        if((num_need_to_save <= 0 || !(need_LBA && num_old_track_fea < (Min_num_old_track_per_frame + 5) && is_old_track)) || val_NCC <= Thres_low)
+                        {
+                            status_fea_track[i] = 0;
+                            if(!add_up)
+                            {
+                                num_long_track_FAST_in_bloc[row_in_bloc][col_in_bloc] -= 1;
+                            }
+                            continue; 
+                        }
+                    }
+                }
+                else
+                {
+                    // 如果是物体点的跟踪，则按照固定的NCC阈值来筛选
+                    if(val_NCC <= 0.965)
+                    {
+                        status_fea_track[i] = 0;
+                        continue; 
+                    }
+                }
+            }
+            
+            // if (cls_label == 0 && x <= bg_left_border_left_img) 
+            // {
+            //     status_fea_track[i] = 0;
+            //     continue;
+            // }
+
+            // 判断是否会超出上下边界
+            if(inBorder(pt_cur))
+            {
+                bool is_invalid_sta_fea = false;
+
+                // 首先排除背景点中方向和长度明显错误的匹配点
+                // 仅前向运动时，大体的光流方向（旧像素指向新像素）应该呈现图像中心向四周的辐射状
+                // 虽然汽车上下坡会影响光流长度甚至改变这个正常的方向，但是非正常方向下的光流长度不应该太大（除非是上下坡的幅度十分巨大）
+                // 其实更好的方法是使用运动预测和极线约束来排除这些明显的异常点，但是这样也有可能因为运动误差较大而导致所有的匹配均被排除？
+                if(is_bg_track)
+                {
+                    if(pt_prev.y/60.0 > 3)
+                    {
+                        if((pt_prev.y - pt_cur.y) > 12)
+                        {
+                            is_invalid_sta_fea = true;
+                        }
+                    }
+                    else
+                    {
+                        if((pt_prev.y - pt_cur.y) < -12)
+                        {
+                            is_invalid_sta_fea = true;
+                        }
+                    }
+
+                    if(is_invalid_sta_fea)
+                    {
+                        status_fea_track[i] = 0;
+                        if(!add_up)
+                        {
+                            num_long_track_FAST_in_bloc[row_in_bloc][col_in_bloc] -= 1;
+                        }
+                        continue; 
+                    }
+                }
+                
+                bool is_close_static_fea = false;
+
+                // if(col_in_bloc == 6) col_in_bloc = 5;
+
+                // todo: 上1/3部分图像中拒绝那些flow绝对值太小的背景点匹配。这些点大多来自于sift检测中有立体匹配的上一帧的点
+                // 这样做是否有意义？如果相机运动很小，则近处的跟踪点同样满足需求
+                if(is_bg_track && row_in_bloc < 2)
+                {
+                    disp_x = pt_cur.x - pt_prev.x;
+                    disp_y = pt_cur.y - pt_prev.y;
+                    // 最上面的行（的中间2/3部分） 以及 第2行的中间1/3部分，要求光流的长度较大
+                    // if(col_in_bloc > 1 && col_in_bloc < 4)
+                    if((row_in_bloc == 0 && col_in_bloc > 0 && col_in_bloc < 5) || (row_in_bloc == 1 && col_in_bloc > 1 && col_in_bloc < 4))
+                    // if((row_in_bloc == 0) || (row_in_bloc == 1 && col_in_bloc > 1 && col_in_bloc < 4))
+                    {
+                        if(disp_x * disp_x + disp_y * disp_y < Min_dist_flow * Min_dist_flow)
+                        {
+                            status_fea_track[i] = 0;
+                            if(!add_up)
+                            {
+                                num_long_track_FAST_in_bloc[row_in_bloc][col_in_bloc] -= 1;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                
+                if(!add_up) gl_id = ids_FAST[i];
+
+                // 用 基于相机的预测运动(来自恒速模型或者FH估计)的极线约束和重投影误差等方法 过滤静态点匹配
+                if(check_flow_with_epi || check_dep_with_reproj_err)
+                {
+                    // todo: 是否只有当需要估计F/H矩阵时，这里才对静态物体跟踪点进行 极线约束或重投影误差 检查？
+                    // 即使不通过估计F/H来筛选静态跟踪点，在某些场景下也需要添加静态物体点！因此这些物体点需要经过初步筛选，尽可能排除动态点
+                    // if((prev_cls == 0 && cls_label == 0) || (reject_with_F && prev_cls > 0 && cls_label == prev_cls && prev_obj_state == 0)
+                    if(is_bg_track || is_sta_obj_track)
+                    {
+                        if(check_flow_with_epi)
+                        {
+                            // int gl_obj_id = prev_FAST_global_obj_id[i];
+                            // if(gl_obj_id > 0 && status_objs_prev.find(gl_obj_id) == status_objs_prev.end())
+                            // {
+                            //     cout << "Weired!" << endl;
+                            //     exit(-1);
+                            // }
+
+                            // 静态点需要离预测的极线不能太远
+                            // todo:纯视觉时是否只用极线约束来筛选上一帧的静态物体点，因为相机的运动预测不一定准确！这样最多只浪费掉静态物体点！
+                            {
+                                int succ;
+                                // 如果当前帧还是纯视觉阶段，则放宽背景点的极线按约束的误差阈值（这主要是为了尽可能排除极端异常的匹配点，如漏检的动态物体点）
+                                // 静态物体点是否也要按照有IMU的条件来检验？
+                                // if(cls_label == 0 && (!USE_IMU || !init_succ))
+                                if(!USE_IMU || !IMU_init_succ)
+                                {
+                                    // 如果已经有了F/E矩阵的估计，则此时的F矩阵应该较为准确，则提高极线约束的要求（但是F/E估计仍然会有一定误差）
+                                    if(!has_FH_est || !has_valid_F)
+                                    {
+                                        if(!has_FH_est)
+                                            succ = check_flow_with_F(F_cam, pt_prev, pt_cur, 16.0);
+                                        else
+                                        {
+                                            // 意味着有成功的H估计，那么旋转R的预测值是比较准确的。位移P的前后帧变化一般不会太大
+                                            succ = check_flow_with_F(F_cam, pt_prev, pt_cur, 6.5);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        if(has_valid_F)
+                                            succ = check_flow_with_F(F_cam_by_cal_FE, pt_prev, pt_cur, 4.0);
+                                    }
+                                }
+                                else
+                                {
+                                    // todo:如果已经有了IMU，是否还要用视觉估计的F/H来进行筛选？这里暂时只使用IMU积分构建的F矩阵来筛选
+                                    // 那如果当前帧预测的位移P很小，F不可靠，那是否用估计的H来筛选？
+
+                                    // if(has_FH_est && has_valid_F)
+                                    //     succ = check_flow_with_F(F_cam, pt_prev, pt_cur, 6.0);
+                                    // else
+                                        succ = check_flow_with_F(F_cam, pt_prev, pt_cur, 5.5);
+                                }
+                                
+                                // 静态点需要离预测的极线不能太远
+                                // 对于不成立的点，只删除纯背景点
+                                // 静态物体点(包括上一帧的漏检的物体点）可能变为了动态点
+                                if(succ <= 0)
+                                {
+                                    if(is_bg_track)
+                                    {
+                                        // cout << "Invalid tracking with predicted epi constraint!" << endl;
+                                        status_fea_track[i] = 0;
+                                        if(!add_up)
+                                        {
+                                            num_long_track_FAST_in_bloc[row_in_bloc][col_in_bloc] -= 1;
+                                        }
+                                        continue;
+                                    }
+                                    else
+                                    {   
+                                        is_invalid_sta_fea = true;
+                                    }
+                                }
+                            }
+                        }
+                        else if(small_p)
+                        {
+                            // todo:当预测的位移较小时，如何排除异常匹配点？包括连续漏检的动态物体上的匹配点.
+                            // 上一帧的静态物体点是否也要参与这里的验证？
+                            // 这里可以有2种方法，1是只要光流长度大于阈值，就认定是错误的背景点匹配；第2种方法就是统计所有背景匹配点的光流长度，使用MAD排除明显异常点
+                            // 但如果前后2帧汽车刚好从静止刚启动，那么方法1是否会错误地排除大多数内点？？
+                            
+                            if(!use_MAD_to_fliter_flow)
+                            {
+                                disp_x = pt_cur.x - pt_prev.x;
+                                disp_y = pt_cur.y - pt_prev.y;
+                                float len_flow = disp_x*disp_x + disp_y*disp_y;
+                                if(len_flow >= 12.0 * 12.0)
+                                {
+                                    if(is_bg_track)
+                                    {
+                                        status_fea_track[i] = 0;
+                                        if(!add_up)
+                                        {
+                                            num_long_track_FAST_in_bloc[row_in_bloc][col_in_bloc] -= 1;
+                                        }
+                                        continue;
+                                    }
+                                    else
+                                    {
+                                        is_invalid_sta_fea = true;
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                // 相机运动很小时，是否要放弃使用上一帧的静态物体点来估计F_H？
+                                // 不放弃，因为后续还可以基于运动预测用重投影误差来排除动态物体点
+                                if(prev_cls > 0)
+                                {
+                                    // is_invalid_sta_fea = true;
+                                }
+                            }
+                        }
+
+                        // 对3D-2D点进行重投影检验
+                        // 这里只对静态物体点进行检验，且其需要在上一帧具有立体匹配
+                        // 要进行重投影检验则必须要有完整的运动预测R和P
+                        if(!add_up && frame_cnt > 1)
+                        {
+                            float th_dep_sta_obj_fea = Th_dep_sta_obj_fea_to_add;
+
+                            // todo: 是否要通过3D-2D投影来验证上一帧的静态物体点是否还静止？
+                            // 需要，因为物体点满足相机的极线约束不一定意味着该物体是静态的，参考工作RigidMask！但是刚好当前帧该物体就由静止启动了？
+                            // 纯背景跟踪点是否也要进行3D-2D投影的检验？
+                            if(!check_dep_with_reproj_err)
+                            {
+                                if(prev_cls == 0)
+                                {
+                                    is_close_static_fea = true;
+                                }
+                                else if(!is_invalid_sta_fea)
+                                {
+                                    // 对于静态物体点，需要匹配的NCC值较高
+                                    if(val_NCC > 0.98)
+                                    {
+                                        // 如果是上一帧的静态物体点，直接使用其中较近的点来参与估计F_H矩阵
+                                        // todo:是否要求该深度来自于立体匹配。暂时不需要
+                                        // if(prevRightFeaMap.find(gl_id) != prevRightFeaMap.end())
+                                        {
+                                            int prev_dep = prev_FAST_dep[i];
+                                            if(prev_dep > 0 && prev_dep <= th_dep_sta_obj_fea)
+                                                is_close_static_fea = true;
+                                        }
+                                    }
+                                }
+                            }
+                            else if(is_bg_track || !is_invalid_sta_fea)
+                            {
+                                // 计算重投影误差时不需要有足够大的预测位移运动！！
+                                // if(check_flow_with_epi)
+                                {
+                                    bool has_dep = false;
+                                    float prev_dep = -1.0;
+                                    
+                                    // 如果是背景的旧点，则其在上一帧一定有深度值（要么来自立体匹配，要么来自运动更新）
+                                    // 除了极线约束之外，让上一帧有深度值的背景点再参与重投影误差检验，是为了排除那些在连续2帧均漏检的动态物体上的点?
+                                    // 这些连续漏检的物体的点不可能再被归为物体点，但却会对相机运动估计产生影响！！（尤其是近处的物体，如骑车的人！）
+                                    // 纯视觉阶段不使用预测运动对背景点进行过滤
+                                    if(is_bg_track)
+                                    {
+                                        // todo: 经过尝试之后，发现即使使用IMU来预测相机运动，对背景跟踪点进行3D-2D的滤除还是比较危险的，可能到时某些帧下完全没有3D-2D跟踪点！！！
+                                        // 此外，最新的系统版本中，每一帧的背景跟踪点不在最新帧中检测立体匹配，同时其来自于运动更新的深度被认为不够精确（仅用于在下一帧被跟踪时提供立体匹配的预测），因此这里背景点暂时都是2D-2D点！
+                                        if(0 && USE_IMU && IMU_init_succ)
+                                        {
+                                            prev_dep = prev_FAST_dep[i];
+                                            if(prev_dep > 0)
+                                            {
+                                                has_dep = true;
+                                            }
+                                            else
+                                            {
+                                                if(prevRightFeaMap.find(gl_id) != prevRightFeaMap.end())
+                                                {
+                                                    float disp_x_prev = prevLeftFeaMap[gl_id].x - prevRightFeaMap[gl_id].x;
+                                                    if(disp_x_prev <= 0)
+                                                    {
+                                                        cout << "Weired! line 2782" << endl;
+                                                        exit(-1);
+                                                    }
+                                                    prev_dep = mbf/disp_x_prev;
+
+                                                    has_dep = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    else
+                                    {
+                                        if(val_NCC > 0.98)
+                                        {
+                                            prev_dep = prev_FAST_dep[i];
+                                            if(prev_dep > 1.5 && prev_dep <= th_dep_sta_obj_fea) 
+                                            {
+                                                // 如果该静态物体点在上一帧的深度值较可靠，即来自立体匹配（或者运动更新），则进行重投影检验
+                                                // if(prevRightFeaMap.find(gl_id) != prevRightFeaMap.end())
+                                                if(prevRightFeaMap.find(gl_id) != prevRightFeaMap.end() || cnt_track > 1)
+                                                    has_dep = true;
+                                                else
+                                                {
+                                                    // 如果该点在上一帧没有较准确的深度值，则不进行重投影校验。那么该点是否还能参与FH估计？如果NCC值较高则可以，后续也优先在上一帧寻找立体匹配以便作为静态3D-2D点的补充
+                                                    if(prev_dep < 15)
+                                                        is_close_static_fea = true;
+                                                }   
+                                            }
+                                        }
+                                    }
+                                    
+                                    if(has_dep)
+                                    {
+                                        if(prev_un_Fea_map.find(gl_id) != prev_un_Fea_map.end())
+                                        {
+                                            Vec4f &prev_fea = prev_un_Fea_map[gl_id];
+                                            float prev_x = prev_fea(0) * prev_dep;
+                                            float prev_y = prev_fea(1) * prev_dep;
+                                            Vector3d prev_pt(prev_x,prev_y,prev_dep);
+                                            Vector3d pred_cur;
+                                            // 临时新检测的背景点的上一帧背景点不会有深度值
+                                            // if(has_valid_F || has_valid_H)
+                                            //     pred_cur = (R_from_E * prev_pt + P_cam_motion);
+                                            // else
+                                                pred_cur = (R_cam_motion * prev_pt + P_cam_motion);
+                                            
+                                            if(pred_cur(2) > 0)
+                                            {
+                                                float pred_x = pred_cur(0)/pred_cur(2);
+                                                float pred_y = pred_cur(1)/pred_cur(2);
+                                                Vector2d pred_un_pt(pred_x,pred_y);
+
+                                                Point2f cur_un_fea;
+                                                undistortedPts(pt_cur,cur_un_fea,m_camera[0]);
+                                                Vector2d cur_un_pt(cur_un_fea.x,cur_un_fea.y);
+                                                
+                                                float err = (pred_un_pt - cur_un_pt).norm();
+
+                                                // 重投影误差小于10.0个像素点，因为考虑到相机运动预测的误差。使用IMU且初始化后可以提高要求
+                                                float Th_err = 14.0;
+                                                if(USE_IMU && IMU_init_succ) 
+                                                    Th_err = 5.0;
+                                                else if(has_FH_est)
+                                                    Th_err = 7.0;
+                                                
+                                                if(err <= Th_err/FOCAL_LENGTH_X)
+                                                {
+                                                    is_close_static_fea = true;
+                                                }
+                                                else
+                                                {
+                                                    // 不满足重投影误差的背景点，可能是动态点，但也可能只是其深度估计误差较大。
+                                                    // todo: 这种情况下是否要放弃该背景跟踪点？
+                                                    if(prev_cls == 0)
+                                                    {
+                                                        // status_fea_track[i] = 0;
+                                                        // continue;
+
+                                                        // 可以不放弃该跟踪点，但是不允许其参与F_H估计，而是只能被校验！
+                                                        // todo: 但是否应该放弃其深度值估计？
+                                                        is_close_static_fea = true;
+                                                        bg_track_not_for_cal_FH.insert(gl_id);
+                                                    }
+                                                    else
+                                                    {
+                                                        // 物体点重投影误差较大，不一定是深度估计较差，也有可能是该物体变为动态的？
+                                                        // status_fea_track[i] = 0;
+                                                        // continue;
+                                                    }
+                                                }
+                                            }
+                                            else
+                                            {
+                                                if(prev_cls == 0)
+                                                {
+                                                    is_close_static_fea = true;
+                                                    bg_track_not_for_cal_FH.insert(gl_id);
+                                                }
+                                            }
+                                        }
+                                        else
+                                        {
+                                            cout << "Weired! Line 3019" << endl;
+                                            exit(-1);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        // 如果上一帧背景点没有深度，则其还是可以作为估计F或H的备选
+                                        if(prev_cls == 0) 
+                                            is_close_static_fea = true;
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            if(is_bg_track)
+                            {
+                                is_close_static_fea = true;
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    if(is_bg_track) 
+                        is_close_static_fea = true;
+                    else if(is_sta_obj_track)
+                    {
+                        // 是否直接使用上一帧近处的静态物体跟踪点参与F/H估计？
+                        float prev_dep = prev_FAST_dep[i];
+                        if(prev_dep > 1.5 && prev_dep < 18.0) 
+                            is_close_static_fea = true;
+                    }
+                }
+                
+                // 如果上一帧和当前帧都是静态点，则把这些点作为当前帧的背景静态点
+                //if (obj_cls_id_FAST[i].second == 0 && 0 == cls_label) ++num_track_FAST_bg;
+                // 如果上一帧和当前帧都是背景点，则把这些点作为当前帧的背景静态点
+
+                int obj_label = pt_info[1];
+                
+                // 第二个元素暂时存储当前帧的临时物体id，待物体关联完成后在修改为全局物体id。第一个元素存储该点的全局类别（基于上一帧对齐），但如果上一帧的点为背景点，则保存当前帧该点的检测类别
+                if(prev_cls == 0 || is_close_static_fea)
+                {
+                    // 上一帧的背景点
+                    if(prev_cls == 0)
+                    {
+                        if(cls_label == 0)
+                        {
+                            ++num_track_FAST_bg;
+                        }
+                        else
+                        {
+                            // 如果是某个物体点在上一帧漏检了，则要求上一帧其漏检特征点必须具有该帧下的深度值（否则后续无法进行运动估计以判断该点是否为动态）
+                            // 这种情况实际上不存在，因为这要求该点在之前均是漏检（即为背景点），但这样的点在上面就已经排除了
+                            if(!add_up && prev_FAST_dep[i] <= 0)
+                            {
+                                if(prevRightFeaMap.find(gl_id) != prevRightFeaMap.end())
+                                {
+                                    float disp_x_prev = prevLeftFeaMap[gl_id].x - prevRightFeaMap[gl_id].x;
+                                    if(disp_x_prev <= 0)
+                                    {
+                                        // assert(false);
+                                        exit(-1);
+                                    }
+
+                                    float dep = mbf/disp_x_prev;
+                                    if(dep > 1.5 && dep < mThDepthObj)
+                                        prev_FAST_dep[i] = dep;
+                                    else
+                                    {
+                                        // 深度无效或者超过阈值，放弃该物体点
+                                        status_fea_track[i] = 0;
+                                        continue;
+                                    }
+                                }
+                                else
+                                {
+                                    // 对于旧跟踪点，后续也会尝试为其在上一帧寻找立体匹配，到时如果找不到再放弃此物体跟踪点。但实际上此种情况（之前多帧为物体点，当前帧变为物体点）在上面就已经去除了！
+                                    // status_fea_track[i] = 0;
+                                    // continue;
+                                }
+                            }
+                        }
+                    }
+
+                    if(!add_up)
+                    {
+                        l_id = i;
+                        if(prev_cls == 0)
+                            // 上一帧为背景点，则当前帧跟踪点的cls label与其当前帧的检测类别相一致（要么背景要么物体）
+                            obj_cls_id_FAST[i] = std::pair<uchar, int>(cls_label, obj_label);
+                        else
+                            obj_cls_id_FAST[i] = std::pair<uchar, int>(prev_cls, obj_label);
+                    }
+                    else
+                    {
+                        // 添加该新跟踪点
+                        prev_FAST.push_back(pt_prev);
+                        // 新添加的一定是上一帧背景区域的点
+                        prev_FAST_global_obj_id.push_back(0);
+                        track_cnt_FAST.push_back(1);
+                        ids_FAST.push_back(n_id);
+                        status_FAST.push_back(1);
+                        obj_cls_id_FAST.emplace_back(cls_label,obj_label);
+                        // 后续再为这些上一帧新点检测其右匹配点
+                        prev_FAST_dep.push_back(-1.0);
+                        prevLeftFeaMap[n_id] = pt_prev;
+
+                        undistortedPts(pt_prev, prev_un_pt, m_camera[0]);
+                        prev_un_Fea_map[n_id] = Vec4f(prev_un_pt.x, prev_un_pt.y, 0.0, 0.0);
+                        cur_FAST.push_back(pt_cur);
+                        gl_id = n_id;
+                        ++n_id;
+                        l_id = num_orig_track;
+                        // cur_FAST中已有的点数
+                        ++num_orig_track;
+                    }
+
+                    // 记录所有的静态跟踪点
+                    if(!only_use_track_sift_for_F && is_close_static_fea)
+                    {
+                        // 有效的静态物体跟踪点也算为静态跟踪点，这样可以减少一些背景点的检测（因为在某些场景中物体可能占据某个大bloc的绝大多数位置）！
+                        --num_need_to_save;
+                        ++num_valid_static_track;
+
+                        if(sort_all_sift_FAST)
+                        {
+                            // cout << "cur FAST: " << pt_cur;
+                            // cout << ", NCC of static tracked FAST: " << val_NCC;
+                            // cout << ", NCC ambi: " << id_ambi_NCC[i] << endl;
+                            
+                            // // 红色实线圈
+                            // circle(prev_img_for_show_fea, pt_prev, 4, Scalar(255,0,0), 1, 16);
+                            
+                            // while(true)
+                            // {
+                            //     cv::imshow("tracked fea in prev left image", prev_img_for_show_fea);
+                            //     // 一直等待用户按下ESC键（ASCI码为27）
+                            //     if(waitKey(0) == 27)
+                            //     {
+                            //         break;
+                            //     }
+                            // }
+
+                            if(!full_cur_bloc)
+                            {
+                                NCC_matching_all.emplace_back((l_id+1),val_NCC);
+                                // 所属大小bloc的静态跟踪点数+1
+                                num_fea_2D2D_big_bloc[id_big_bloc] += 1;
+                                pt_2d_2d_small_bloc[id_small_bloc] += 1;
+
+                                if(prev_cls != 0)
+                                {
+                                    int num_got = num_sta_obj_track_per_bloc[id_big_bloc];
+                                    id_sta_obj_track_per_bloc[id_big_bloc][num_got] = (l_id+1);
+                                    num_sta_obj_track_per_bloc[id_big_bloc] += 1;
+                                }
+                            }
+
+                            // 记录所有track NCC较高的静态物体点，后续为所有这些点都尽可能寻找上一帧的立体匹配（即形成3D-2D点），多余的点将作为备份的静态3D-2D点
+                            if(prev_cls != 0) g_id_sta_obj_2D2D_high_NCC.insert(ids_FAST[l_id]);
+                        }
+                        else
+                        {
+                            // 近处的点多添加一些
+                            if(row_in_bloc >= start_row_bloc)
+                            {
+                                int num_total = 8;
+                                if(row_in_bloc > 3)
+                                {
+                                    num_total = NUM_FEA_IN_BLOC;
+                                    // 如果该bloc内有静态物体，适当减少特征点（物体上的特征点太多且集中）
+                                    if(prev_cls > 0) 
+                                    {
+                                        num_total = 6;
+                                        // cout << "Got a static obj fea tracking!" << endl;
+                                    }
+                                }
+                                
+                                if(id_best_track_bloc[row_in_bloc][col_in_bloc] < num_total)
+                                {
+                                    // 是否只选择多帧跟踪（这些点是否也有办法记录其quality?)，以及quality值足够高的新检测点用于估计F矩阵
+                                    // 最后还是要根据点匹配的质量的大小来排序，而不是根据点检测的质量。匹配质量越好的点，越先放入temp_pts_for_F中！
+                                    // if(i < thres_pt_id)
+                                    {
+                                        id_best_track_bloc[row_in_bloc][col_in_bloc] += 1;
+                                        temp_pts_for_F.push_back(i+1);
+                                    }
+                                    // pts_stereo_for_F;
+                                }
+                            }
+                            else
+                            {
+                                int num_total = 5;
+                                float prev_dep = prev_FAST_dep[i];
+                                // 如果该bloc内包含了近处的背景点，则增加该bloc的点数，因为一般一个物体上不会只有一个特征点
+                                if(prev_dep > 0 && prev_dep <= 18)
+                                {
+                                    num_total = 9;
+                                }
+
+                                // FAST的跟踪点中还是有在上半部分的。其来自于sift
+                                if(id_best_track_bloc[row_in_bloc][col_in_bloc] < num_total)
+                                {
+                                    // 是否只选择多帧跟踪（这些点是否也有办法记录其quality?)，以及quality值足够高的新检测点用于估计F矩阵
+                                    // 最后还是要根据点匹配的质量来选择，而不是根据点检测的质量
+                                    // if(i < thres_pt_id)
+                                    {
+                                        id_best_track_bloc[row_in_bloc][col_in_bloc] += 1;
+                                        temp_pts_for_F.push_back(i+1);
+                                    }
+                                    // pts_stereo_for_F;
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    // 此时是上一帧的物体点，该点应该是在上一帧就已经保存的点
+                    if(add_up)
+                    {
+                        cout << "Weired! Line 3116" << endl;
+                        exit(-1);
+                    }
+
+                    l_id = i;
+                    // 如果上一帧是物体点，需要该点在上一帧必须有深度值。
+                    // 物体的所有被跟踪点均在上一帧已经确定，且具有深度值（跟踪点来自立体匹配或者运动更新，新点来自立体匹配或者直接取depth_map的值）！
+                    // 这种情况其实应该是不会出现的！
+                    // 不一定，比如该点是作为静态物体的3D-2D跟踪点加入了地图（那么其运动更新就只在三角化函数内与背景点一起进行），但是如果刚好该帧相机运动估计失败（没有PnP或者LBA），则不会进行地图点的运动更新获取深度！
+                    if(prev_FAST_dep[l_id] <= 0) 
+                    {
+                        // cout << "Weired! Line 3082" << endl;
+                        // exit(-1);
+                        // 那么是否继续跟踪该点？取决于后续是否继续为该点在上一帧寻找立体匹配。这里暂时选择不再保留！
+                        status_fea_track[i] = 0;
+                        continue;
+                    }
+                    
+                    // 上一帧为物体点，则当前帧跟踪点的cls label与上一帧的点一致，obj_id则仍然用临时检测物体的id
+                    obj_cls_id_FAST[i] = std::pair<uchar, int>(prev_cls, obj_label);
+                }
+                
+                // 跟踪的FAST静态点(包括静态物体）数量。需要该点在上一帧为静态点（但是如果上一帧为背景点，而当前帧匹配的是物体点，则不算为静态点跟踪）
+                if(prev_obj_state == 0 && (prev_cls > 0 || cls_label == 0))
+                {
+                    ++num_track_FAST_static;
+                    // 长跟踪的静态FAST点数
+                    if(!add_up && cnt_track > 1) ++num_sta_FAST_long_track;
+                }
+
+                // 对于跟踪成功的物体点，在上一帧中对其进行标注
+                if(add_new_fea_in_next_frame)
+                {
+                    // 如果关联的两个点有一个不是背景点，则认为是物体点
+                    if(prev_cls != 0 || cls_label != 0)
+                    {
+                        circle(mask_prev_fea_objs, prev_FAST[l_id], 3, 0, -1);
+                    }
+                }
+                
+                // 计数纯背景跟踪点
+                if(is_bg_track) 
+                {
+                    ++num_valid_track_bg;
+
+                    if(!need_cal_FH || small_p)
+                    {
+                        id_bg_track_FAST.push_back(l_id);
+                    }
+                    
+                    if(need_LBA && is_old_track) ++num_old_track_fea;
+                }
+                
+                if(sort_by_NCC)
+                {
+                    float ambi_NCC = id_ambi_NCC[i];
+                    if(add_up)
+                        ambi_NCC_new_FAST.push_back(ambi_NCC);
+                    else
+                        ambi_NCC_new_FAST[i] = ambi_NCC;
+                }
+
+                if(add_up)
+                {
+                    if(use_motion_to_pred_fea_dep) predict_dep_FAST.push_back(-1.0);
+                }
+            }
+            else 
+            {
+                status_fea_track[i] = 0;
+                if(!add_up && prev_cls == 0 && cls_label == 0)
+                {
+                    num_long_track_FAST_in_bloc[row_in_bloc][col_in_bloc] -= 1;
+                }
+            }
+        }
+    }
+
+    // 将近处的静态物体跟踪点也算入静态点
+    return num_valid_static_track;
+    // return num_valid_track_bg;
+}
+
+// 按要求在上一帧图像的各个大bloc中检测新的FAST背景点并跟踪，以达到每个大bloc中要求的最小跟踪数
+bool FeatureTracker::new_FAST_detect_and_track(Mat &base_mask_full_img, float high_th_NCC, float low_th_NCC, int &num_valid_track, const cv::Mat &seg_map_cur, const cv::Mat &flow_map, 
+                                                const vector<int> &min_num_track_need, int max_cnt_try, int total_num_need, const bool has_F_est, const float Th_ambi_min)
+{
+    vector<Point2f> new_det_FAST_prev;
+    vector<Point2f> temp_track_FAST_cur;
+    vector<uchar> temp_track_status;
+    int num_add_new = 0;
+    
+    int start_id = prev_FAST.size();
+    // 为4个大bloc分别补充新的FAST跟踪点直到点数达到最大阈值
+
+    vector<Mat> mask_img_to_draw_invalid_pt;
+    mask_img_to_draw_invalid_pt.push_back(base_mask_full_img);
+
+    for(int k = 3; k >= 0; --k)
+    {
+        int num_need = 0;
+        int num_had = num_fea_2D2D_big_bloc[k];
+        int max_num_th = max_num_track_big_bloc[k];
+        int min_num_th = min_num_track_need[k];
+
+        // 如果各个大bloc中的跟踪点数还没达到最小值，则单独在各个bloc中进行检测
+        if(num_had < min_num_th)
+        {
+            Mat &mask_fea_prev = mask_appeared_fea_prev[k];
+            // todo:可以不copy整个mask，而是只创建一个全0的大mask，然后依次把各个大bloc对应的小mask区域复制过来，并把上一个大bloc的区域置为0（也是复制一个全0的小mask）。这样是否可以减少clone的时间？
+            // mask_fea_prev = mask_bg_fea_prev.clone();
+            mask_fea_prev = base_mask_full_img.clone();
+
+            // 首先将其他所有大bolc都mask掉
+            mask_fea_prev.setTo(0,mask_for_cover_big_bloc[k]);
+            
+            vector<uchar> maskd(9,0);
+            int cnt_try = 0;
+            bool first_try = true;
+
+            // todo: 是否要反复地尝试检测？
+            while(num_had < max_num_th)
+            {
+                // 如果要反复尝试增加新跟踪点，则次数不超过2次
+                ++cnt_try;
+
+                if(cnt_try > max_cnt_try) break;
+
+                // 如果1轮过后点数达到了最小要求，则不再检测
+                if(cnt_try > 1 && num_had >= min_num_th) break;
+
+                if(!new_det_FAST_prev.empty())
+                {
+                    draw_bg_fea_in_mask_prev(mask_fea_prev, new_det_FAST_prev, 0, temp_track_status);
+
+                    new_det_FAST_prev.clear();
+                    temp_track_status.clear();
+                }
+                
+                // 查看该大bloc中各个小bloc的点数是否已满
+                for(int i = 0; i < 9; ++i)
+                {
+                    int id_small_bloc = id_small_bloc_in_big_bloc[k][i];
+                    int num_pt;
+
+                    int id_row = id_small_bloc/6;
+                    int id_col = id_small_bloc%6;
+
+                    // if(first_try)
+                    // {
+                    //     num_pt = num_flow_pt_in_bloc[id_row][id_col] + num_long_track_FAST_in_bloc[id_row][id_col] + num_temp_flow_pt_in_bloc[id_row][id_col];
+                    //     pt_2d_2d_small_bloc[id_small_bloc] = num_pt;
+                    //     first_try = false;
+                    // }
+                    // else
+                    {
+                        num_pt = pt_2d_2d_small_bloc[id_small_bloc];
+                    }
+
+                    int num_limt = limit_num_track_per_bloc[id_small_bloc];
+
+                    // 如果该小bloc点数刚刚已满，则mask该区域
+                    if(num_pt >= num_limt)
+                    {
+                        if(maskd[i] == 0)
+                        {
+                            int w_bloc = 200, h_bloc = 60;
+                            if(id_row == 5) h_bloc = row - 60*5;
+                            if(id_col == 5) w_bloc = col - 200*5;
+                            
+                            cv::Rect targetRectBloc(200*id_col, 60*id_row, w_bloc, h_bloc);
+                            Mat allZeorZoneBloc(h_bloc, w_bloc, CV_8UC1, Scalar(0));
+                            Mat dest_zone_bloc = mask_fea_prev(targetRectBloc);
+                            allZeorZoneBloc.copyTo(dest_zone_bloc);
+
+                            maskd[i] = 1;
+                        }
+                    }
+                }
+                
+                if(cnt_try == 1) 
+                    num_need = max_num_th - num_had;
+                else
+                    num_need = min_num_th - num_had;
+                
+                if(num_need > 0)
+                {
+                    // 上半图像要求点的质量更高
+                    float quality_level = 0.03;
+                    float step_ = 0.03;
+                    // 需要更多的近点，因此适当放宽质量条件？
+                    if(k >= 2) 
+                    {
+                        quality_level = 0.02;
+                        step_ = 0.02;
+                    }
+
+                    // 如果是多次尝试，则每次都提高检测点的要求（因为更好的点都在上一帧中优先被检测了）
+                    quality_level += step_ * (cnt_try - 1);
+                    
+                    // 把base_mask_full_img也作为参数传入，对那些确定不需要再被检测的点（比如max_ambi大于固定阈值），则在base_mask_full_img这一全局的mask中将其注黑（以免后续再被重复检测）！
+                    // 由于会在多轮检测中改变min_ambi的阈值，因此对于min_ambi不符合要求的点，暂时不将其在base_mask_full_img注黑（但是min_ambi不能大于最终允许的最大值，否则也可以提前标注）！
+                    detect_new_FAST_prev(num_need, mask_fea_prev, mask_img_to_draw_invalid_pt, new_det_FAST_prev, quality_level, false, false, check_detect_by_ambi_NCC, Th_ambi_min);
+                    // detect_new_FAST_prev(total_num, mask_bg_fea_prev, new_det_FAST_prev, true, true, Th_ambi_min);
+
+                    if(!new_det_FAST_prev.empty())
+                    {
+                        // cout << "New det bg fea in prev frame: " << new_det_FAST_prev.size() << endl;
+                        
+                        // {
+                        //     for(int i = 0; i < new_det_FAST_prev.size(); ++i)
+                        //     {
+                        //         Point2f &pt = new_det_FAST_prev[i];
+                        //         // 虚线的圈代表FAST.
+                        //         circle(prev_color_img_l, pt, 4, Scalar(255,0,255), 1, 8);
+                        //     }
+
+                        //     while(true)
+                        //     {
+                        //         cv::imshow("new detected fea in prev img", prev_color_img_l);
+                        //         // 一直等待用户按下ESC键（ASCI码为27）
+                        //         if(waitKey(0) == 27)
+                        //         {
+                        //             break;
+                        //         }
+                        //     }
+                        // }
+
+                        if(hasPrediction)
+                        {
+                            // 这些新检测的点还没有深度值，因此只能用flow_map来设置跟踪点预测
+                            track_pred_for_new_det_prev_fea(new_det_FAST_prev, temp_track_FAST_cur, flow_map, seg_map_cur);
+                        }
+                        
+                        num_add_new = Track_and_Filter_FAST(new_det_FAST_prev, temp_track_FAST_cur, temp_track_status, hasPrediction, seg_map_cur, true, num_need, high_th_NCC, low_th_NCC, has_F_est, Th_ambi_min);
+                        num_valid_track += num_add_new;
+                    }
+                }
+                
+                num_had = num_fea_2D2D_big_bloc[k];
+            }
+        }
+
+        // 将该大bloc中新检测到的点画到base_mask_full_img上
+        {
+            int new_num = prev_FAST.size();
+            if(new_num > start_id)
+            {
+                draw_bg_fea_in_mask_prev(base_mask_full_img, prev_FAST, start_id);
+                start_id = new_num;
+            }
+
+            if(!new_det_FAST_prev.empty())
+            {
+                new_det_FAST_prev.clear();
+                temp_track_status.clear();
+            }
+        }
+    }
+    
+    if(total_num_need <= 0) total_num_need = MIN_CNT_PTS_TRACK_BG;
+    // if(total_num_need <= 0) total_num_need = 30;
+
+    // 如果至此有效静态跟踪点数还是少于规定的最小值，则在仅标注了已检测点（包含跟踪失败的点）的上一帧整张图像上进行检测，并适当放宽跟踪的筛选要求
+    if(num_valid_track < total_num_need)
+    {
+        mask_img_to_draw_invalid_pt.clear();
+        int max_iter = 2;
+        int num_need = total_num_need - num_valid_track;
+        int cnt_iter = 0;
+        // todo: 是否要重复检测和跟踪，直到满足需要的最少数量
+        while(num_need > 0 && cnt_iter < max_iter)
+        {
+            if(!new_det_FAST_prev.empty())
+            {
+                draw_bg_fea_in_mask_prev(base_mask_full_img, new_det_FAST_prev, 0, temp_track_status);
+
+                new_det_FAST_prev.clear();
+                temp_track_status.clear();
+            }
+            
+            // 点之间间隔大一些
+            detect_new_FAST_prev(num_need, base_mask_full_img, mask_img_to_draw_invalid_pt, new_det_FAST_prev, 0.05, false, false, check_detect_by_ambi_NCC, Th_ambi_min, 30);
+            
+            if(!new_det_FAST_prev.empty())
+            {
+                if(hasPrediction)
+                {
+                    track_pred_for_new_det_prev_fea(new_det_FAST_prev, temp_track_FAST_cur, flow_map, seg_map_cur);
+                }
+                
+                num_add_new = Track_and_Filter_FAST(new_det_FAST_prev, temp_track_FAST_cur, temp_track_status, hasPrediction, seg_map_cur, true, num_need, (high_th_NCC-cnt_iter*0.01), (low_th_NCC-cnt_iter*0.01), has_F_est, Th_ambi_min);
+                
+                num_valid_track += num_add_new;
+                ++cnt_iter;
+            }
+            else
+                break;
+
+            num_need = total_num_need - num_valid_track;
+        }
+    }
+}
+
+// 基于NCC值用局部搜索的方式为某个点寻找立体匹配
+float FeatureTracker::find_stereo_match_by_best_NCC(const Point2f &left_pt, Point2f &find_r_pt, float thres_min_NCC, float search_range_x, bool has_pred)
+{
+    Point2f cent_pt;
+
+    if(!has_pred) 
+        cent_pt = left_pt;
+    else
+        cent_pt = find_r_pt;
+    
+    if(search_range_x <= 0) search_range_x = 15.0;
+    
+    float lim_1 = cent_pt.x - search_range_x;
+    float limit_l = max((float)0.0, lim_1);
+
+    float lim_2 = cent_pt.x + search_range_x;
+    float limit_r = min(bg_right_border_right_img, lim_2);
+    // 左右视差disp_x = l_x-r_x必须是大于0的！
+    if(limit_r >= left_pt.x) limit_l = left_pt.x - 5.0;
+
+    if(limit_l >= limit_r) return -1.0;
+
+    float l_end = limit_l - cent_pt.x;
+    float r_end = limit_r - cent_pt.x;
+
+    Point2f pt_shift = cent_pt;
+
+    float val_NCC, max_NCC = 0.0, sub_max_NCC = 0.0;
+
+    float best_shift_x = 0, best_shift_y = 0, sub_best_shift_x = 0, sub_best_shift_y = 0;
+
+    int cnt = 0;
+    // 首先以1.0像素为间隔，只在x方向搜寻最大的NCC的匹配点处
+    for(float shift_x = l_end; shift_x <= r_end; shift_x += 1.0)
+    {
+        pt_shift.x = cent_pt.x + shift_x;
+
+        // todo:取像素点灰度值时是否应该插值？
+        val_NCC = cal_NCC(prev_img, prev_img_r, left_pt, pt_shift, Len_edge_win);
+
+        if(val_NCC > max_NCC)
+        {
+            // 记录最大和次大 的匹配，由于基线较大，左右图像的成像可能有一定的差别，因此最大的NCC匹配不一定就是最优的
+            if(cnt > 0)
+            {
+                sub_max_NCC = max_NCC;
+                sub_best_shift_x = best_shift_x;
+            }
+            
+            best_shift_x = shift_x;
+
+            max_NCC = val_NCC;
+        }
+        else
+        {
+            if(val_NCC > sub_max_NCC)
+            {
+                sub_max_NCC = val_NCC;
+                sub_best_shift_x = shift_x;
+            }
+        }
+
+        ++cnt;
+    }
+
+    // 如果最佳值位于左右边界，则认为此次的搜索范围不足
+    if(best_shift_x == l_end || best_shift_x == r_end) 
+        return -1.0;
+    else
+    {
+        if(max_NCC < 0.70) return -1.0;
+
+        Point2f best_cent = cent_pt;
+        best_cent.x += best_shift_x;
+
+        Point2f sub_best_cent = cent_pt;
+        bool check_sub_best = false;
+        if(cnt > 1)
+        {
+            if(sub_max_NCC/max_NCC >= 0.90 && abs(best_shift_x - sub_best_shift_x) >= 2.0)
+            {
+                check_sub_best = true;
+                sub_best_cent.x += sub_best_shift_x;
+            }
+        }
+
+        best_shift_x = 0;
+        for(float shift_x = -2.0; shift_x <= 2.0; shift_x += 0.5)
+        {
+            // 根据KITTI的标定文件，同一个点在右图像的中的y坐标会比其在左图像的y坐标略大（即更偏向图像底部）
+            for(float shift_y = -1.0; shift_y <= 2.0; shift_y += 0.5)
+            {
+                if(shift_x == 0 && shift_y == 0) continue;
+                pt_shift.x = best_cent.x + shift_x;
+                pt_shift.y = best_cent.y + shift_y;
+
+                // todo:取像素点灰度值时是否应该插值？
+                val_NCC = cal_NCC(prev_img, prev_img_r, left_pt, pt_shift, Len_edge_win);
+
+                if(val_NCC > max_NCC)
+                {
+                    best_shift_x = shift_x;
+                    best_shift_y = shift_y;
+                    max_NCC = val_NCC;
+                }
+            }
+        }
+
+        best_cent.x += best_shift_x;
+        best_cent.y += best_shift_y;
+        cent_pt = best_cent;
+
+        if(check_sub_best)
+        {
+            sub_best_shift_x = 0;
+
+            for(float shift_x = -2.0; shift_x <= 2.0; shift_x += 0.5)
+            {
+                // 根据KITTI的标定文件，同一个点在右图像的中的y坐标会比其在左图像的y坐标略大（即更偏向图像底部）
+                for(float shift_y = -1.0; shift_y <= 2.0; shift_y += 0.5)
+                {
+                    if(shift_x == 0 && shift_y == 0) continue;
+
+                    pt_shift.x = sub_best_cent.x + shift_x;
+                    pt_shift.y = sub_best_cent.y + shift_y;
+
+                    // todo:取像素点灰度值时是否应该插值？
+                    val_NCC = cal_NCC(prev_img, prev_img_r, left_pt, pt_shift, Len_edge_win);
+
+                    if(val_NCC > sub_max_NCC)
+                    {
+                        sub_best_shift_x = shift_x;
+                        sub_best_shift_y = shift_y;
+                        sub_max_NCC = val_NCC;
+                    }
+                }
+            }
+
+            // todo: 但是最终的判断准则还是用NCC的最大值吗？？
+            // 由于初始的sub_max_NCC比max_NCC要小，因此这里如果成立，则意味着sub_max处该点的可区分性更大？
+            if(sub_max_NCC > max_NCC)
+            {
+                sub_best_cent.x += sub_best_shift_x;
+                sub_best_cent.y += sub_best_shift_y;
+                cent_pt = sub_best_cent;
+                max_NCC = sub_max_NCC;
+            }
+        }
+
+        // {
+        //     int row_bloc = left_pt.y/60;
+        //     float dep = mbf/(left_pt.x - cent_pt.x);
+        //     cout << "Got a stereo match! row_bloc: " << row_bloc << ", NCC: " << max_NCC << ", depth: " << dep << endl;
+        // }
+        
+        if(max_NCC >= thres_min_NCC)
+        {
+            find_r_pt = cent_pt;
+
+            return max_NCC;
+        }
+        else
+            return -1.0;
+    }
+}
+
+// 为当前的tracking feature在上一帧寻找立体匹配
+int FeatureTracker::find_stereo_for_tracked_fea(const cv::Mat &prev_dep_map, const vector<int> &near_pt_need_bloc, const vector<int> &total_num_need_bloc, int &num_near_3D_2D, 
+                                                    int &num_total_3D_2D, int near_pt_need, int total_num_need, int start_id_FAST, int start_id_SIFT, bool has_est_FH)
+{
+    // 根据跟踪结果，为跟踪点在上一帧寻找立体匹配
+    // 上一帧就已经保留的物体点 是否有立体匹配已经是在上一帧就决定了的，但是可能有些漏检点（临时检测的上一帧背景区域的点）还没有立体匹配
+    if(!num_fea_3D2D_big_bloc.empty()) num_fea_3D2D_big_bloc.clear();
+    num_fea_3D2D_big_bloc.resize(4,0);
+
+    if(!num_fea_2D2D_big_bloc.empty()) num_fea_2D2D_big_bloc.clear();
+    num_fea_2D2D_big_bloc.resize(4,0);
+
+    vector<int> num_far_pt_big_bloc(4,0);
+
+    num_near_3D_2D = 0;
+    num_total_3D_2D = 0;
+
+    int invalid_bg_track = 0;
+    int w_big_bloc = 200*3;
+    int h_big_bloc = 60*3;
+    int num_2d, num;
+    int row_bloc, col_bloc, row_big_bloc, col_big_bloc, id_big_bloc;
+
+    vector<int> ids_new_obj_pts;
+    vector<uchar> l_id_obj_fea_need_LK;
+    set<int> far_prev_pt_stereo;
+
+    if(!pts_stereo_large_dep.empty())
+    {
+        for(auto &iter: pts_stereo_large_dep)
+        {
+            far_prev_pt_stereo.insert(iter.second);
+        }
+    }
+    
+    // 被选中（用于估计F/H和相机PnP估计）的静态物体点
+    set<int> l_id_sta_obj_pt_select, l_id_sta_obj_pt_all;
+    // 记录近处静态物体跟踪点，这些物体点要尽量获取立体匹配，以防止在某些情况下某些大bloc中纯背景3D-2D点不足
+    for(int i = 0; i < 4; ++i)
+    {
+        int num_sta_obj_track = num_sta_obj_track_per_bloc[i];
+
+        if(num_sta_obj_track > 0)
+        {
+            for(int j = 0; j < num_sta_obj_track; ++j)
+            {
+                int l_id = id_sta_obj_track_per_bloc[i][j];
+                if(l_id_outliers_sta_obj_fea.find(l_id) == l_id_outliers_sta_obj_fea.end())
+                    l_id_sta_obj_pt_select.insert(l_id);
+            }
+        }
+    }
+
+    int num_3D_2D_stat_obj_pt = 0;
+    bool prev_new_fea_need_LK = (frame_cnt > 2 && use_motion_to_pred_fea_dep);
+    // 如果物体的跟踪点在上一帧没有立体匹配。那么对于其中的旧点（即上一帧的跟踪点）是否保留其来自于运动更新的深度值
+    bool trust_obj_fea_from_motion_update = true;
+    
+    for(int k = 0; k < 2; ++k)
+    {
+        int num_old_track, id, l_id, gl_obj_id, start_pt_id, num_cnt;
+        Point2f pt;
+        uchar cls;
+        float dep;
+        
+        if(k == 0)
+        {
+            num = prev_sift.size();
+            start_pt_id = start_id_SIFT;
+            num_old_track = num_old_track_sift;
+        }
+        else
+        {
+            num = prev_FAST.size();
+            start_pt_id = start_id_FAST;
+            num_old_track = num_old_track_FAST;
+        }
+
+        for(int i = start_pt_id; i < num; ++i)
+        {
+            if(k == 0)
+            {
+                if(status_sift[i] == 0) continue;
+                pt = prev_sift[i];
+                cls = obj_cls_id_sift[i].first;
+                dep = prev_sift_dep[i];
+                id = ids_sift[i];
+                l_id = -i;
+                num_cnt = track_cnt_sift[i];
+                gl_obj_id = prev_sift_global_obj_id[i];
+            }
+            else
+            {
+                if(status_FAST[i] == 0) continue;
+                pt = prev_FAST[i];
+                cls = obj_cls_id_FAST[i].first;
+                dep = prev_FAST_dep[i];
+                id = ids_FAST[i];
+                l_id = i + 1;
+                num_cnt = track_cnt_FAST[i];
+                gl_obj_id = prev_FAST_global_obj_id[i];
+            }
+
+            // 纯背景跟踪点
+            if(cls == 0)
+            {
+                row_big_bloc = pt.y/h_big_bloc;
+                col_big_bloc = pt.x/w_big_bloc;
+                if(row_big_bloc > 1) row_big_bloc = 1;
+                if(col_big_bloc > 1) col_big_bloc = 1;
+                
+                id_big_bloc = 2 * row_big_bloc + col_big_bloc;
+
+                // 部分背景跟踪点在上一帧可能已经有了立体匹配
+                if(prevRightFeaMap.find(id) != prevRightFeaMap.end())
+                {
+                    // 记录各个大bloc的已有远和近的3D-2D点数量
+                    if(far_prev_pt_stereo.find(id) != far_prev_pt_stereo.end())
+                    {
+                        num_far_pt_big_bloc[id_big_bloc] += 1;
+                        fea_g_id_dep[id] = 1;
+                    }
+                    else
+                    {
+                        num_fea_3D2D_big_bloc[id_big_bloc] += 1;
+                        fea_g_id_dep[id] = 0;
+                    }
+
+                    // 如果需要对立体匹配进行三角化才获得深度值，则这里放弃该点在上一帧结束时的深度值（来自于运动更新或者直接来自depth_map）
+                    if(use_tria_stereo && dep > 0)
+                    {
+                        if(k == 0)
+                            prev_sift_dep[i] = -1.0;
+                        else
+                            prev_FAST_dep[i] = -1.0;
+                    }
+                }
+                else
+                {
+                    num_2d = num_fea_2D2D_big_bloc[id_big_bloc];
+
+                    if(num_2d >= 2*NUM_FEA_IN_BIG_BLOC)
+                    {
+                        cout << "Weired! Line 3834" << endl;
+                        exit(-1);
+                    }
+
+                    num_fea_2D2D_big_bloc[id_big_bloc] += 1;
+
+                    if(k == 0)
+                        id_fea_2D2D_big_bloc[id_big_bloc][num_2d] = -i;
+                    else
+                        id_fea_2D2D_big_bloc[id_big_bloc][num_2d] = i+1;
+                }
+            }
+            else
+            {
+                // 对于上一帧就保留的物体跟踪点（注意这些点不一定都是多帧跟踪，有些是上一帧的新物体点），如果其在上一帧没有深度值（来自立体匹配或者运动更新），则尝试为其寻找立体匹配
+                if(i < num_old_track)
+                {
+                    // 这部分点应该在上一帧就应该有深度值了？
+                    // 不一定，该点可能上一帧作为静态物体的3D-2D跟踪点加入地图，但是PnP和LBA均失败导致无法通过运动更新获取深度值！
+                    if(dep <= 0)
+                    {
+                        // cout << "Weired! Line 3678" << endl;
+                        // if(k == 0)
+                        //     cout << "It's a old sift!" << endl;
+                        // else
+                        //     cout << "It's a old FAST!" << endl;
+                        
+                        // exit(-1);
+
+                        // 如果在2D跟踪时选择保留这样的点，则说明是选择尝试为其在上一帧继续寻找立体匹配，如果找不到再放弃该点
+                        ids_new_obj_pts.push_back(l_id);
+                        // 这些点作为上一帧的跟踪就已经采用LK光流尝试寻找立体匹配了，而当前帧是否继续先使用LK光流则取决于上一帧设置匹配预测值时是否使用了depth_map
+                        if(prev_new_fea_need_LK)
+                            l_id_obj_fea_need_LK.push_back(1);
+                        else
+                            l_id_obj_fea_need_LK.push_back(0);
+
+                        // 虽然该点在上一帧没有深度值，如果后面该点没有找到立体匹配，则会放弃该点(status为0)，该点不会被错误使用 
+                        l_id_3D_2D_obj_fea.push_back(l_id);
+                        continue;
+                    }
+
+                    // 如果被跟踪的物体点在上一帧还没有立体匹配，则为这些点在上一帧再次寻找立体匹配
+                    // 之所以说是“再次”，因为所有物体点在上一帧都尝试过寻找立体匹配
+                    // 上一帧时有些点会寻找立体匹配失败，这其中的跟踪点可能在上一帧运动估计后更新了深度，而新点则直接用depth_map作为深度值
+                    // 上一帧没有立体匹配的跟踪点因为深度值更新了，因此其可以作为LK更精确的初始值。但上一帧没有立体匹配的新点其实在当前再次LK寻找立体匹配是没有意义的（因为初始值大概率还是找不到）但是可以增加强制搜索）
+                    if(prevRightFeaMap.find(id) != prevRightFeaMap.end())
+                    {
+                        // 记录物体的3D-2D点
+                        l_id_3D_2D_obj_fea.push_back(l_id);
+                        // 如果是近处的静态物体跟踪点有立体匹配，则记录，后续会作为估计相机运动的静态3D-2D点
+                        if(l_id_sta_obj_pt_select.find(l_id) != l_id_sta_obj_pt_select.end())
+                        {
+                            ++num_3D_2D_stat_obj_pt;
+                            g_id_sta_obj_3D2D_high_NCC.insert(id);
+                        }
+                        else if(g_id_sta_obj_2D2D_high_NCC.find(id) != g_id_sta_obj_2D2D_high_NCC.end())
+                        {
+                            cand_g_id_sta_obj_fea.insert(id);
+                        }
+                    }
+                    else
+                    {
+                        ids_new_obj_pts.push_back(l_id);
+                        // 可以进行LK光流估计的跟踪点，即上一帧的旧点（经过运动估计后更新了深度值，此处作为立体匹配的初始值）或者上一帧的新点（使用了运动预测值设置了立体匹配初始值,则先在可以用depth_map作为初值再尝试LK）
+                        if(num_cnt > 2 || prev_new_fea_need_LK)
+                        {
+                            l_id_obj_fea_need_LK.push_back(1);
+                            // 对于旧点,即使寻找立体匹配失败,也可以选择保留来自运动更新的深度值(认为精度足够)
+                            if(num_cnt > 2 && trust_obj_fea_from_motion_update) l_id_3D_2D_obj_fea.push_back(l_id);
+                        }
+                        else
+                            l_id_obj_fea_need_LK.push_back(0);
+
+                        // 如果是上一帧较近处的静态物体点，则为其寻找立体匹配时可以多几次尝试
+                        if(status_objs_prev.find(gl_obj_id) != status_objs_prev.end())
+                        {
+                            if(status_objs_prev[gl_obj_id] == 1)
+                            {
+                                // 这些点的深度要么来自运动更新（上一帧的跟踪点），要么直接来自于depth_map（上一帧的新点），但是都经过了MAD筛选（即没有明显的离群值）
+                                if(dep <= (Th_dep_sta_obj_fea_to_add+2))
+                                {
+                                    l_id_sta_obj_pt_all.insert(l_id);
+                                } 
+                            }
+                        }
+                        else
+                        {
+                            cout << "Weired! Line 3922" << endl;
+                            exit(-1);
+                        }
+                    }
+                }
+                // 临时添加的物体新跟踪点。这些点是物体在上一帧的漏检点
+                else
+                {
+                    l_id_3D_2D_obj_fea.push_back(l_id);
+                    if(dep > 0)
+                    {
+                        // 如果该漏检点在上一帧有深度值，则必须来自立体匹配
+                        if(prevRightFeaMap.find(id) == prevRightFeaMap.end())
+                        {
+                            cout << "Weired! Line 3936" << endl;
+                            exit(-1);
+                        }
+                        l_id_3D_2D_obj_fea.push_back(l_id);
+                    }
+                    else
+                    {
+                        ids_new_obj_pts.push_back(l_id);
+                        // 需要优先采用LK光流估计
+                        l_id_obj_fea_need_LK.push_back(1);
+                    }
+                }
+            }
+        }
+    }
+    
+    int total_3D_2D = 0, total_3D = 0;
+
+    // 为sift和FAST跟踪点寻找在上一帧的立体匹配
+    {
+        vector<Point2f> tracked_new_pt, pts_right_orig, pts_right;
+        vector<int> id_for_r, id_obj_fea_need_LK_for_r, l_id_obj_fea_need_LK_for_r;
+        
+        vector<int> l_id_rest_2d_pts;
+        vector<Point2f> pred_rest_2d_pts;
+        vector<pair<int,float>> index_ambi_rest_2d_pts;
+        int num_rest = 0;
+        
+        // float max_disp = mbf/mMinDepthPt;
+        float min_disp, max_disp = mbf/1.5;
+        
+        float min_disp_bg = mbf/mThDepthBg;
+
+        float min_disp_obj = mbf/mThDepthObj;
+
+        float close_pt_disp = mbf/21.0;
+
+        Point2f prev_pt_r, prev_un_pt_r;
+        float disp_x, disp_y;
+
+        // Check_dep_with_reproj_err代表是否要用运动预测（来自恒速模型或者IMU积分）来进行重投影误差检验
+        bool check_dep_with_reproj_err = frame_cnt > 1 && (Check_dep_with_reproj_err || has_est_FH);
+        
+        // 由于恒速运动模型得到的运动预测不是很精确，因此阈值要大一些
+        float thres_err = 15.0;
+        if(check_dep_with_reproj_err)
+        {
+            if(USE_IMU && IMU_init_succ) 
+                thres_err = 5.5;
+            else if(has_est_FH)
+            {
+                thres_err = 6.5;
+            }
+        }
+
+        int total_num_3D3D_low_half = 0;
+
+        if(total_num_need <= 0)
+        {
+            total_num_need = 0;
+            for(int k = 0; k < 4; ++k)
+                total_num_need += total_num_need_bloc[k];
+        }
+
+        if(near_pt_need <= 0)
+        {
+            near_pt_need = 0;
+            for(int k = 0; k < 4; ++k)
+                near_pt_need += near_pt_need_bloc[k];
+        }
+        
+        for(int j = 3; j >= -1; --j)
+        {
+            if(!tracked_new_pt.empty())
+            {
+                tracked_new_pt.clear();
+                id_for_r.clear();
+                pts_right_orig.clear();
+                pts_right.clear();
+            }
+
+            int num_pts;
+            int num_3D = 0, num_3D_2D = 0;
+            if(j >= 0)
+            {
+                num_pts = num_fea_2D2D_big_bloc[j];
+                // 该大bloc中已有的近处（小于21m)的3D-2D点数
+                num_3D = num_fea_3D2D_big_bloc[j];
+                // 该大bloc中已有的3D-2D点数（包含近点与远点）
+                num_3D_2D = num_far_pt_big_bloc[j] + num_3D;
+            }
+            else
+            {
+                num_pts = ids_new_obj_pts.size();
+                num_3D = num_3D_2D_stat_obj_pt;
+                num_3D_2D = num_3D;
+            }
+
+            if(num_pts > 0)
+            {
+                int id;
+                for(int k = 0; k < num_pts; ++k)
+                {
+                    if(j >= 0)
+                        id = id_fea_2D2D_big_bloc[j][k];
+                    else
+                        id = ids_new_obj_pts[k];
+                    
+                    if(id > 0)
+                        tracked_new_pt.push_back(prev_FAST[(id-1)]);
+                    else
+                        tracked_new_pt.push_back(prev_sift[(-id)]);
+                    
+                    id_for_r.push_back(id);
+                    if(j < 0) l_id_obj_fea_need_LK_for_r.push_back(k);
+                }
+            }
+            
+            if(!tracked_new_pt.empty())
+            {
+                // 首先为这些新特征点设置右匹配点的预测值
+                float ave_disp_x_bg = mbf/(2.0/3*mMinDepthPt + 1.0/3*mThDepthBg);
+                float ave_disp_y_bg = Y_shift_right_image/(2.0/3*mMinDepthPt + 1.0/3*10);
+
+                float r_x, r_y;
+                int id, g_id, cnt_track = 0, g_id_obj = 0;
+                uchar cls_;
+                float dep_prev, disp;
+                // 标记在此轮未找到立体匹配的跟踪点
+                vector<int> pts_no_stereo;
+                int cnt = -1;
+                for(auto &pt: tracked_new_pt)
+                {
+                    ++cnt;
+                    id = id_for_r[cnt];
+                    if(id > 0)
+                    {
+                        dep_prev = prev_FAST_dep[(id-1)];
+                        if(j >= 0)
+                        {
+                            // 上一帧的背景点如果有有效深度值，则其只会来自运动更新。
+                            // 如果认为这样的深度值不够精确，则只用其来提供立体匹配的预测，因此随后放弃这个深度值
+                            if(dep_prev > 0 && !Trust_dep_from_motion)
+                                prev_FAST_dep[(id-1)] = -1.0;
+                        }
+                        else
+                        {
+                            if(track_cnt_FAST[(id-1)] <= 2 || !trust_obj_fea_from_motion_update)
+                                prev_FAST_dep[(id-1)] = -1.0;
+                        }
+                    }
+                    else
+                    {
+                        dep_prev = prev_sift_dep[(-id)];
+                        if(j >= 0)
+                        {
+                            if(dep_prev > 0 && !Trust_dep_from_motion)
+                                prev_sift_dep[(-id)] = -1.0;
+                        }
+                        else
+                        {
+                            if(track_cnt_sift[(-id)] <= 2 || !trust_obj_fea_from_motion_update)
+                                prev_sift_dep[(-id)] = -1.0;
+                        }
+                    }
+                    
+                    // 首先如果该点在上一帧有深度值（来自于运动更新），则可以考虑使用该深度值来设置其立体匹配的预测
+                    if(Use_pred_dep_to_find_stereo_mtach && dep_prev > 0)
+                    {
+                        disp = mbf/dep_prev;
+                    }
+                    else
+                    {
+                        // 否则从上一帧的depth_map中获取预测值
+                        disp = prev_dep_map.at<float>(pt.y,pt.x);
+                    }
+                    
+                    // 如果前面的预测都无效，则用上下阈值的加权平均作为代替
+                    if(disp <= 0)
+                    {
+                        // assert(disp>0 && "Why value in disp_map <= 0?");
+                        r_x = pt.x - ave_disp_x_bg;
+                        // r_y = min(pt.y+ave_disp_y_bg, (float)(row-5));
+                        r_y = min(pt.y, (float)(row-5));
+                    }
+                    else
+                    {
+                        r_x = pt.x - disp;
+                        // float depth = mbf/disp;
+                        // float shift_y = Y_shift_right_image/depth;
+                        // r_y = min(pt.y+shift_y, (float)(row-5));
+                        r_y = pt.y;
+                    }
+
+                    if(r_x >= 5 && r_x <= bg_right_border_right_img)
+                        pts_right.emplace_back(r_x, r_y);
+                    else if (r_x < 5)
+                        pts_right.emplace_back(5, r_y);
+                    else
+                        pts_right.emplace_back(bg_right_border_right_img, r_y);
+                }
+                
+                pts_right_orig = pts_right;
+
+                // 如果是为物体点寻找立体匹配
+                if(j == -1)
+                {
+                    if(l_id_obj_fea_need_LK.size() != id_for_r.size())
+                    {
+                        cout << "Weired! Line 4038" << endl;
+                        exit(-1);
+                    }
+                    // 首先那些没有经过运动更新的上一帧跟踪点（其实保留下来的跟踪点要么是有立体匹配的，要么应该是通过运动更新深度值的）以及通过depth_map还没找到立体匹配的上一帧新点，
+                    // 在此处就不再进行LK匹配，而是直接进入强制搜索，以节省时间
+                    reduceVector(tracked_new_pt, l_id_obj_fea_need_LK);
+                    reduceVector(pts_right, l_id_obj_fea_need_LK);
+                    id_obj_fea_need_LK_for_r = id_for_r;
+                    reduceVector(id_obj_fea_need_LK_for_r, l_id_obj_fea_need_LK);
+                    reduceVector(l_id_obj_fea_need_LK_for_r, l_id_obj_fea_need_LK);
+                }
+
+                // 为上一帧每个新点寻找立体匹配
+                vector<uchar> statusLR;
+                vector<cv::Point2f> reverseLeftPts;
+                vector<uchar> statusRL;
+                vector<float> err;
+                
+                if(!tracked_new_pt.empty())
+                {
+                    // cout << "Start stereo match for FAST in right image!" << endl;
+                    // // cur left ---- cur right
+                    // // 注意，无论有没有预测值，cur_right_pts和status的长度都与cur_pts的是一样的，status的值会指示cur_right_pts中的对应元素是否为有效的光流估计匹配点
+                    // cv::Size给定的两个值分别是（width，height)
+                    cv::calcOpticalFlowPyrLK(prev_img, prev_img_r, tracked_new_pt, pts_right, statusLR, err, cv::Size(11, 11), 2,
+                                            cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
+                    
+                    // 尝试一下立体匹配不进行flow back
+                    if(FLOW_BACK)
+                    {
+                        vector<float> err_reserve;
+                        reverseLeftPts = tracked_new_pt;
+                        cv::calcOpticalFlowPyrLK(prev_img_r, prev_img, pts_right, reverseLeftPts, statusRL, err_reserve, cv::Size(11, 11), 1,
+                                                cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.02), cv::OPTFLOW_USE_INITIAL_FLOW);
+                    }
+                }
+
+                uchar succ;
+                float min_disp = min_disp_bg;
+                float pt_un_y, thres_NCC = 0.97;
+                uchar* p_status;
+                float* p_dep; 
+
+                // 通过此变量控制是否 搜寻局部最优立体匹配
+                bool use_LK_for_stereo_match = false;
+                bool is_SIFT = false, is_stat_obj_track = false, pt_above_th_dep = false;
+                
+                for(int i = 0; i < statusLR.size(); ++i)
+                {
+                    succ = statusLR[i];
+
+                    if(FLOW_BACK)
+                    {
+                        if(statusRL[i])
+                        {
+                            if(distance(tracked_new_pt[i], reverseLeftPts[i]) > 1.0)
+                                succ = 0;
+                        }
+                        else
+                            succ = 0;
+                    }
+                    
+                    Point2f &prev_pt = tracked_new_pt[i];
+                    // int row_in_bloc = prev_pt.y/60;
+                    int l_id = i;
+                    
+                    if(j > -1)
+                    {
+                        id = id_for_r[i];
+                    }
+                    else
+                    {
+                        id = id_obj_fea_need_LK_for_r[i];
+                        l_id = l_id_obj_fea_need_LK_for_r[i];
+                    }
+
+                    if(id > 0)
+                    {
+                        cls_ = obj_cls_id_FAST[(id-1)].first;
+                        p_status = &(status_FAST[(id-1)]);
+                        p_dep = &(prev_FAST_dep[(id-1)]);
+                        g_id = ids_FAST[(id-1)];
+                        cnt_track = track_cnt_FAST[(id-1)];
+                        is_SIFT = false;
+
+                        if(j < 0) g_id_obj = prev_FAST_global_obj_id[(id-1)];
+                    }
+                    else
+                    {
+                        cls_ = obj_cls_id_sift[-id].first;
+                        p_status = &(status_sift[-id]);
+                        p_dep = &(prev_sift_dep[-id]);
+                        g_id = ids_sift[-id];
+                        cnt_track = track_cnt_sift[(-id)];
+                        is_SIFT = true;
+
+                        if(j < 0) g_id_obj = prev_sift_global_obj_id[(-id)];
+                    }
+                    
+                    if(cls_ == 0) pt_un_y = prev_un_Fea_map[g_id](1);
+                    
+                    // 这里不应该只将 被选择参与相机运动估计的某一些上一帧静态物体点 列入强制搜索的目标，而是应该所有近处的静态物体（<=16m)的点都列入范围！
+                    // 因为这些被选择的点需要在objs-matching阶段被提前确认为静态（需要有足够的3D-3D点），否则其跟踪点不会被加入地图！所以同一个近处的静态物体的跟踪点是需要被同等重视的！
+                    // if(j < 0 && l_id_sta_obj_pt_select.find(id) != l_id_sta_obj_pt_select.end()) is_stat_obj_track = true;
+                    if(j < 0 && l_id_sta_obj_pt_all.find(id) != l_id_sta_obj_pt_all.end()) is_stat_obj_track = true;
+
+                    if(succ)
+                    {
+                        float len_flow = 0;
+                        prev_pt_r = pts_right[i];
+                        disp_x = prev_pt.x - prev_pt_r.x;
+                        disp_y = prev_pt.y - prev_pt_r.y;
+                        
+                        // 首先y方向的差别不能太大，否则后续即使局部优化也无法满足要求
+                        if(abs(disp_y) >= 3.0 || disp_x <= 0) 
+                        {
+                            // todo: 物体点能否直接使用上一帧的dep_map来赋值？那这跟直接用像素点有什么区别？虽然flow tracking比较准确，但是深度值如果不准确，那么该3D-2D点对PnP估计的影响会非常大！
+                            if(cls_ > 0)
+                            {
+                                if(!is_stat_obj_track)
+                                {
+                                    // todo:如果是旧跟踪点,是否保留该点来自运动更新的深度值?
+                                    if(cnt_track <= 2 || !trust_obj_fea_from_motion_update)
+                                        *p_status = 0;
+                                }
+                                else
+                                    pts_no_stereo.push_back(l_id);
+                            }
+                            else
+                                pts_no_stereo.push_back(l_id);
+
+                            continue;
+                        }
+                        
+                        if(cls_ == 0)
+                        {
+                            min_disp = min_disp_bg;
+                        }
+                        else
+                        {
+                            min_disp = min_disp_obj;
+                        }
+
+                        // 太远或太近的跟踪点放弃，也节省了下面的NCC计算
+                        if(disp_x < min_disp || disp_x > max_disp) 
+                        {
+                            if(cls_ > 0 || (!(need_cal_FH && before_cal_FH)))
+                            {
+                                *p_status = 0;
+                                if(cls_ == 0) ++invalid_bg_track;
+                                continue;
+                            }
+                            else
+                            {
+                                if(id > 0)
+                                {
+                                    Point2f &pt_p = prev_FAST[(id-1)];
+                                    Point2f &pt_c = cur_FAST[(id-1)];
+                                    len_flow = (pt_p.x-pt_c.x)*(pt_p.x-pt_c.x) + (pt_p.y-pt_c.y)*(pt_p.y-pt_c.y);
+                                }
+                                else
+                                {
+                                    Point2f &pt_p = prev_sift[(-id)];
+                                    Point2f &pt_c = cur_sift[(-id)];
+                                    len_flow = (pt_p.x-pt_c.x)*(pt_p.x-pt_c.x) + (pt_p.y-pt_c.y)*(pt_p.y-pt_c.y);
+                                }
+
+                                // 如果超近点或超远点的光流长度够大，大可用于估计F/H矩阵（主要是估计E矩阵）
+                                if((frame_cnt == 1 || (pred_delta_angle_cam > 1.0 || pred_trans_cam > 0.8)) && len_flow >= 11)
+                                {
+                                    // pt_above_th_dep = true;
+                                }
+                                else
+                                {
+                                    *p_status = 0;
+                                    ++invalid_bg_track;
+                                    continue;
+                                }
+                            }
+                        }
+
+                        if(cls_ == 0)
+                        {
+                            // 立体匹配的NCC值并不低，绝大多数正确匹配都应该大于0.95。
+                            if(prev_pt.y/60.0 <= 3)
+                                thres_NCC = 0.98;
+                            else
+                            {
+                                // 先对所有的下半图像的点放宽NCC阈值，后续再根据其是否为地面点再调整阈值要求
+                                thres_NCC = 0.96;
+                                // 考虑到近处地面点（下1/3图像区域）在左右图像形变可能较大，适当降低NCC
+                                // if(prev_pt.y/60.0 >= 4) 
+                                //     thres_NCC = 0.96;
+                                // else
+                                //     thres_NCC = 0.975;
+                            }
+                        }
+                        else
+                        {
+                            // 0.9？
+                            thres_NCC = 0.97;
+                        }
+                        
+                        // todo:大于20m的背景点认为深度估计不够准确，放弃该立体匹配？
+                        // 暂时记录这些较远的立体匹配，防止当前帧没有任何的近点深度！！
+                        // if(cls_ == 0 && disp_x < close_pt_disp)
+                        // {
+                        //     continue;
+                        // }
+
+                        // 计算NCC并选择最佳的立体匹配点
+                        float shift_x, shift_y;
+                        float val_NCC;
+                        // todo: 由于FAST点的立体匹配是使用LK光流估计的，精度较高，这里是否可以不再搜寻局部最优立体匹配？
+                        if(!use_LK_for_stereo_match && refine_matching_stereo)
+                        {
+                            // cout << "cal best NCC for FAST in prev frame! ";
+                            val_NCC = cal_best_NCC(prev_img, prev_img_r, prev_pt, prev_pt_r, Len_edge_win, shift_x, shift_y, false, is_SIFT);
+                            // val_NCC = cal_best_NCC(prev_img, prev_img_r, prev_pt, prev_pt_r, Len_edge_win, shift_x, shift_y, check_match_by_ambi_NCC, is_SIFT);
+                        }
+                        else
+                        {
+                            // 立体匹配也不用局部NCC的ambi来过滤，这种筛选使用在flow匹配上
+                            // if(check_by_ambi_NCC)
+                            //     val_NCC = cal_check_by_ambi_NCC(prev_img, prev_img_r, prev_pt, prev_pt_r, Len_edge_win);
+                            // else
+                            {
+                                val_NCC = cal_NCC(prev_img, prev_img_r, prev_pt, prev_pt_r, Len_edge_win);
+
+                                // int row_fea = prev_pt.y/60;
+                                // if(row_fea == 6) row_fea = 5;
+                                // cout << "NCC of FAST stereo matching in prev img: " << val_NCC << ", row of fea: " << row_fea << endl;
+                            }
+                        }
+                        
+                        // 要求立体匹配最终的NCC值不能小于阈值！
+                        // 这些点都是背景点
+                        if(val_NCC <= thres_NCC)
+                        {
+                            // todo:是否为物体点也多次尝试？
+                            // 只为近处的静态物体跟踪点进行强制搜索匹配
+                            if(cls_ > 0) 
+                            {
+                                if(!is_stat_obj_track)
+                                {
+                                    if(cnt_track <= 2 || !trust_obj_fea_from_motion_update)
+                                        *p_status = 0;
+                                }
+                                else
+                                    pts_no_stereo.push_back(l_id);
+                            }
+                            else
+                            {
+                                // if(row_in_bloc >= start_row_bloc)
+                                // if(row_in_bloc >= 0)
+                                {
+                                    pts_no_stereo.push_back(l_id);
+                                }
+                            }
+                            continue;
+                        }
+                        else 
+                        {
+                            if(!use_LK_for_stereo_match && refine_matching_stereo)
+                            {
+                                if(shift_x != 0 || shift_y != 0)
+                                {
+                                    // for showing stereo-match result of specified frame 
+                                    // if(0 && total_frame == 909)
+                                    // {
+                                    //     if(Mat_img_for_show.data != nullptr && mbf/(disp_x - shift_x) < 20)
+                                    //     {
+                                    //         // 红色点
+                                    //         circle(Mat_img_for_show, prev_pt, 3, Scalar(0,0,255), 1, 16);
+                                    //         // 绿色框是进行NCC计算的小窗口
+                                    //         rectangle(Mat_img_for_show, Point2f(prev_pt.x-12.0, prev_pt.y-12.0), Point2f(prev_pt.x+12.0, prev_pt.y+12.0), Scalar(0,255,0));
+
+                                    //         // 故意拉开优化前后点的距离，否则不好显示
+                                    //         Point2f orig_p(prev_pt_r.x-3*shift_x, prev_pt_r.y-3*shift_y);
+                                    //         // 黑色点是错误原始匹配点
+                                    //         circle(Mat_img_for_show, orig_p, 3, Scalar(0,0,0), 1, 16);
+                                    //         // 黑色小框是搜索的范围
+                                    //         rectangle(Mat_img_for_show, Point2f(orig_p.x-6.0, orig_p.y-6.0), Point2f(orig_p.x+6.0, orig_p.y+6.0), Scalar(0,0,0));
+                                            
+                                    //         Point2f new_p(prev_pt_r.x+shift_x, prev_pt_r.y+shift_y);
+                                    //         circle(Mat_img_for_show, new_p, 3, Scalar(0,0,255), 1, 16);
+                                    //         rectangle(Mat_img_for_show, Point2f(new_p.x-12.0, new_p.y-12.0), Point2f(new_p.x+12.0, new_p.y+12.0), Scalar(0,255,0));
+                                    //         // 蓝色连线
+                                    //         line(Mat_img_for_show, prev_pt, new_p, Scalar(255,0,0), 1, 16);
+                                            
+                                    //         while(true)
+                                    //         {
+                                    //             cv::imshow("final all tracked fea in prev left image", Mat_img_for_show);
+                                    //             // 一直等待用户按下ESC键（ASCI码为27）
+                                    //             if(waitKey(0) == 27)
+                                    //             {
+                                    //                 break;
+                                    //             }
+                                    //         }
+                                    //     }
+                                    // }
+                                    
+                                    prev_pt_r.x = prev_pt_r.x + shift_x;
+                                    prev_pt_r.y = prev_pt_r.y + shift_y;
+                                    disp_x -= shift_x;
+                                    disp_y -= shift_y;
+                                }
+                            }
+
+                            // 图像下半区域的点可能是地面点，也可能不是
+                            if(cls_ == 0 && prev_pt.y/60.0 > 3)
+                            {
+                                if(disp_x <= 0)
+                                {
+                                    pts_no_stereo.push_back(l_id);
+                                    continue;
+                                    // cout << "Weired! Line 4318" << endl;
+                                    // exit(-1);
+                                }
+                                
+                                float dep = mbf/disp_x;
+                                // 如果该点距离地面的高度大于等于0.3m，则对该点的NCC阈值要提高
+                                if(dep * pt_un_y <= (Cam_H - 0.3))
+                                {
+                                    if(val_NCC < 0.975)
+                                    {
+                                        pts_no_stereo.push_back(l_id);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
+                        // 如果该立体匹配不太准确，则放弃该立体匹配，但是仍保留该跟踪点
+                        // disp_y如何限制？KITTI的标定数据表明img2的相同点要比在img_3中的位置高（y坐标小），这个差距与点的depth有关
+                        if(abs(disp_y) >= 2.0) 
+                        {
+                            // 对于物体点是否也要通过暴力搜索来寻找匹配？物体点特征一般比较明显，这里不应该匹配不到，除非点质量比较差
+                            if(cls_ > 0)
+                            {
+                                if(!is_stat_obj_track)
+                                {
+                                    if(cnt_track <= 2 || !trust_obj_fea_from_motion_update)
+                                        *p_status = 0;
+                                }
+                                else
+                                    pts_no_stereo.push_back(l_id);
+                            }
+                            else
+                            {
+                                // 再次尝试
+                                pts_no_stereo.push_back(l_id);
+                            }
+                            continue;
+                        }
+
+                        if(disp_x <= 0)
+                        {
+                            if(cls_ > 0) 
+                            {
+                                if(!is_stat_obj_track)
+                                {
+                                    if(cnt_track <= 2 || !trust_obj_fea_from_motion_update)
+                                        *p_status = 0;
+                                }
+                                else
+                                    pts_no_stereo.push_back(l_id);
+                            }
+                            else
+                            {
+                                pts_no_stereo.push_back(l_id);
+                            }
+                            continue;
+                        }
+                        else if(disp_x < min_disp || disp_x > max_disp)
+                        {
+                            // 如果是超出深度范围的背景跟踪点后续不用于估计F/H矩阵，则这里不再保留该跟踪点
+                            if(cls_ > 0 || (!(need_cal_FH && before_cal_FH)))
+                            {
+                                *p_status = 0;
+                                if(cls_ == 0) ++invalid_bg_track;
+                                continue;
+                            }
+                            else
+                            {
+                                if(val_NCC > 0.985)
+                                {
+                                    if(len_flow <= 0)
+                                    {
+                                        if(id > 0)
+                                        {
+                                            Point2f &pt_p = prev_FAST[(id-1)];
+                                            Point2f &pt_c = cur_FAST[(id-1)];
+                                            len_flow = (pt_p.x-pt_c.x)*(pt_p.x-pt_c.x) + (pt_p.y-pt_c.y)*(pt_p.y-pt_c.y);
+                                        }
+                                        else
+                                        {
+                                            Point2f &pt_p = prev_sift[(-id)];
+                                            Point2f &pt_c = cur_sift[(-id)];
+                                            len_flow = (pt_p.x-pt_c.x)*(pt_p.x-pt_c.x) + (pt_p.y-pt_c.y)*(pt_p.y-pt_c.y);
+                                        }
+                                    }
+
+                                    // 如果超近点或超远点的光流长度够大，大可用于估计F/H矩阵（主要是估计E矩阵）
+                                    if((frame_cnt == 1 || (pred_delta_angle_cam > 1.0 || pred_trans_cam > 0.8)) && len_flow >= 11)
+                                    {
+                                        pt_above_th_dep = true;
+                                        // 这些点是否还要接受下面的重投影误差检验？
+                                        // tracked_pts_above_th_dep.insert(g_id);
+                                        // continue;
+                                    }
+                                    else
+                                    {
+                                        *p_status = 0;
+                                        ++invalid_bg_track;
+                                        continue;
+                                    }
+                                }
+                                else
+                                {
+                                    // 不满足NCC要求的点（这里超出深度阈值的点大多数应该都为远处高点，它们的左右图像中成像差异应该较小，且视差较小，不再寻求暴力搜寻）
+                                    // pts_no_stereo.push_back(l_id);
+                                    *p_status = 0;
+                                    ++invalid_bg_track;
+                                    continue;
+                                }
+                            }
+                        }
+                        
+                        float dep = mbf/disp_x;
+
+                        if(j < 0 && g_id_obj > 0)
+                        {
+                            float ave_dep = ave_dep_prev_objs[g_id_obj];
+                            if (dep > (ave_dep + 5.0) || dep < (ave_dep - 2.0))
+                            {
+                                if(!is_stat_obj_track)
+                                {
+                                    if(cnt_track <= 2 || !trust_obj_fea_from_motion_update)
+                                        *p_status = 0;
+                                }
+                                else
+                                    pts_no_stereo.push_back(l_id);
+
+                                continue;
+                            }
+                        }
+                        
+                        // 用预测运动值来计算静态跟踪点在该深度值下的重投影误差，排除明显错误的深度值！
+                        if(check_dep_with_reproj_err && (cls_ == 0 || is_stat_obj_track))
+                        {
+                            Vec4f &un_pt_prev = prev_un_Fea_map[g_id];
+                            float p_X = un_pt_prev(0) * dep;
+                            float p_Y = un_pt_prev(1) * dep;
+                            
+                            Vector3d prev_3d(p_X, p_Y, dep);
+                            Vector3d proj_cur;
+                            
+                            if(!has_est_FH)
+                                proj_cur = R_cam_motion * prev_3d + P_cam_motion;
+                            else
+                                proj_cur = R_from_E * prev_3d + P_cam_motion;
+                            
+                            float max_dep = mThDepthBg;
+                            if(cls_ > 0) max_dep = (Th_dep_sta_obj_fea_to_add + 2.0);
+
+                            if(proj_cur(2) <= 0)
+                            {
+                                pts_no_stereo.push_back(l_id);
+                                continue;
+                            }
+
+                            if(!pt_above_th_dep && (proj_cur(2) < 0.8 || proj_cur(2) > 1.1*max_dep))
+                            {
+                                pts_no_stereo.push_back(l_id);
+                                continue;
+                            }
+                            else
+                            {
+                                Point2f pred_cur;
+                                spaceToPlane(proj_cur, pred_cur, m_camera[0]);
+                                Point2f cur_fea;
+
+                                if(id > 0)
+                                    cur_fea = cur_FAST[(id-1)];
+                                else
+                                    cur_fea = cur_sift[-id];
+                                
+                                // 由于恒速运动模型得到的运动预测不是很精确，因此阈值要大一些
+                                if((pred_cur.x - cur_fea.x)*(pred_cur.x - cur_fea.x) + (pred_cur.y - cur_fea.y)*(pred_cur.y - cur_fea.y) > thres_err * thres_err)
+                                {
+                                    if(!pt_above_th_dep)
+                                    {
+                                        pts_no_stereo.push_back(l_id);
+                                        continue;
+                                    }
+                                    else
+                                    {
+                                        // 是否要继续搜寻该点
+                                        // pts_no_stereo.push_back(l_id);
+                                        *p_status = 0;
+                                        ++invalid_bg_track;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // l_id_3D_2D_obj_fea.push_back(l_id);
+
+                        // 如果是超出深度距离的点，且满足所有检验要求，则认为该点2d-2d跟踪是可信的，可以用于估计F/H，但是此处不记录其立体匹配
+                        if(pt_above_th_dep) 
+                        {
+                            tracked_pts_above_th_dep.insert(id);
+                            continue;
+                        }
+
+                        // 如果是纯背景跟踪点或者近处静态物体的高NCC值的跟踪点
+                        if(cls_ == 0 || is_stat_obj_track)
+                        {
+                            // {
+                            //     int row_bloc = prev_pt.y/60;
+                            //     cout << "Got a stereo match by LK FLOW! row_bloc: " << row_bloc << ", NCC: " << val_NCC << ", depth: " << dep << endl;
+                            // }   
+
+                            // 记录那些具有较大NCC值的立体匹配的上一帧背景点，之后按深度值从小到大排序，并选取一定数量的点来补充3D-2D匹配点，剩余的立体匹配删除
+                            if(disp_x < close_pt_disp)
+                            {
+                                if(val_NCC >= 0.985)
+                                {
+                                    if(cls_ != 0)
+                                    {
+                                        *p_status = 0;
+                                        continue;
+                                    }
+
+                                    ++num_3D_2D;
+                                    // 记录该背景点为远点
+                                    fea_g_id_dep[g_id] = 1;
+                                    pts_stereo_large_dep.emplace_back(dep, g_id);
+                                }
+                                else
+                                {
+                                    pts_no_stereo.push_back(l_id);
+                                    continue;
+                                }
+                            }
+                            else
+                            {
+                                if(cls_ == 0 || l_id_sta_obj_pt_select.find(id) != l_id_sta_obj_pt_select.end())
+                                {
+                                    // 同时统计近点的数量
+                                    ++num_3D;
+                                    ++num_3D_2D;
+                                    // 记录为近点
+                                    if(cls_ == 0) 
+                                        fea_g_id_dep[g_id] = 0;
+                                    else 
+                                        g_id_sta_obj_3D2D_high_NCC.insert(g_id);
+                                }
+                                else if(g_id_sta_obj_2D2D_high_NCC.find(g_id) != g_id_sta_obj_2D2D_high_NCC.end())
+                                {
+                                    // 剩余的近处静态物体点如果是3D-2D点，则记录它作为备用.因为这些静态点并没有直接参与F/H的估计,但是其通过了预测运动的F约束,也通过了上面的重投影误差检验(其中会使用F/H得到的R)
+                                    cand_g_id_sta_obj_fea.insert(g_id);
+                                }
+                            }
+                        }
+                        
+                        prevRightFeaMap[g_id] = prev_pt_r;
+                        undistortedPts(prev_pt_r, prev_un_pt_r, m_camera[1]);
+                        prev_un_r_Fea_map[g_id] = Vec4f(prev_un_pt_r.x, prev_un_pt_r.y, 0.0, 0.0);
+
+                        if(j < 0 && (cnt_track <= 2 || !trust_obj_fea_from_motion_update)) l_id_3D_2D_obj_fea.push_back(id);
+                        if(cls_ > 0 || !use_tria_stereo)
+                        {                       
+                            *p_dep = dep;
+                        }
+                    }
+                    else
+                    {
+                        if(cls_ > 0)
+                        {
+                            // todo:是否为物体点也多次尝试？只为近处静态物体点进行尝试
+                            if(!is_stat_obj_track)
+                            {
+                                if(cnt_track <= 2 || !trust_obj_fea_from_motion_update)
+                                    *p_status = 0;
+                            }
+                            else
+                                pts_no_stereo.push_back(l_id);
+                        }
+                        else
+                        {
+                            pts_no_stereo.push_back(l_id);
+                        }
+                    }
+                }
+                
+                if(j < 0)
+                {
+                    // 添加那些没有参与LK但是需要尝试通过强制搜索获得立体匹配的点
+                    for(int k = 0; k < l_id_obj_fea_need_LK.size(); ++k)
+                    {
+                        if(l_id_obj_fea_need_LK[k]) 
+                            continue;
+                        else
+                            pts_no_stereo.push_back(k);
+                    }
+                }
+                
+                // 如果大bloc中的静态3D-2D点数不满足要求，则为还未到立体匹配的进行强制搜索匹配
+                // if(j >= 0 && !pts_no_stereo.empty())
+                if(!pts_no_stereo.empty())
+                {
+                    int min_total_num_pt = total_num_need_bloc[j];
+                    int min_num_near_pt = near_pt_need_bloc[j];
+                    
+                    if(j < 0)
+                    {
+                        min_disp = min_disp_obj;
+                        // 如果各个大bloc中的背景3D-2D点再加上已有立体匹配的静态物体3D-2D点，已经足够，则减少或不再为剩下的被选择静态物体点进行暴力搜寻?减少搜索次数
+                        // todo:还可以计数每个静态物体和新物体的跟踪点数，如果每个物体的3D-2D点数已经达到最小要求（例如每个物体12个3D-2D点），则不再为该物体的剩余点寻找立体匹配，这样可以极大地节省时间！
+                        min_total_num_pt = 0;
+                        if(total_3D < 1.5*near_pt_need || (total_3D+num_3D) < 2.0 * near_pt_need)
+                            min_num_near_pt = 2.0 * near_pt_need - total_3D;
+                        else
+                            min_num_near_pt = 0;
+                    }
+                    else
+                    {
+                        min_disp = min_disp_bg;
+                    }
+
+                    int num_pt = pts_no_stereo.size();
+                    vector<uchar> status_succ(num_pt,0);
+
+                    // 剩下的点由于不太好寻找立体匹配点，按照ambi_NCC从小到大排序，代表点质量越好的越优先被尝试和保留
+                    vector<pair<int,float>> id_ambi_NCC;
+                    float ambi, un_pt_y;
+                    int id, l_id, g_id;
+
+                    for(auto iter: pts_no_stereo)
+                    {
+                        // 由于不是所有物体跟踪点的ambi值都被记录，因此针对物体跟踪点就不按照ambi值排序了
+                        if(j > -1)
+                        {
+                            l_id = id_for_r[iter];
+                            if(l_id > 0)
+                            {
+                                ambi = ambi_NCC_new_FAST[(l_id-1-start_id_FAST)];
+                            }   
+                            else
+                            {
+                                g_id = ids_sift[(-l_id)];
+                                ambi = id_ambi_NCC_new_sift[g_id];
+                            }
+                        }
+                        else
+                        {
+                            ambi = 0;
+                        }
+                        
+                        id_ambi_NCC.emplace_back(iter,ambi);
+                    }
+                    
+                    // 是要要无条件地为所有规定深度范围内的静态物体点寻找立体匹配？还是说要设置一个已有点数的限制？
+                    if(j < 0 || (num_3D < min_num_near_pt || num_3D_2D < min_total_num_pt))
+                    // if(num_3D < min_num_near_pt || num_3D_2D < min_total_num_pt)
+                    {
+                        max_disp = mbf/2.0;
+                        
+                        float val_NCC;
+                        Point2f prev_pt, pred_r_pt;
+
+                        if(j > -1)
+                        {
+                            // 将这部分点按照ambi_NCC从小到大排序，优先寻找区分度较大的点的立体匹配
+                            sort(id_ambi_NCC.begin(), id_ambi_NCC.end(), [](pair<int,float> &a, pair<int,float> &b)
+                                {return a.second < b.second;});
+                        }
+
+                        float th_NCC = 0.99;
+                        float step_th = 0.005, search_range = 4.0, range_step = 4.0;
+                        int num_done = 0, num_try = 0, max_num_try = 2;
+
+                        // 近处的背景点适当放宽NCC要求，最小的NCC值是0.95。注意，0.95是针对地面上的点，如果是近处的较高的点，则不应该使用如此低的阈值！
+                        if(j >= 2)
+                            step_th = 0.02;
+
+                        // 近处的静态物体点一般也不在地面上，其在左右图像中的形变应该不大，所以不放宽条件
+                        if(j < 0)
+                        {
+                            // 最小的NCC为0.975
+                            step_th = 0.015;
+                            search_range = 6.0;
+                            range_step = 6.0;
+                            // 物体点最多只搜寻2次
+                            max_num_try = 1;
+                        }
+                        
+                        // 在实际检测时各个大bloc中的3D-2D点数可能与给定的最小阈值不同。
+                        // 这里是先搜索下半图像的3D-2D点，如果其点数比计划的要多，则应该也要相应调整上半图像的3D-2D点数的最小值（至少是下半图像点数的40%）
+                        if(j == 1)
+                        {
+                            total_num_3D3D_low_half = total_3D_2D;
+                            // 上半帧的点数最少需要下半帧点数的40%
+                            int half_min_num = total_3D_2D*0.4*0.5;
+                            min_total_num_pt = max(half_min_num, min_total_num_pt);
+                        }
+                        else if (j == 0)
+                        {
+                            int half_min_num = total_num_3D3D_low_half*0.4 - (total_3D_2D - total_num_3D3D_low_half);
+                            min_total_num_pt = max(half_min_num, min_total_num_pt);
+                        }
+                        
+                        vector<uchar> status_check(num_pt,0);
+                        // 为失败的点多次尝试
+                        while(num_done < num_pt)
+                        {
+                            // 最多尝试 2 (3)次
+                            if(num_try > max_num_try) break;
+                            ++num_try;
+
+                            for(int i = 0; i < num_pt; ++i)
+                            {
+                                if(status_check[i] > 0) continue;
+                                id = id_ambi_NCC[i].first;
+                                l_id = id_for_r[id];
+                                
+                                if(l_id > 0)
+                                {
+                                    prev_pt = prev_FAST[(l_id-1)];
+                                    g_id = ids_FAST[(l_id-1)];
+                                    if(j < 0) 
+                                    {
+                                        cnt_track = track_cnt_FAST[(l_id-1)];
+                                        g_id_obj = prev_FAST_global_obj_id[(l_id-1)];
+                                    }
+                                }
+                                else
+                                {
+                                    prev_pt = prev_sift[-l_id];
+                                    g_id = ids_sift[-l_id];
+                                    if(j < 0) 
+                                    {
+                                        cnt_track = track_cnt_sift[-l_id];
+                                        g_id_obj = prev_sift_global_obj_id[-l_id];
+                                    }
+                                }
+                                
+                                if(j >= 2)
+                                {
+                                    un_pt_y = prev_un_Fea_map[g_id](1);
+                                }
+
+                                pred_r_pt = pts_right_orig[id];
+
+                                // 基于最大允许的背景点深度，左图像中位于此竖直线更左边的点是不会在右图像中被观测到的
+                                if(prev_pt.x < bg_left_border_left_img) 
+                                {
+                                    // 记录以便后续不再处理该点
+                                    status_check[i] = 1;
+                                    ++num_done;
+                                    continue;
+                                }
+
+                                // 同理，右图像的某条竖线再往右的区域，是不会在左图像中被观测到（或者深度超过了阈值）
+                                // if(pred_r_pt > bg_right_border_right_img) 
+                                // {
+                                //     status_check[i] = 1;
+                                //     ++num_done;
+                                //     continue;
+                                // }
+
+                                bool is_sta_obj_fea = false;
+                                if(j < 0 && l_id_sta_obj_pt_all.find(l_id) != l_id_sta_obj_pt_all.end()) is_sta_obj_fea = true;
+
+                                float Th_NCC = th_NCC;
+
+                                // 图像中第4行的最小NCC为0.97
+                                // 不再单独假设第4行中的点为地面远点。因为该图像区域的点也有可能是远离地面的高点，甚至可能是近处的高点！
+                                // if(j >= 2 && prev_pt.y/60.0 <= 4) Th_NCC += (num_try-1)*0.01;
+                                
+                                val_NCC = find_stereo_match_by_best_NCC(prev_pt, pred_r_pt, Th_NCC, search_range);
+
+                                if(val_NCC > 0)
+                                {
+                                    float disp_x = prev_pt.x - pred_r_pt.x;
+                                    if(disp_x <= min_disp || disp_x > max_disp)
+                                    {
+                                        // todo: 某一次尝试的结果不一定可靠？可以多次尝试?
+                                        if(val_NCC > 0.97)
+                                        {
+                                            // 认为该点深度确实不符合要求，不再为该点寻找立体匹配
+                                            status_check[i] = 1;
+                                            ++num_done;
+                                        }
+                                        else if(j < 0 && !is_sta_obj_fea)
+                                        {
+                                            // 非近处静态物体点只会搜寻一次
+                                            status_check[i] = 1;
+                                            ++num_done;
+                                        }
+                                        continue;
+                                    }
+                                    else
+                                    {
+                                        if(disp_x < close_pt_disp)
+                                        {
+                                            // 如果可信度不足
+                                            if(val_NCC < 0.98)
+                                            {
+                                                // 非近处静态物体点只会搜寻一次
+                                                if(j < 0 && !is_sta_obj_fea)
+                                                {
+                                                    status_check[i] = 1;
+                                                    ++num_done;
+                                                }
+                                                continue;
+                                            }
+                                        }
+
+                                        float dep = mbf/disp_x;
+                                        if(j < 0 && g_id_obj > 0)
+                                        {
+                                            if(ave_dep_prev_objs.find(g_id_obj) == ave_dep_prev_objs.end())
+                                            {
+                                                cout << "Weired! Line 4834" << endl;
+                                                exit(-1);
+                                            }
+                                            float ave_dep = ave_dep_prev_objs[g_id_obj];
+                                            if (dep > (ave_dep + 5.0) || dep < (ave_dep - 2.0))
+                                            {
+                                                if(!is_stat_obj_track)
+                                                {
+                                                    status_check[i] = 1;
+                                                    ++num_done;
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                        else
+                                        {
+                                            // 近处点不一定都是地面点，如果是高处的点，则要适当提高NCC阈值的要求！
+                                            if(j >= 2)
+                                            {
+                                                // 如果是距离地面点0.4m以上的点，则要提高其NCC阈值！
+                                                // 是否考虑到了地面坡度的问题？如果路面是大的上坡或者下坡，则是否要适当调整此高度？差别应该不会很大，暂时不考虑。这里0.4m就是为上坡情况考虑的余量
+                                                // 即使这里该点的立体匹配有误，下面还可以通过重投影误差来排除
+                                                if(un_pt_y * dep <= (Cam_H - 0.3))
+                                                {
+                                                    // 如果是明显高出地面的点，则其最小的NCC阈值为0.97
+                                                    Th_NCC += (num_try-1)*0.01;
+                                                    if(val_NCC <= Th_NCC)
+                                                    {
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // 用预测运动值来计算该深度值下的重投影误差，排除明显错误的深度值！
+                                        if(check_dep_with_reproj_err && (j >= 0 || is_sta_obj_fea))
+                                        {
+                                            Vec4f &un_pt_prev = prev_un_Fea_map[g_id];
+                                            float p_X = un_pt_prev(0) * dep;
+                                            float p_Y = un_pt_prev(1) * dep;
+                                            
+                                            Vector3d prev_3d(p_X, p_Y, dep);
+                                            Vector3d proj_cur;
+                                            
+                                            if(!has_est_FH)
+                                                proj_cur = R_cam_motion * prev_3d + P_cam_motion;
+                                            else
+                                                proj_cur = R_from_E * prev_3d + P_cam_motion;
+                                            
+                                            float max_dep = mThDepthBg;
+                                            if(cls_ > 0) max_dep = 18.0;
+                                            // 允许一部分运动预测误差带来的重投影深度误差
+                                            if(proj_cur(2) <= 0.8 || proj_cur(2) > 1.1*max_dep)
+                                            {
+                                                if(proj_cur(2) > 0)
+                                                {
+                                                    status_check[i] = 1;
+                                                    ++num_done;
+                                                }
+                                                continue;
+                                            }
+                                            else
+                                            {
+                                                Point2f pred_cur;
+                                                spaceToPlane(proj_cur, pred_cur, m_camera[0]);
+                                                Point2f cur_fea;
+
+                                                if(l_id > 0)
+                                                    cur_fea = cur_FAST[(l_id-1)];
+                                                else
+                                                    cur_fea = cur_sift[-l_id];
+                                                
+                                                if((pred_cur.x - cur_fea.x)*(pred_cur.x - cur_fea.x) + (pred_cur.y - cur_fea.y)*(pred_cur.y - cur_fea.y) >= thres_err * thres_err)
+                                                {
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        
+                                        // 如果是纯背景跟踪点或者近处静态物体的跟踪点
+                                        if(j >= 0 || is_sta_obj_fea)
+                                        {
+                                            bool is_near_sta_obj_fea = (j < 0);
+                                            if(disp_x < close_pt_disp)
+                                            {
+                                                // 选择的近处静态物体不应该有远点，否则应该放弃该点（可能确实是该物体的mask中的点，但是mask不准确，其可能是远处的背景点）
+                                                if(is_near_sta_obj_fea)
+                                                {
+                                                    status_check[i] = 1;
+                                                    ++num_done;
+                                                    continue;
+                                                }
+                                                
+                                                if(j >= 0) fea_g_id_dep[g_id] = 1;
+                                                pts_stereo_large_dep.emplace_back(dep, g_id);
+                                                ++num_3D_2D;
+                                                // 对于某个大bloc只将近点作为统计指标?
+                                                // ++num_3D;
+                                            }
+                                            else
+                                            {
+                                                // 除了纯背景点，优先将先前被选择的近处静态物体点作为静态地图点。是否要限制总的近点数？是否要按照大bloc来添加？
+                                                // 暂时不限制总点数,后续当背景3D-2D近点不足时,直接从这些点中选择即可
+                                                if(j >= 0 || (l_id_sta_obj_pt_select.find(l_id) != l_id_sta_obj_pt_select.end()))
+                                                // if(j >= 0 || (num_3D < min_num_near_pt && l_id_sta_obj_pt_select.find(l_id) != l_id_sta_obj_pt_select.end()))
+                                                {
+                                                    // 对于大bloc只将近点作为统计指标?
+                                                    ++num_3D;
+                                                    ++num_3D_2D;
+                                                    if(j >= 0) 
+                                                        fea_g_id_dep[g_id] = 0;
+                                                    else
+                                                        g_id_sta_obj_3D2D_high_NCC.insert(g_id);
+                                                }
+                                                else if(g_id_sta_obj_2D2D_high_NCC.find(g_id) != g_id_sta_obj_2D2D_high_NCC.end())
+                                                {
+                                                    // 剩余的近处静态物体点如果是3D-2D点，则记录它作为备用.因为这些静态点并没有直接参与F/H的估计,但是其通过了预测运动的F约束,也通过了上面的重投影误差检验(其中会使用F/H得到的R)
+                                                    cand_g_id_sta_obj_fea.insert(g_id);
+                                                }
+                                            }
+                                        }
+
+                                        status_succ[i] = 1;
+                                        status_check[i] = 1;
+                                        ++num_done;
+                                        prevRightFeaMap[g_id] = pred_r_pt;
+                                        undistortedPts(pred_r_pt, prev_un_pt_r, m_camera[1]);
+                                        // 其实这里上一帧的右图像观测的vel不一定为0，因为该点在上上帧可能也有右观测！这点留到该点加入地图后再修改
+                                        prev_un_r_Fea_map[g_id] = Vec4f(prev_un_pt_r.x, prev_un_pt_r.y, 0.0, 0.0);
+                                        
+                                        if(j < 0 || !use_tria_stereo)
+                                        {
+                                            if(j < 0 && (cnt_track <= 2 || !trust_obj_fea_from_motion_update)) l_id_3D_2D_obj_fea.push_back(l_id);
+
+                                            if(l_id > 0)
+                                                prev_FAST_dep[(l_id-1)] = mbf/disp_x;
+                                            else
+                                                prev_sift_dep[-l_id] = mbf/disp_x;
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // 如果该bloc中的近点数和总点数已经达到最小需求值，则放弃再继续搜寻其他点的立体匹配
+                            if(j >= 0)
+                            {
+                                if(num_3D >= min_num_near_pt && num_3D_2D >= min_total_num_pt) 
+                                    break;
+                                else if(num_try == 2 && num_3D_2D >= min_total_num_pt)
+                                {
+                                    break;
+                                }
+                                else if(num_try == 3)
+                                    break;
+                            }
+                            
+                            th_NCC -= step_th;
+                            
+                            search_range += range_step;
+                            if(search_range > 12) search_range = 12;
+                        }
+                    }
+                    
+                    for(int i = 0; i < num_pt; ++i)
+                    {
+                        // 如果已经找到立体匹配
+                        if(status_succ[i] > 0) 
+                            continue;
+
+                        id = id_ambi_NCC[i].first;
+                        l_id = id_for_r[id];
+                        if(j >= 0)
+                        {
+                            ambi = id_ambi_NCC[i].second;
+                            l_id_rest_2d_pts.push_back(l_id);
+                            pred_rest_2d_pts.push_back(pts_right_orig[id]);
+                            index_ambi_rest_2d_pts.emplace_back(num_rest,ambi);
+                            ++num_rest;
+                        }
+                        else
+                        {
+                            // 如果物体点没有在上一帧找到立体匹配，是否要保留该跟踪点？
+                            // 这些物体点在上一帧都会有一个深度值，但是该值并不准确，那么是否使用该深度值作为物体的3D-2D点？
+                            // 如果是上一帧任意物体的新点则放弃（因为所有物体的新点的较可靠深度值只能来自于立体匹配，其次是运动更新后的深度值，如果仅靠depth_map则不可信）
+                            if(l_id > 0)
+                            {
+                                l_id -= 1;
+                                int num_cnt = track_cnt_FAST[l_id];
+                                // 是否要将所有没有立体匹配的近处静态物体跟踪点都删除？即来自运动更新的深度是否可靠？认为还是较为可靠，因为既然它估计得到的运动与相机运动极为相近，则说明估计精度还可以
+                                // if(l_id_sta_obj_pt_all.find(l_id) != l_id_sta_obj_pt_all.end() || num_cnt <= 2)
+                                if(num_cnt <= 2 || !trust_obj_fea_from_motion_update) 
+                                    status_FAST[l_id] = 0;
+                            }
+                            else
+                            {
+                                l_id = -l_id;
+                                int num_cnt = track_cnt_sift[l_id];
+                                // if(l_id_sta_obj_pt_all.find(l_id) != l_id_sta_obj_pt_all.end() || num_cnt <= 2)
+                                if(num_cnt <= 2 || !trust_obj_fea_from_motion_update)
+                                    status_sift[l_id] = 0;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // 是否要把近处静态物体点算入静态3D-2D跟踪点？这些点不一定会在objs-matching阶段被判定为静态（需要等到运动估计阶段），则它们不一定能加入地图。因此这里暂时不算入
+            // if(j < 4)
+            if(j >= 0)
+            {
+                // cout << "num of found close 3D-2D bg fea track in No." << j << " big bloc: " << num_3D << endl;
+                total_3D += num_3D;
+                total_3D_2D += num_3D_2D;
+                num_near_fea[j] += num_3D;
+                num_far_fea[j] += num_3D_2D;
+            }
+        }
+        
+        // 及时释放不必要的内存
+        if(!id_ambi_NCC_new_sift.empty()) id_ambi_NCC_new_sift.clear();
+        if(!ambi_NCC_new_FAST.empty()) ambi_NCC_new_FAST.clear();
+
+        if(num_rest > 0)
+        {
+            vector<uchar> status_succ(num_rest,0);
+            // 如果近的3D-2D点或总的3D-2D(包含了远点)的数量不足，则继续对剩余的2d-2d点寻找立体匹配
+            // 是否有必要追求远点的数量？
+            if(total_3D < near_pt_need || total_3D_2D < total_num_need)
+            {
+                sort(index_ambi_rest_2d_pts.begin(),index_ambi_rest_2d_pts.end(),[](pair<int,float> &a, pair<int,float> &b)
+                    {return a.second < b.second;});
+                
+                vector<uchar> status_check(num_rest,0);
+                int max_num_iter = 3;
+                float val_NCC, th_NCC = 0.985, th_step = 0.015, th_dep = 21.0;
+                float search_range = 5.0;
+                int g_id, num_done = 0, num_try = 0;
+                Point2f pt_p, pt_p_r;
+
+                float half_H = 60*3, half_W = 200*3;
+                float un_pt_y;
+
+                for(int n = 0; n < 2; ++n)
+                {
+                    // 如果总的3D_2D数目足够多，则不在进行远点的搜寻
+                    if(n == 1 && total_3D_2D >= total_num_need) break;
+
+                    num_try = 0;
+                    search_range = 5.0;
+                    if(n == 1)
+                    {
+                        th_NCC = 0.985;
+                        // 远点的disp较小，不需要太大的搜索范围
+                        max_num_iter = 2;
+                        th_step = 0.01;
+                        th_dep = mThDepthBg;
+                    }
+                    
+                    min_disp_bg = mbf/th_dep;
+
+                    while(num_done < num_rest)
+                    {
+                        // 最多尝试 2或3次
+                        if(num_try >= max_num_iter) break;
+
+                        // 第一个while主要是负责搜寻足够多的近点，但执行期间也可以保留找到的远点（假如数量不足）
+                        if(n == 0 && total_3D >= near_pt_need) break;
+                        
+                        // 第2个while负责搜寻足够多的3D-2D点，不论远点或近点
+                        if(n == 1 && total_3D_2D >= total_num_need) break;
+                        
+                        ++num_try;
+                        
+                        for(int i = 0; i < num_rest; ++i)
+                        {
+                            // 对于第一轮，近点数达到最小数量要求后就不再进行
+                            if(n == 0 && total_3D >= near_pt_need) break;
+                            if(n == 1 && total_3D_2D >= total_num_need) break;
+
+                            if(status_check[i] > 0) continue;
+                            
+                            int index = index_ambi_rest_2d_pts[i].first;
+                            int l_id = l_id_rest_2d_pts[index];
+
+                            if(l_id > 0)
+                            {
+                                pt_p = prev_FAST[(l_id-1)];
+                                g_id = ids_FAST[(l_id-1)];
+                            }
+                            else
+                            {
+                                pt_p = prev_sift[(-l_id)];
+                                g_id = ids_sift[(-l_id)];
+                            }
+
+                            un_pt_y = prev_un_Fea_map[g_id](1);
+
+                            pt_p_r = pred_rest_2d_pts[index];
+
+                            // 在第一轮中如果总3D点数已经达到要求，则对于预测深度明显大于近点阈值的点就不再搜寻
+                            if(n == 0 && total_3D_2D >= total_num_need)
+                            {
+                                if(mbf/(pt_p.x - pt_p_r.x) >= 1.1 * th_dep)
+                                    continue;
+                            }
+
+                            float Th_NCC = th_NCC;
+                            // 远点最小的NCC为0.98
+                            // if(n == 0 && pt_p.y/60.0 <= 4) Th_NCC += (num_try-1)*0.0075;
+                            
+                            val_NCC = find_stereo_match_by_best_NCC(pt_p, pt_p_r, Th_NCC, search_range);
+
+                            if(val_NCC > 0)
+                            {
+                                disp_x = pt_p.x - pt_p_r.x;
+                                if(disp_x <= min_disp_bg || disp_x > max_disp)
+                                {
+                                    // 某一次尝试的深度值结果不一定可靠？
+                                    if(val_NCC >= 0.97)
+                                    {
+                                        status_check[i] = 1;
+                                        ++num_done;
+                                    }
+                                    continue;
+                                }
+                                else
+                                {
+                                    if(disp_x < close_pt_disp)
+                                    {
+                                        if(val_NCC <= 0.98)
+                                        {
+                                            // status_check[i] = 1;
+                                            // ++num_done;
+                                            continue;
+                                        }
+                                        else if(total_3D_2D >= total_num_need)
+                                        {
+                                            status_check[i] = 1;
+                                            ++num_done;
+                                            continue;
+                                        }
+                                    }
+
+                                    float dep = mbf/disp_x;
+
+                                    if(n == 0 && pt_p.y/60.0 > 3)
+                                    {
+                                        if(un_pt_y*dep <= (Cam_H - 0.3))
+                                        {
+                                            if(val_NCC <= 0.975)
+                                            {
+                                                // status_check[i] = 1;
+                                                // ++num_done;
+                                                continue;
+                                            }
+                                        }
+                                    }
+
+                                    // 用预测运动值来计算该深度值下的重投影误差，排除明显错误的深度值！
+                                    if(check_dep_with_reproj_err)
+                                    {
+                                        Vec4f &un_pt_prev = prev_un_Fea_map[g_id];
+                                        float p_X = un_pt_prev(0) * dep;
+                                        float p_Y = un_pt_prev(1) * dep;
+                                        
+                                        Vector3d prev_3d(p_X, p_Y, dep);
+                                        Vector3d proj_cur;
+
+                                        if(!has_est_FH)
+                                            proj_cur = R_cam_motion * prev_3d + P_cam_motion;
+                                        else
+                                            proj_cur = R_from_E * prev_3d + P_cam_motion;
+                                        
+                                        if(proj_cur(2) <= 0.8 || proj_cur(2) > mThDepthBg)
+                                        {
+                                            if(proj_cur(2) > 0)
+                                            {
+                                                status_check[i] = 1;
+                                                ++num_done;
+                                            }
+                                            continue;
+                                        }
+                                        else
+                                        {
+                                            Point2f pred_cur;
+                                            spaceToPlane(proj_cur, pred_cur, m_camera[0]);
+                                            Point2f cur_fea;
+
+                                            if(l_id > 0)
+                                                cur_fea = cur_FAST[(l_id-1)];
+                                            else
+                                                cur_fea = cur_sift[-l_id];
+                                            
+                                            // 由于恒速运动模型得到的运动预测不是很精确，因此阈值要大一些
+                                            if((pred_cur.x - cur_fea.x)*(pred_cur.x - cur_fea.x) + (pred_cur.y - cur_fea.y)*(pred_cur.y - cur_fea.y) > thres_err * thres_err)
+                                            {
+                                                // status_check[i] = 1;
+                                                // ++num_done;
+                                                continue;
+                                            }
+                                        }
+                                    }
+
+                                    int id_row = pt_p.y/half_H;
+                                    int id_col = pt_p.x/half_W;
+                                    if(id_row > 1) id_row = 1;
+                                    if(id_col > 1) id_col = 1;
+                                    int id_big_bloc = 2*id_row + id_col;
+
+                                    if(disp_x < close_pt_disp)
+                                    {
+                                        pts_stereo_large_dep.emplace_back(dep, g_id);
+                                        ++total_3D_2D;
+                                        fea_g_id_dep[g_id] = 1;
+                                        num_far_fea[id_big_bloc] += 1;
+                                    }
+                                    else
+                                    {
+                                        ++total_3D;
+                                        ++total_3D_2D;
+                                        fea_g_id_dep[g_id] = 0;
+                                        num_near_fea[id_big_bloc] += 1;
+                                    }
+
+                                    status_succ[i] = 1;
+                                    status_check[i] = 1;
+                                    ++num_done;
+                                    prevRightFeaMap[g_id] = pt_p_r;
+                                    undistortedPts(pt_p_r, prev_un_pt_r, m_camera[1]);
+                                    prev_un_r_Fea_map[g_id] = Vec4f(prev_un_pt_r.x, prev_un_pt_r.y, 0.0, 0.0);
+                                    
+                                    if(!use_tria_stereo)
+                                    {                 
+                                        if(l_id > 0)      
+                                            prev_FAST_dep[(l_id-1)] = mbf/disp_x;
+                                        else
+                                            prev_sift_dep[-l_id] = mbf/disp_x;
+                                    }
+                                }
+                            }
+                        }
+
+                        // if(num_done == num_pt) break;    
+                        if(search_range >= 15) break;
+                        th_NCC -= th_step;
+                        search_range += 5.0;
+                        if(search_range > 15) search_range = 15;
+                    }
+                }
+            }
+            
+            // 对于剩下的没有找到立体匹配的背景跟踪点，是否要保留取决于系统是否要使用两帧的三角化测量。如果不使用，则对于新跟踪点则直接放弃
+            if(!Use_tria_for_2d2d)
+            {
+                for(int i = 0; i < num_rest; ++i)
+                {
+                    if(status_succ[i] > 0) continue;
+                    int index = index_ambi_rest_2d_pts[i].first;
+                    int l_id = l_id_rest_2d_pts[index];
+                    if(l_id > 0)
+                    {
+                        l_id -= 1;
+                        if(status_FAST[l_id] != 0)
+                        {
+                            // todo:旧点是否可以继续保留当前2帧的2D-2D跟踪，以便其可以参加LBA？
+                            // 如果该点为仅2帧跟踪点，则放弃该点。
+                            // 如果是由于上一帧marg次新帧而导致的cnt_track为2的点，是否保留？然而上一帧可能没有有效的PnP或LBA，导致跟踪点也无法通过运动更新获得有效深度，则这些点也不应该保留（这些可以在三角化函数中进行排除）
+                            // 但对于这样的点，如何判断其在上一帧是否具有来自运动更新的有效深度？可以通过直接查看prev_sift_dep等变量的值。
+                            // 最好的方法是在marg次新帧前记录所有在map中剩余观察帧数大于1的跟踪点！
+                            // if(track_cnt_FAST[l_id] <= 2)
+                            if((l_id >= num_old_track_FAST || !add_new_fea_in_next_frame) && track_cnt_FAST[l_id] <= 2)
+                                status_FAST[l_id] = 0;
+                            else
+                            {
+                                // 就算不本系统不进行LBA，PnP时也可以用到这些旧跟踪点！
+                                // if(USE_IMU || Use_LBA_for_puer_V)
+                                //     status_FAST[l_id] = 0;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        l_id = -l_id;
+                        if(status_sift[l_id] != 0)
+                        {
+                            // if(track_cnt_sift[l_id] <= 2)
+                            if((l_id >= num_old_track_sift|| !add_new_fea_in_next_frame) && track_cnt_sift[l_id] <= 2)
+                                status_sift[l_id] = 0;
+                            else
+                            {
+                                // if(USE_IMU || Use_LBA_for_puer_V)
+                                //     status_sift[l_id] = 0;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            l_id_rest_2d_pts.clear();
+            pred_rest_2d_pts.clear();
+            index_ambi_rest_2d_pts.clear();
+        }
+    }
+    num_near_3D_2D = total_3D;
+    num_total_3D_2D = total_3D_2D;
+    return invalid_bg_track;
+}
+
+// 为当前帧的点（跟踪点+新检测点）寻找立体匹配
+void FeatureTracker::find_stereo_for_fea_in_cur_frame(bool for_sift, const Mat &seg_map, const Mat &depth_map, bool find_stereo_for_bg_fea)
+{
+    int num_total_fea, num_track, num_prev_fea, num_old_track;
+
+    vector<Point2f> *p_fea;
+    vector<uchar> *p_status;
+    vector<pair<uchar,int>> *p_cls_id;
+    vector<float> *p_dep_pred;
+    vector<float> *p_dep_prev;
+    vector<float> *p_dep_cur;
+    vector<Point2f> *p_cur_right;
+    vector<int> *p_gl_obj_id;
+    vector<int> *p_cnt_track;
+    
+    if(for_sift)
+    {
+        num_total_fea = cur_sift.size();
+        num_track = num_track_sift;
+        p_fea = &(cur_sift);
+        p_status = &(status_sift);
+        p_cls_id = &(obj_cls_id_sift);
+        p_dep_prev = &(prev_sift_dep);
+        p_dep_pred = &(predict_dep_sift);
+        p_dep_cur = &(cur_sift_dep);
+        p_cur_right = &(cur_right_sift);
+        p_gl_obj_id = &(prev_sift_global_obj_id);
+        p_cnt_track = &(track_cnt_sift);
+
+        if(frame_cnt >= 2 && use_motion_to_pred_fea_dep == 1) num_prev_fea = prev_sift.size();
+        num_old_track = num_old_track_sift;
+    }
+    else
+    {
+        num_total_fea = cur_FAST.size();
+        num_track = num_track_FAST;
+        p_fea = &(cur_FAST);
+        p_status = &(statusLeftRIght);
+        p_cls_id = &(obj_cls_id_FAST);
+        p_dep_prev = &(prev_FAST_dep);
+        p_dep_pred = &(predict_dep_FAST);
+        p_dep_cur = &(cur_FAST_dep);
+        p_cur_right = &(cur_right_FAST);
+        p_gl_obj_id = &(prev_FAST_global_obj_id);
+        p_cnt_track = &(track_cnt_FAST);
+        
+        // num_new_FAST_bg = 0;
+
+        if(frame_cnt >= 2 && use_motion_to_pred_fea_dep == 1) num_prev_fea = prev_FAST.size();
+        num_old_track = num_old_track_FAST;
+    }
+    
+    // 跟踪特征点可以使用depth_map或恒速运动模型来设置当前帧的右匹配点预测
+    // 只为物体跟踪点在当前帧寻找立体匹配
+    if(num_total_fea > 0)
+    {
+        // 记录需要在当前帧寻找立体匹配的点的id，提供其预测值
+        vector<Point2f> cur_left_temp, cur_right_temp;
+        vector<int> lid_cur_fea_temp;
+
+        float pred_u_r, pred_disp, depth, shift_y;
+        float l_x, l_y, r_x, r_y;
+        Vec2b pt_info;
+        uchar cls_label;
+        float Th_NCC, val_NCC;
+
+        // 记录各个临时物体上的FAST跟踪特征点的视差值之和以及特征点数，以便后续给物体上的新检测点提供视差的参考值
+        // 如果是系统首帧则不会有track特征点，也就不会有各个跟踪点的预测深度
+        // float ave_disp_x_bg = mbf/(3.0/4*mMinDepthPt + 1.0/4*mThDepthBg);
+        // float ave_disp_y_bg = Y_shift_right_image/(3.0/4*mMinDepthPt + 1.0/4*mThDepthBg);
+        // FAST点就选择近一些的点，不然容易选到很远处的树叶
+        float ave_disp_x_bg = mbf/(1.0/2*mMinDepthPt + 1.0/2*10);
+        float ave_disp_y_bg = Y_shift_right_image/(1.0/2*mMinDepthPt + 1.0/2*10);
+
+        float ave_disp_x_objs = mbf/(2.0/3*mMinDepthPt + 1.0/3*mThDepthObj);
+        float ave_disp_y_objs = Y_shift_right_image/(2.0/3*mMinDepthPt + 1.0/3*mThDepthObj);
+        
+        // 是使用depth_map来设置深度预测值，还是使用相机和物体的运动模型计算得到的深度预测值
+        if(frame_cnt < 2 || use_motion_to_pred_fea_dep == 0)
+        {
+            int i = -1;
+            float th_x_right_img;
+            for(int i = 0; i < num_total_fea; ++i)
+            {
+                if(for_sift)
+                {
+                    if(!((*p_status)[i]))
+                        continue;
+                }
+                else if(!status_FAST[i])
+                {
+                    // 对于FAST点，由于刚完成reduceVector，应该是不会出现此情况的
+                    cout << "Weired! Line 5226" << endl;
+                    exit(-1);
+                    continue;
+                }
+
+                Point2f &p = (*p_fea)[i];
+                
+                if((*p_cls_id)[i].first == 0)
+                {
+                    // 如果不对纯背景点在当前帧寻找立体匹配
+                    if(!add_stereo_for_bg_fea_cur_frame)
+                    {
+                        // 这种情况下的sift背景点在之前就已经记录过了
+                        if(!for_sift)
+                        {
+                            (*p_status)[i] = 2;
+                            FAST_no_stereo_bg.push_back(i);
+                        }
+                        continue;
+                    }
+                    else
+                    {
+                        if(for_sift)
+                        {
+                            // 某些点sift纯背景点在先前就已经确认不可能或不再需要寻找立体匹配，则其已经加入sift_no_stereo_bg
+                            if(std::find(sift_no_stereo_bg.begin(), sift_no_stereo_bg.end(), i) != sift_no_stereo_bg.end())
+                                continue;
+                        }
+                    }
+                }
+                else
+                {
+                    // if(for_sift)
+                    {
+                        // 如果是已经在当前帧找到立体匹配的点（指sift物体点）
+                        if((*p_status)[i] == 1) continue;
+                    }
+                    lid_cur_fea_temp.push_back(i);
+                    cur_left_temp.push_back(p);
+                }
+                
+                l_x = p.x;
+                l_y = p.y;
+                
+                pred_disp = depth_map.at<float>(l_y,l_x);
+                if(pred_disp <= 0) 
+                {
+                    r_x = max(5.0f,l_x-ave_disp_x_bg);
+                    r_y = min(l_y+ave_disp_y_bg, (float)(row-5));
+                    cur_right_temp.emplace_back(r_x,r_y);
+                    continue;
+                }
+
+                depth = mbf/pred_disp;
+                shift_y = Y_shift_right_image/depth;
+                r_x = l_x - pred_disp;
+                
+                // 跟踪点的cls是要按检测类别还是按所跟踪的点的全局类别？
+                // pt_info = seg_map.at<Vec2b>(l_y, l_x);
+                // cls_label = pt_info[0];
+                cls_label = (*p_cls_id)[i].first;
+
+                if(cls_label == 0)
+                    th_x_right_img = bg_right_border_right_img;
+                else
+                    th_x_right_img = obj_right_border_right_img;
+                
+                if(r_x >= 5 && r_x <= th_x_right_img)
+                    cur_right_temp.emplace_back(r_x, l_y+shift_y);
+                else if (r_x < 5)
+                    cur_right_temp.emplace_back(5, l_y+shift_y);
+                else
+                    cur_right_temp.emplace_back(th_x_right_img, l_y+shift_y);
+            }
+        }
+        else
+        {
+            // 如果系统是使用恒速运动模型为每个点预测了在当前帧的（深度值和）右匹配点
+            // 此时predict_dep_FAST应该不为空
+            if((*p_dep_pred).empty())
+            {
+                cout << "Why predict_dep_FAST or predict_dep_sift is empty?" << endl;
+                exit(-1);
+            }
+
+            int obj_id;
+            // 设置当前帧跟踪到的特征点的右图像预测点坐标
+            for(int i = 0; i < num_total_fea; ++i)
+            {
+                if(for_sift)
+                {
+                    if(!((*p_status)[i]))
+                        continue;
+                }
+                else if(!status_FAST[i]) 
+                {
+                    cout << "Weired! Line 5426" << endl;
+                    exit(-1);
+                    continue;
+                }
+
+                Point2f &p = (*p_fea)[i];
+                // first是与所跟踪的上一帧特征点的全局cls所对齐的（除非上一帧是背景点，而当前帧是物体，则保留为物体cls）。如果是初始帧，则都是当前帧各个点的检测类别
+                cls_label = (*p_cls_id)[i].first;
+
+                if(cls_label == 0)
+                {
+                    if(!add_stereo_for_bg_fea_cur_frame)
+                    {
+                        if(!for_sift)
+                        {
+                            (*p_status)[i] = 2;
+                            FAST_no_stereo_bg.push_back(i);
+                        }
+                        continue;
+                    }
+                    else
+                    {
+                        if(for_sift)
+                        {
+                            // 某些点sift纯背景点在先前就已经确认不可能或不再需要寻找立体匹配，则其已经加入sift_no_stereo_bg
+                            if(std::find(sift_no_stereo_bg.begin(), sift_no_stereo_bg.end(), i) != sift_no_stereo_bg.end())
+                                continue;
+                        }
+                    }
+                }
+                else
+                {
+                    // if(for_sift)
+                    {
+                        // 如果是已经在当前帧找到立体匹配的sift点
+                        if((*p_status)[i] == 1) continue;
+                    }
+
+                    lid_cur_fea_temp.push_back(i);
+                    cur_left_temp.push_back(p);
+                }
+                
+                l_x = p.x;
+                l_y = p.y;
+                
+                obj_id = (*p_cls_id)[i].second;
+                
+                depth = -1.0;
+
+                // 只有在上一帧就保留的物体点会有提供在当前帧的深度预测值
+                if(i < num_prev_fea) depth = (*p_dep_pred)[i];
+
+                bool bad_dep = false;
+
+                if(depth <= 0) 
+                {
+                    if(obj_fea_disp_num.find(obj_id) != obj_fea_disp_num.end())
+                    {
+                        assert(obj_id > 0 && "bg fea should not be in obj_fea_disp_num！");
+                        pred_disp = obj_fea_disp_num[obj_id].first/obj_fea_disp_num[obj_id].second;
+                        depth = mbf/pred_disp;
+                        bad_dep = true;
+                    }
+                    else
+                    {
+                        if(cls_label == 0)
+                        {
+                            // 最后我们规定FAST的深度必须比较近，最远不超过10m，因为FAST点的检测和匹配精度均比较低
+                            // if(ave_dep_bg_cur_frame != 0 && num_bg_with_dep > 15) 
+                            // {
+                            //     float ave_dep = ave_dep_bg_cur_frame/num_bg_with_dep;
+                            //     float ave_disp_x = mbf/ave_dep;
+                            //     float ave_disp_y = Y_shift_right_image/ave_dep;
+                            //     // 检查超出边界
+                            //     r_x = max(5.0f,l_x-ave_disp_x);
+                            //     r_y = min(l_y+ave_disp_y, (float)(row-5));
+                            //     cur_right_FAST.emplace_back(r_x,r_y);
+                            // }
+                            // else
+                            {
+                                r_x = max(5.0f,l_x-ave_disp_x_bg);
+                                r_y = min(l_y+ave_disp_y_bg, (float)(row-5));
+                                cur_right_temp.emplace_back(r_x,r_y);
+                            }
+                        }
+                        else
+                        {
+                            r_x = max(5.0f,l_x-ave_disp_x_objs);
+                            r_y = min(l_y+ave_disp_y_objs, (float)(row-5));
+                            cur_right_temp.emplace_back(r_x,r_y);
+                        }
+                        
+                        continue;
+                    }
+                }
+                else
+                    pred_disp = mbf/depth;
+                
+                shift_y = Y_shift_right_image/depth;
+                
+                // 检验该深度是否合适
+                r_x = l_x - pred_disp;
+                r_y = min(l_y+shift_y, (float)(row-5));
+                if(cls_label == 0)
+                {
+                    if(r_x >= 5 && r_x <= bg_right_border_right_img)
+                        cur_right_temp.emplace_back(r_x, r_y);
+                    else if(r_x < 5)
+                        cur_right_temp.emplace_back(5, r_y);
+                    else
+                        cur_right_temp.emplace_back(bg_right_border_right_img, r_y);
+                }
+                else
+                {   
+                    if(r_x >= 5 && r_x <= obj_right_border_right_img)
+                        cur_right_temp.emplace_back(r_x, r_y);
+                    else if(r_x < 5)
+                        cur_right_temp.emplace_back(5, r_y);
+                    else
+                        cur_right_temp.emplace_back(obj_right_border_right_img, r_y);
+                    
+                    // 只保存检测出来的物体的跟踪特征点的视差值，对于当前帧漏检的物体的跟踪点，只能用预测的深度值或者直接用左图像点坐标 来计算右观测点（否则这里会把背景点也记录进去，而背景点的深度的差异是很大的！）
+                    if(obj_id != 0 && !bad_dep)
+                    {
+                        if(obj_fea_disp_num.find(obj_id) == obj_fea_disp_num.end())
+                        {
+                            obj_fea_disp_num[obj_id] = std::pair<float,int>(pred_disp,1);
+                        }
+                        else
+                        {
+                            // 可以这样做加法并赋值吗？
+                            obj_fea_disp_num[obj_id].first += pred_disp;
+                            obj_fea_disp_num[obj_id].second += 1;
+                            // obj_fea_disp_num[obj_id].first  = obj_fea_disp_num[obj_id].first + pred_disp;
+                            // obj_fea_disp_num[obj_id].second = obj_fea_disp_num[obj_id].second + 1;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 对指定的点在当前帧中寻找立体匹配
+        if(stereo_cam && !cur_img_r.empty())
+        {
+            if(!cur_left_temp.empty())
+            {
+                // 记录无法通过LK光流找到立体匹配的点，包括上一帧的静态物体点以及新物体点（因为这些物体在当前帧可能为静态，而这将为下一帧提供静态跟踪点），使用暴力搜索来为其寻找立体匹配
+                vector<int> l_id_pt_no_stereo;
+                vector<uchar> pts_check, status_temp;
+                vector<Point2f> left_pts, orig_pred_r_pts;
+                // 是否使用暴力搜索来为某些静态物体跟踪点寻找立体匹配
+                bool brute_force_find_stereo = true;
+                if(brute_force_find_stereo) orig_pred_r_pts = cur_right_temp;
+
+                int max_iter = 2;
+                for(int n = 0; n <= max_iter; ++n)
+                {
+                    if(n > 0 && l_id_pt_no_stereo.empty()) continue;
+                    
+                    vector<float> err, err_rl;
+                    if(n == 0 && !cur_left_temp.empty())
+                    {
+                        // cout << "Start stereo match for (tracked and new) fea in current frame!" << endl;
+                        
+                        // cur left ---- cur right
+                        // 不给出预测的右图像中的匹配点吗？因为不给出预测点位置，所以需要使用3层的图像金字塔来进行光流估计。那为什么不直接使用双目立体匹配的结果作为匹配的初值或者最终值呢？
+                        // 其实对于双目立体图像而言，这里使用3层光流应该就足以跟踪了，因为只要点的深度不要太大，它其实很好寻找（就沿着x轴）。另外，这里使用普通的光流跟踪，可以适配非立体校准图像对的情况！
+                        // 注意，无论有没有预测值，cur_right_pts和status的长度都与cur_pts的是一样的，status的值会指示cur_right_pts中的对应元素是否为有效的光流估计匹配点
+                        // TODO: 右图像中的FAST点不应该跟SIFT的点相重叠，这点后续要如何排除？可以再给定一个在SIFT点周围画黑点区域的右图像的mask，用来查询这里的FAST匹配是否在黑点区域外?T  太麻烦了
+
+                        // 如果用cv::OPTFLOW_USE_INITIAL_FLOW指明了cur_right_FAST有初始估计值，则cur_FAST和cur_right_FAST的size需要一致
+                        cv::calcOpticalFlowPyrLK(cur_img, cur_img_r, cur_left_temp, cur_right_temp, status_temp, err, cv::Size(11, 11), 2,
+                                                cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
+                        
+                        // cv::calcOpticalFlowPyrLK(cur_img, rightImg, cur_FAST, cur_right_FAST, statusLeftRIght, err, cv::Size(21, 21), 3);
+                        // reverse check cur right ---- cur left
+                        if(FLOW_BACK)
+                        {
+                            vector<cv::Point2f> reverseLeftPts = cur_left_temp;
+                            vector<uchar> statusRightLeft;
+                            cv::calcOpticalFlowPyrLK(cur_img_r, cur_img, cur_right_temp, reverseLeftPts, statusRightLeft, err_rl, cv::Size(11, 11), 1,
+                                                    cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
+                            // cv::calcOpticalFlowPyrLK(rightImg, cur_img, cur_right_FAST, reverseLeftPts, statusRightLeft, err, cv::Size(21, 21), 3);
+
+                            for(int k = 0; k < status_temp.size(); ++k)
+                            {
+                                if(status_temp[k])
+                                {
+                                    if(statusRightLeft[k])
+                                    {
+                                        if(distance(cur_left_temp[k], reverseLeftPts[k]) > 1.0)
+                                            status_temp[k] = 0;
+                                    }
+                                    else
+                                        status_temp[k] = 0;
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // 最多2次暴力搜索，最小的NCC值为0.975
+                        Th_NCC = 0.985 - 0.01*(n-1);
+                        float search_range = 6 + 6*(n-1);
+
+                        int num_pts = l_id_pt_no_stereo.size();
+                        if(n == 1)
+                        {
+                            if(!status_temp.empty()) status_temp.clear();
+                            if(!cur_right_temp.empty()) cur_right_temp.clear();
+                            status_temp.resize(num_pts,0);
+                            cur_right_temp.resize(num_pts, Point2f(0,0));
+                            pts_check.resize(num_pts,0);
+                        }
+
+                        for(int k = 0; k < num_pts; ++k)
+                        {
+                            if(pts_check[k] > 0) continue;
+                            int l_id = l_id_pt_no_stereo[k];
+                            Point2f &pt_p = cur_left_temp[l_id];
+                            Point2f &pt_p_r = orig_pred_r_pts[l_id];
+
+                            val_NCC = find_stereo_match_by_best_NCC(pt_p, pt_p_r, Th_NCC, search_range);
+                            if(val_NCC > 0)
+                            {
+                                status_temp[k] = 1;
+                                cur_right_temp[k] = pt_p_r;
+                            }
+                        }
+                    }
+                    
+                    float r_x, r_y, disp_x, disp_y, shift_y;
+                    int  l_id, gl_obj_id, cnt_track;
+
+                    bool keep = false;
+                    // 如果该物体新点的右观测点预测值是通过运动模型来设置的，则可能该预测值很不准确(尤其是上一帧的新物体点，或者当前帧的新物体点），则比较难找到匹配，因此后续可以使用depth_map直接获取深度值
+                    // keep = (frame_cnt > 1 && use_motion_to_pred_fea_dep);
+                    keep = true;  // 无论如何选择记录找不到立体匹配的点，后续不一定会直接用depth_map来作为其深度值。如果该点在下一帧再被跟踪到，则到时再为该点在这一帧寻找立体匹配（包括使用暴力匹配）
+                    
+                    uchar cls;
+
+                    // 还是执行局部优化
+                    bool use_LK_for_stereo_match = false;
+                    int num_pts = status_temp.size();
+                    for(int k = 0; k < num_pts; ++k)
+                    {
+                        if(n == 0) 
+                        {
+                            l_id = k;
+                        }
+                        else
+                        {
+                            if(pts_check[k] > 0) continue;
+                            l_id = l_id_pt_no_stereo[k];
+                        }
+                        
+                        int i = lid_cur_fea_temp[l_id];
+
+                        // 采用当前帧的cls来判断是否为物体,因为跟踪点的cls是与上一帧的全局物体的cls对齐的(除非上一帧为背景而当前帧为物体)
+                        cls = (*p_cls_id)[i].first;
+                        // 用来判断该点是否为上一帧的静态物体或新物体在当前帧的跟踪点
+                        gl_obj_id = (*p_gl_obj_id)[i];
+                        cnt_track = (*p_cnt_track)[i];
+
+                        // 如果是最先的版本，即在每一最新中都检测新的背景和物体点，则在此处排除图像最顶部区域的点
+                        // if(!add_new_fea_in_next_frame)
+                        // {
+                            // 室外场景图像的中顶部区域一般是天空或者比较远的建筑，两侧顶部还可能是建筑
+                            // todo：其实最好的办法还是与激光雷达相结合，把深度明显太远的方向的图像区域全部去除！
+                            // 光靠图像的话只能用全景分割来区别更一般的区域！例如将天空、树木等物体区域去除
+                            // 注意，前面的分数要有一个数是浮点，否则该分数实际结果为0！！！
+                            // if(cls == 0 && ((*p_fea)[i].y < 1.0/6*row || ((*p_fea)[i].x > 2.0/5*col && (*p_fea)[i].x < 3.0/5*col)))
+                            // 路面其实也可以检测特征点，但是很难跟踪，参考SOFT2！！
+                            // if(cls == 0 && ((*p_fea)[i].y < 1.0/6*row))
+                            // {
+                            //     (*p_status)[i] = 0;
+                            //     continue;
+                            // }
+                        // }
+                        
+                        uchar obj_status = 0;
+                        bool is_stat_new_obj_pt = false;
+                        if(n == 0)
+                        {
+                            if(brute_force_find_stereo)
+                            {
+                                // 需要进行暴力搜索的点，包括 上一帧处理后就保留的物体点。由于cls>0的情况可能是当前帧的物体点与上一帧的背景点匹配（该背景点只能是上一帧的新检测点），因此需要额外用该上一帧点的gl_obj_id来确定是否为物体点
+                                // 是否对当前帧新检测的物体点也进行暴力搜寻？暂不，对于没找到立体匹配的新点暂使用depth_map赋予深度值，待其下一帧被跟踪到再进行立体匹配强制搜寻
+                                // 单纯的i < num_track除了包含（i < num_old_track）的点，还包含了那些在当前帧新添加的跟踪点，即该点在上一帧为背景点，当前帧为物体点。但如果再加上gl_obj_id > 0的条件，则不包含这些上一帧漏检点
+                                // if(cls > 0 && (cnt_track == 1 || gl_obj_id > 0))
+                                if(cls > 0 && i < num_track && gl_obj_id > 0)
+                                {
+                                    // 如果是当前帧的新物体点，是否要进行暴力搜索（保证该物体在下一帧能有一定的点被用于跟踪）？
+                                    // 没必要，优先保证旧物体（尤其是静态物体或新物体）的跟踪点在当前帧有立体匹配即可，因此这些点要用于在objs_matching阶段进行静态验证，也可能作为静态点被加入地图
+                                    // if(cnt_track == 1)
+                                    // {
+                                    //     is_stat_new_obj_pt = true;
+                                    // }
+                                    // else
+                                    {
+                                        if(status_objs_prev.find(gl_obj_id) != status_objs_prev.end())
+                                        {
+                                            obj_status = status_objs_prev[gl_obj_id];
+                                            // todo:对上一帧的静态物体点在当前帧的跟踪点要求尽可能获取立体匹配。对于上一帧的新物体的点，是否也要尽可能获取呢？
+                                            // 暂时不需要，确定其是否为静态物体最终只需要3D-2D点进行PnP就足够了，而且上一帧的新物体无法在objs-matching阶段确定为静态（因为其没有运动模型）
+                                            // if(obj_status != 0) 
+                                            if(obj_status == 1)
+                                            {
+                                                float dep_prev = (*p_dep_prev)[i];
+                                                // 只为上一帧20m内的静态物体（或新物体） 寻找更多的在当前帧的立体匹配（以便其尽早地在objs-matching阶段能被确定是否为静态）
+                                                if(dep_prev > 0)
+                                                {
+                                                    if(dep_prev < (Th_dep_sta_obj_fea_to_add+2)) is_stat_new_obj_pt = true;
+                                                }
+                                                else
+                                                {
+                                                    cout << "Weired! Line 5647" << endl;
+                                                    exit(-1);
+                                                }
+                                            }
+                                        }
+                                        else
+                                        {
+                                            // 这是一个上一帧的漏检背景点，是否要对其进行暴力搜索立体匹配？这样的点在上一帧必须有立体匹配，则这里可以查看其深度值
+                                            float dep_prev = (*p_dep_prev)[i];
+                                            // 尝试为近一些的物体点寻找立体匹配
+                                            if(dep_prev > 0 && dep_prev < 16)
+                                            {
+                                                is_stat_new_obj_pt = true;
+                                            }
+                                            else
+                                            {
+                                                cout << "Weired! Line 5663" << endl;
+                                                exit(-1);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            if(cnt_track > 1 && status_objs_prev.find(gl_obj_id) != status_objs_prev.end())
+                            {
+                                obj_status = status_objs_prev[gl_obj_id];
+                            }
+                        }
+                        
+                        uchar find_track_l_r = status_temp[k];
+
+                        // 找到左右匹配点
+                        if(find_track_l_r)
+                        {
+                            Point2f &p_r_temp = cur_right_temp[k];
+                            if (!(inBorder(p_r_temp)))
+                            {
+                                // 如果是物体点且没有立体匹配（位于图像边缘），则放弃该点
+                                if(cls != 0)
+                                {
+                                    (*p_status)[i] = 0;
+                                    if(n > 0) pts_check[k] = 1;
+                                }
+                                else
+                                {
+                                    // if(i < num_track)
+                                    //     (*p_status)[i] = 2;
+                                    // else
+                                        (*p_status)[i] = 0;
+                                }
+                                continue;
+                            }
+                            
+                            r_x = p_r_temp.x;
+                            r_y = p_r_temp.y;
+
+                            Point2f &p_l_temp = cur_left_temp[l_id];
+                            disp_x = p_l_temp.x - r_x;
+                            disp_y = p_l_temp.y - r_y;
+
+                            if(n == 0)
+                            {
+                                // 在执行局部优化之前，y方向的差别不应该太大
+                                if(abs(disp_y) >= 3.0)
+                                {
+                                    // 跟踪点如果在当前帧没有立体匹配
+                                    if(i < num_track)
+                                    {
+                                        // 背景跟踪点是否保留取决于该点上一帧是否有深度值，而不是取决于当前帧是否有立体匹配
+                                        if(cls == 0)
+                                        {
+                                            (*p_status)[i] = 2;
+                                            if(for_sift)
+                                                sift_no_stereo_bg.push_back(i);
+                                            else
+                                                FAST_no_stereo_bg.push_back(i);
+                                        }
+                                        else
+                                        {
+                                            // 如果是要暴力寻找立体匹配的点
+                                            if(is_stat_new_obj_pt)
+                                            {
+                                                l_id_pt_no_stereo.push_back(k);
+                                            }
+                                            else
+                                            {
+                                                // 如果是非选择的物体点（静态物体或上一帧的新物体）
+                                                // 对于上一帧的新物体，由于其一般是比较远的（近的物体应该一直被跟踪着），其disp_x相对小一些，因此如果要对其进行暴力搜索，也只搜索一次
+                                                // 由于估计运动只需要3D-2D点，因此对于物体的跟踪点可以保留
+                                                (*p_status)[i] = 2;
+                                                if(for_sift)
+                                                {
+                                                    id_sift_no_depth.push_back(i);
+                                                }
+                                                else
+                                                {
+                                                    id_FAST_no_depth.push_back(i);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    else
+                                    {
+                                        if(cls == 0)
+                                        {
+                                            // 如果在当前帧检测了新的背景点，是否允许其没有立体匹配取决于是否使用前后2帧的三角测量来恢复深度
+                                            if(USE_TRIANGULATE_TWO_FRAME)
+                                            {
+                                                (*p_status)[i] = 3;
+                                                if(for_sift)
+                                                    sift_no_stereo_bg.push_back(i);
+                                                else
+                                                    FAST_no_stereo_bg.push_back(i);
+                                            }
+                                            else
+                                                (*p_status)[i] = 0;
+                                        }
+                                        else
+                                        {
+                                            if(is_stat_new_obj_pt)
+                                            {
+                                                l_id_pt_no_stereo.push_back(k);
+                                            }
+                                            else
+                                            {
+                                                // 需要记录在当前帧没有立体匹配的跟踪点。但是对于新点如果没有立体匹配且已经使用了depth_map作为预测，是否直接放弃（因为后续没有任何方法可以更新其深度值）？
+                                                // 不放弃该点，而是直接用depth_map作为其深度值，虽然这些新点在当前帧不参与任何物体关联的计算（只用于计算物体平均深度），但是却为下一帧提供被跟踪点！
+                                                if(keep)
+                                                {
+                                                    (*p_status)[i] = 3;
+                                                    if(for_sift)
+                                                    {
+                                                        id_sift_no_depth.push_back(i);
+                                                    }
+                                                    else
+                                                    {
+                                                        id_FAST_no_depth.push_back(i);
+                                                    }
+                                                }
+                                                else
+                                                    (*p_status)[i] = 0;
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+
+                                // 在优化匹配点前，如果初始的disp_x错误，则在此处跳过，避免浪费无效计算NCC
+                                if(disp_x <= 0) 
+                                {
+                                    if(cls == 0)
+                                    {
+                                        // 当前帧没有深度值的跟踪点的状态用2，新点则用3
+                                        // 最后还是决定如果当前帧没有深度值，则必须是跟踪点且上一帧有深度值，才能保留该点
+                                        if(i < num_track)
+                                        {
+                                            (*p_status)[i] = 2;
+                                            if(for_sift)
+                                                sift_no_stereo_bg.push_back(i);
+                                            else
+                                                FAST_no_stereo_bg.push_back(i);
+                                        }
+                                        else 
+                                        {
+                                            // 要不要保留当前帧背景中没有立体匹配的新点
+                                            if(USE_TRIANGULATE_TWO_FRAME)
+                                            {
+                                                if(for_sift)
+                                                    sift_no_stereo_bg.push_back(i);
+                                                else
+                                                    FAST_no_stereo_bg.push_back(i);
+                                                
+                                                (*p_status)[i] = 3;
+                                            }
+                                            else
+                                                (*p_status)[i] = 0;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        if(is_stat_new_obj_pt)
+                                        {
+                                            l_id_pt_no_stereo.push_back(k);
+                                        }
+                                        else
+                                        {
+                                            if(i < num_track || keep) 
+                                            {
+                                                if(i < num_track)
+                                                    (*p_status)[i] = 2;
+                                                else
+                                                {
+                                                    (*p_status)[i] = 3;
+                                                }
+                                                
+                                                if(for_sift)
+                                                {
+                                                    id_sift_no_depth.push_back(i);
+                                                }
+                                                else
+                                                {
+                                                    id_FAST_no_depth.push_back(i);
+                                                }
+                                            }
+                                            else
+                                            {
+                                                (*p_status)[i] = 0;
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            // 检查一下立体匹配点的NCC值
+                            // 还可以选择优化匹配点的位置
+                            float shift_x, shift_y;
+                            
+                            float NCC, Th_val_NCC = 0.97;
+                            if(n == 0)
+                            {
+                                // 远处的背景点的要求提高。之所以对上半图像的物体点要求不提高，是因为该处的物体不一定是远点（有可能是较大的车就在近处的两侧）
+                                if(cls == 0 && p_r_temp.y <= 240) Th_val_NCC = 0.98;
+                                if(cls > 0) Th_val_NCC = 0.975;
+
+                                if(!use_LK_for_stereo_match && refine_matching_stereo)
+                                {
+                                    NCC = cal_best_NCC(cur_img, cur_img_r, p_l_temp, p_r_temp, Len_edge_win, shift_x, shift_y);
+                                    // NCC = cal_best_NCC(cur_img, cur_img_r, p_l_temp, p_r_temp, Len_edge_win, shift_x, shift_y, check_match_by_ambi_NCC, for_sift);
+                                }
+                                else
+                                {
+                                    // if(check_match_by_ambi_NCC)
+                                    // {
+                                    //     float ambi_NCC;
+                                    //     NCC = cal_check_by_ambi_NCC(cur_img, cur_img_r, p_l_temp, p_r_temp, Len_edge_win, ambl_NCC, for_sift);
+                                    // }
+                                    // else
+                                    {
+                                        NCC = cal_NCC(cur_img, cur_img_r, p_l_temp, p_r_temp, Len_edge_win);
+
+                                        // int row_fea = p_l_temp.y/60;
+                                        // if(row_fea == 6) row_fea = 5;
+                                        // cout << "NCC of stereo matching in cur img: " << NCC << ", row of fea: " << row_fea << endl;
+                                    }
+                                }
+                                // cout << "NCC of stereo fea matching: " << NCC << endl;
+                            }
+                            else
+                            {
+                                // 对于暴力搜索，只要该点通过搜索，则其NCC值肯定是大于当前的Th_NCC
+                                Th_val_NCC = Th_NCC;
+                                NCC = Th_NCC + 0.01;
+                            }
+
+                            if(NCC <= Th_val_NCC)
+                            {
+                                if(cls == 0)
+                                {
+                                    if(i < num_track)
+                                    {
+                                        (*p_status)[i] = 2;
+                                        if(for_sift)
+                                            sift_no_stereo_bg.push_back(i);
+                                        else
+                                            FAST_no_stereo_bg.push_back(i);
+                                    }
+                                    else
+                                    {
+                                        if(USE_TRIANGULATE_TWO_FRAME)
+                                        {
+                                            (*p_status)[i] = 3;
+                                            if(for_sift)
+                                                sift_no_stereo_bg.push_back(i);
+                                            else
+                                                FAST_no_stereo_bg.push_back(i);
+                                        }
+                                        else
+                                            (*p_status)[i] = 0;
+                                    }
+                                }
+                                else
+                                {
+                                    if(is_stat_new_obj_pt)
+                                    {
+                                        // is_stat_new_obj_pt只会在n==0时才可能为true
+                                        // if(n == 0)
+                                            l_id_pt_no_stereo.push_back(k);
+                                    }
+                                    else
+                                    {
+                                        if(n == 0 || n == max_iter || (obj_status == 2))
+                                        {
+                                            if(n >= 1) pts_check[k] = 1;
+                                            if(i < num_track || keep) 
+                                            {
+                                                if(i < num_track)
+                                                    (*p_status)[i] = 2;
+                                                else
+                                                    (*p_status)[i] = 3;
+                                                
+                                                if(for_sift)
+                                                {
+                                                    id_sift_no_depth.push_back(i);
+                                                }
+                                                else
+                                                {
+                                                    id_FAST_no_depth.push_back(i);
+                                                }
+                                            }
+                                            else
+                                            {
+                                                (*p_status)[i] = 0;
+                                            }
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            else
+                            {
+                                if(n == 0)
+                                {
+                                    if(!use_LK_for_stereo_match && refine_matching_stereo)
+                                    {
+                                        if(shift_x > 0 || shift_y > 0)
+                                        {
+                                            p_r_temp.x += shift_x;
+                                            r_x = p_r_temp.x;
+                                            p_r_temp.y += shift_y;
+                                            disp_x -= shift_x; 
+                                            disp_y -= shift_y;
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // 如果左右图像没有严格的立体校正，则y方向上的视差可能不会接近0。
+                            // 最终v方向上的差别不应该太大（太大要么是严重错误匹配，要么是点太近了）
+                            if(abs(disp_y) >= 2.0)
+                            {
+                                if(cls == 0)
+                                {
+                                    if(i < num_track)
+                                    {
+                                        (*p_status)[i] = 2;
+                                        if(for_sift)
+                                            sift_no_stereo_bg.push_back(i);
+                                        else
+                                            FAST_no_stereo_bg.push_back(i);
+                                    }
+                                    else
+                                    {
+                                        if(USE_TRIANGULATE_TWO_FRAME)
+                                        {
+                                            (*p_status)[i] = 3;
+                                            if(for_sift)
+                                                sift_no_stereo_bg.push_back(i);
+                                            else
+                                                FAST_no_stereo_bg.push_back(i);
+                                        }
+                                        else
+                                            (*p_status)[i] = 0;
+                                    }
+                                }
+                                else
+                                {
+                                    if(is_stat_new_obj_pt)
+                                    {
+                                        l_id_pt_no_stereo.push_back(k);
+                                    }
+                                    else
+                                    {
+                                        if(n == 0 || n == max_iter || (obj_status == 2))
+                                        {
+                                            if(n > 0) pts_check[k] = 1;
+                                            if(i < num_track || keep) 
+                                            {
+                                                if(i < num_track)
+                                                    (*p_status)[i] = 2;
+                                                else
+                                                {
+                                                    (*p_status)[i] = 3;
+                                                }
+
+                                                if(for_sift)
+                                                {
+                                                    id_sift_no_depth.push_back(i);
+                                                }
+                                                else
+                                                {
+                                                    id_FAST_no_depth.push_back(i);
+                                                }
+                                            }
+                                            else
+                                            {
+                                                (*p_status)[i] = 0;
+                                            }
+                                        }
+                                    }
+                                }
+                                continue;    
+                            }
+
+                            // 右图像中的点不能大于指定深度范围内的左右相机重叠视野在右图像中的投影边界
+                            if(cls == 0 && r_x > bg_right_border_right_img)
+                            {
+                                // 跟踪点是否保留取决于该点上一帧是否有深度值，而不是取决于当前帧是否有立体匹配
+                                if(i < num_track)
+                                {
+                                    (*p_status)[i] = 2;
+                                    if(for_sift)
+                                        sift_no_stereo_bg.push_back(i);
+                                    else
+                                        FAST_no_stereo_bg.push_back(i);
+                                }
+                                else
+                                {
+                                    // 匹配的点位于右图像边缘，认为该点下一帧很难被跟踪到了？
+                                    // (*p_status)[i] = 0;
+                                    if(USE_TRIANGULATE_TWO_FRAME)
+                                    {
+                                        (*p_status)[i] = 3;
+                                        if(for_sift)
+                                            sift_no_stereo_bg.push_back(i);
+                                        else
+                                            FAST_no_stereo_bg.push_back(i);
+                                    }
+                                    else
+                                        (*p_status)[i] = 0;
+                                }
+                                continue;
+                            }
+                            else if (cls > 0 && r_x > obj_right_border_right_img)
+                            {
+                                if(i < num_track)
+                                {
+                                    (*p_status)[i] = 2;
+                                    if(for_sift)
+                                    {
+                                        id_sift_no_depth.push_back(i);
+                                    }
+                                    else
+                                    {
+                                        id_FAST_no_depth.push_back(i);
+                                    }
+                                }
+                                else
+                                    (*p_status)[i] = 0;
+                                
+                                if(n > 0) pts_check[k] = 1;
+                                continue;
+                            }
+
+                            // disp_x is the (x_left_img - x_right_img), so disp_x should be > 0
+                            // 经过NCC计算及优化后的disp_x应该不会<=0吧？
+                            if (disp_x <= 0) 
+                            {
+                                if (cls == 0)
+                                {
+                                    // 当前帧没有深度值的跟踪点的状态用2，新点则用3
+                                    // 最后还是决定如果当前帧没有深度值，则必须是跟踪点且上一帧有深度值，才能保留该点
+                                    if(i < num_track)
+                                    {
+                                        (*p_status)[i] = 2;
+                                        if(for_sift)
+                                            sift_no_stereo_bg.push_back(i);
+                                        else
+                                            FAST_no_stereo_bg.push_back(i);
+                                    }
+                                    else
+                                    {
+                                        // 要不要保留当前帧背景中没有立体匹配的新点
+                                        if(USE_TRIANGULATE_TWO_FRAME)
+                                        {
+                                            (*p_status)[i] = 3;
+                                            if(for_sift)
+                                                sift_no_stereo_bg.push_back(i);
+                                            else
+                                                FAST_no_stereo_bg.push_back(i);
+                                        }
+                                        else
+                                            (*p_status)[i] = 0;
+                                    }
+                                }
+                                else
+                                {
+                                    if(is_stat_new_obj_pt)
+                                    {
+                                        l_id_pt_no_stereo.push_back(k);
+                                    }
+                                    else
+                                    {
+                                        if(n == 0 || n == max_iter || (obj_status == 2))
+                                        {
+                                            if(n > 0) pts_check[k] = 1;
+                                            if(i < num_track || keep) 
+                                            {
+                                                if(i < num_track)
+                                                    (*p_status)[i] = 2;
+                                                else
+                                                {
+                                                    (*p_status)[i] = 3;
+                                                }
+                                                
+                                                if(for_sift)
+                                                {
+                                                    id_sift_no_depth.push_back(i);
+                                                }
+                                                else
+                                                {
+                                                    id_FAST_no_depth.push_back(i);
+                                                }
+                                            }
+                                            else
+                                            {
+                                                (*p_status)[i] = 0;
+
+                                            }
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            
+                            depth = mbf/disp_x;
+
+                            // 经常会把很远处的树叶作为特征点，并且深度估计也是错误的。因此限制点的深度值
+                            // 深度值太大时认为立体匹配不够准确，后续采用运动变换来计算深度
+                            // if (cls == 0 && (depth >= mThDepthBg || depth < mMinDepthPt))
+                            if (cls == 0 && (depth > 21 || depth < 1.5)) 
+                            {
+                                if(i < num_track)
+                                {
+                                    (*p_status)[i] = 2;
+                                    if(for_sift)
+                                        sift_no_stereo_bg.push_back(i);
+                                    else
+                                        FAST_no_stereo_bg.push_back(i);
+                                }
+                                else
+                                    // 深度不合适的新背景点就不要了，因为下一帧很难跟踪？
+                                    (*p_status)[i] = 0;
+                                
+                                continue;
+                            }
+                            // else if(cls > 0 && (depth >= mThDepthObj || depth < mMinDepthPt)) 
+                            else if(cls > 0 && (depth >= mThDepthObj || depth < 1.5)) 
+                            {
+                                if(is_stat_new_obj_pt)
+                                {
+                                    l_id_pt_no_stereo.push_back(k);
+                                }
+                                else
+                                {
+                                    // if(depth < mMinDepthPt)
+                                    if(depth < 1.5)
+                                    {
+                                        if(depth > 1.0 && i < num_track)
+                                        {
+                                            (*p_status)[i] = 2;
+                                            if(for_sift)
+                                            {
+                                                id_sift_no_depth.push_back(i);
+                                            }
+                                            else
+                                            {
+                                                id_FAST_no_depth.push_back(i);
+                                            }
+                                        }
+                                        else
+                                            (*p_status)[i] = 0;
+                                        
+                                        if(n > 0) pts_check[k] = 1;
+                                    }
+                                    else
+                                    {
+                                        if(n == 0 || n == max_iter || (obj_status == 2))
+                                        {
+                                            if(n > 0) pts_check[k] = 1;
+                                            if(i < num_track || keep) 
+                                            {
+                                                if(i < num_track)
+                                                    (*p_status)[i] = 2;
+                                                else
+                                                {
+                                                    (*p_status)[i] = 3;
+                                                }
+
+                                                if(for_sift)
+                                                {
+                                                    id_sift_no_depth.push_back(i);
+                                                }
+                                                else
+                                                {
+                                                    id_FAST_no_depth.push_back(i);
+                                                }
+                                            }
+                                            else
+                                            {
+                                                (*p_status)[i] = 0;
+                                            }
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+
+                            // 会出现这种情况吗？？所估计的深度值使得3D点位于右相机的视锥左侧面之外（更左边）且位于规定深度区域内，则排除，因为该点不可能在右图像观测到
+                            // float err = (r_cam_3D_plane[0]*cur_un_FAST[i].x+r_cam_3D_plane[1]*cur_un_FAST[i].y+r_cam_3D_plane[2])*depth+r_cam_3D_plane[3];
+                            // if (err <= 0) 
+                            // {
+                            //     statusLeftRIght[i] = 0;
+                            //     continue;
+                            // }
+                            
+                            // 如果所估计的深度满足要求，则记录
+                            // 是否直接默认为立体校对后的匹配，还是需要使用左右匹配进行三角化（一般还要同时优化左右相机的外参）
+                            (*p_cur_right)[i] = p_r_temp;
+                            (*p_status)[i] = 1;
+
+                            if(for_sift && i >= num_track && cls == 0)
+                            {
+                                // todo:注意，对于sift在当前帧的新sift背景点，如果在这里找到立体匹配，则应该在此处将其从sift_no_stereo_bg中删除！（虽然影响并不大）
+
+                            }
+
+                            if(cls == 0)
+                            {
+                                if(use_tria_stereo)
+                                    (*p_dep_cur)[i] = -1.0;
+                                else
+                                    (*p_dep_cur)[i] = depth;
+                            }
+                            else
+                            {
+                                // 能这么做的前提是立体校正足够准确!
+                                (*p_dep_cur)[i] = depth;
+                                if(n > 0) pts_check[k] = 1;
+                            }
+                            
+                            if(cls == 0)
+                            {
+                                if(!use_tria_stereo)
+                                {
+                                    if(use_motion_to_pred_fea_dep) 
+                                    {
+                                        ave_dep_bg_cur_frame += depth;
+                                        ++num_bg_with_dep;
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            if((*p_cls_id)[i].first == 0)
+                            {
+                                if(i < num_track)
+                                {
+                                    (*p_status)[i] = 2;
+                                    if(for_sift)
+                                        sift_no_stereo_bg.push_back(i);
+                                    else
+                                        FAST_no_stereo_bg.push_back(i);
+                                }
+                                else
+                                {
+                                    if(USE_TRIANGULATE_TWO_FRAME)
+                                    {
+                                        (*p_status)[i] = 3;
+                                        if(for_sift)
+                                            sift_no_stereo_bg.push_back(i);
+                                        else
+                                            FAST_no_stereo_bg.push_back(i);
+                                    }
+                                    else
+                                        (*p_status)[i] = 0;
+                                }
+                            }
+                            else
+                            {
+                                if(is_stat_new_obj_pt)
+                                {
+                                    l_id_pt_no_stereo.push_back(k);
+                                }
+                                else
+                                {
+                                    if(n == 0 || n == max_iter || (obj_status == 2))
+                                    {
+                                        if(n > 0) pts_check[k] = 1;
+                                        if(i < num_track || keep)
+                                        {
+                                            if(i < num_track)
+                                                (*p_status)[i] = 2;
+                                            else
+                                            {
+                                                (*p_status)[i] = 3;
+                                            }
+                                            
+                                            if(for_sift)
+                                            {
+                                                id_sift_no_depth.push_back(i);
+                                            }
+                                            else
+                                            {
+                                                id_FAST_no_depth.push_back(i);
+                                            }
+                                        }
+                                        else
+                                        {
+                                            (*p_status)[i] = 0;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if(n == 0)
+                    {
+                        status_temp.clear();
+                        cur_right_temp.clear(); 
+                    }
+                }
+            }
+        }
+    }
 }
 
 // CPU上跟踪FAST特征点（注意此函数中暂时没有左右特征点匹配，以及左图像中新特征点的检测）
 // 跟踪上一帧的特征点在当前帧上的位置，8个维度分别表示特征点的3维归一化平面坐标（即z轴坐标为1）、像素坐标、二维点速度（即前后两帧的匹配点在归一化平面上在u和v方向上的向量），以及该点在前后两帧间属于哪个运动物体(id)
 // 返回类型中，第一个int表示该特征点（在当前滑窗内）的全局ID，第2个int表示该特征点在当前帧的观测点是在左相机（0）还是右相机（1)
 // 注意，VINS-Fusion中没有对双目相机进行立体校正，因此此处左右图像间的匹配点无法通过视差来直接计算深度！但在MVIO项目中，默认已经进行了立体校正
-void FeatureTracker::trackImage(int frame_count, const cv::Mat &_img, bool &end_flow_post, const cv::Mat &seg_map, bool &end_FAST_track,  
-                                const cv::Mat &prev_dep_map,const cv::Mat &flow_map, const vector<Vector3d> &Ps, const vector<Matrix3d> &Rs)
+void FeatureTracker::trackImage(bool &end_flow_post, const cv::Mat &seg_map_cur, bool &end_FAST_track, const cv::Mat &prev_dep_map, 
+                                const cv::Mat &flow_map, const vector<Vector3d> &Ps, const vector<Matrix3d> &Rs)
 {
     TicToc t_r;
-    // FAST检测只能在8UC1或者32FC1 的灰度图像上。而光流跟踪只能在8UC1灰度图像上！
-    // if(_img.channels() == 3)
-    //     cvtColor(_img, cur_img, COLOR_BGR2GRAY);
-    // else
-    //     //cur_img = _img.clone();
-    //     cur_img = _img;
     
-    frame_cnt = frame_count;
-    assert(cur_img.type() == CV_8UC1 && "Must provide an image with CV_8UC1 type for tracking and detection of FAST!");
-
-    if(frame_count == 0)
+    if(frame_cnt == 0)
     {
         end_FAST_track = true;
         return;
     }
-    // 是否要进行图像预处理
-    //cv::Mat rightImg = _img1;
-    /*
-    {
-        cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
-        clahe->apply(cur_img, cur_img);
-        if(!rightImg.empty())
-            clahe->apply(rightImg, rightImg);
-    }
-    */
-
-    if(add_new_sift_in_next_frame)
+    ++total_frame;
+    num_track_FAST_bg = 0;
+    num_track_FAST_static = 0;
+    num_sta_FAST_long_track = 0;
+    
+    for(int i = 0; i < 6; ++i)
+        for(int j = 0; j < 6; ++j)
+            num_new_FAST_detect[i][j] = 0;
+    
+    if(add_new_fea_in_next_frame)
     {
         // 这里不需要等到sift_select函数完成，只需要其中将上一帧有立体匹配（但是无当前帧跟踪）的点加入到prev_FAST即可，后续这两个函数的操作互相不再影响
         // while(!done_select_sift)
@@ -1375,3661 +6888,271 @@ void FeatureTracker::trackImage(int frame_count, const cv::Mat &_img, bool &end_
 
     TicToc t_o;
 
-    num_track_FAST_bg = 0;
-    num_track_FAST_static = 0;
-    num_sta_FAST_long_track = 0;
-
-    // FAST新的背景跟踪点只在下半部分图像中检测，即近处的点
-    int num_new_FAST_detect[3][6];
-    for(int i = 0; i < 3; ++i)
-        for(int j = 0; j < 6; ++j)
-            num_new_FAST_detect[i][j] = 0;
-
-    int num_orig_FAST = prev_FAST.size();
-    int num_add_new = 0;
-    
-    int thres_pt_id;
-    
-    if(add_new_sift_in_next_frame)
-    {
-        // rectangle(x_left_top. y_left_top, width, height)
-        Rect targetRect(0, 0, col, 3*60);
-        // 给定像素的值一定要是显式的Scalar类型，不能直接给定0这种int值！！否则编译器会报错
-        Mat allZeroZone(targetRect.height, targetRect.width, CV_8UC1, Scalar(0));
-        // 获取要涂黑的图像区域的ptr
-        Mat dest_zone = mask_bg_prev(targetRect);
-        allZeroZone.copyTo(dest_zone);
-        
-        for(int i = 3; i < 6; ++i)
-        {
-            for(int j = 0; j < 6; ++j)
-            {
-                // 虽然bloc中的背景sift跟踪点中有些被排除了，但是由于总体要采样的点足够多，因此应该不会导致最终的背景跟踪点太少吧？
-                int num_pt = num_flow_pt_in_bloc[i][j] + num_long_track_FAST_in_bloc[i][j] + num_temp_flow_pt_in_bloc[i][j];
-                int rest_num;
-                if(i == 3)
-                    rest_num = 7 - num_pt;
-                else
-                    rest_num = NUM_FEA_IN_BLOC - num_pt;
-                
-                if(rest_num > 0)
-                {
-                    num_add_new += rest_num;
-                    num_new_FAST_detect[i-3][j] = rest_num;
-                }
-                else
-                {
-                    int w_bloc = 200, h_bloc = 60;
-                    if(i == 5) h_bloc = row - 60*5;
-
-                    if(j == 5) w_bloc = col - 200*5;
-
-                    cv::Rect targetRectBloc(200*j, 60*i, w_bloc, h_bloc);
-                    Mat allZeorZoneBloc(h_bloc, w_bloc, CV_8UC1, Scalar(0));
-                    Mat dest_zone_bloc = mask_bg_prev(targetRectBloc);
-                    allZeorZoneBloc.copyTo(dest_zone_bloc);
-                }
-            }
-        }
-        
-        // 最少需要15个新FAST跟踪点
-        int total_num = std::max(15,num_add_new);
-
-        // 当需要补充的点数足够多时，检测新点
-        // if(total_num > 4)
-        {
-            vector<Point2f> new_FAST_bg_temp;
-            // cv::goodFeaturesToTrack(prev_img, new_FAST_bg_temp, total_num * 1.5, 0.03, 30, mask_bg_prev);
-
-            // 使用此版本的函数，其中会输出各个角点的质量
-            vector<float> quality_FAST;
-            cv::goodFeaturesToTrack(prev_img, new_FAST_bg_temp, total_num * 1.0, 0.01, 30, mask_bg_prev, quality_FAST);
-            int num_new = new_FAST_bg_temp.size();
-            cout << "original num of new detected fea: " << num_new << endl;
-            
-            float l_x, l_y;
-            Point2f prev_un_pt;
-            int num_fea = 0;
-
-            bool sort_by_quality = false;
-            // 是否要根据检测点的quality先进行排序
-            if(sort_by_quality)
-            {
-                multimap<float,int,greater<float>> fea_qua_id;
-                float quality;
-                for(int j = 0; j < num_new; ++j)
-                {
-                    quality = quality_FAST[j];
-                    // map不允许有多个相同的key，如果相同，这里后插入的会把之前的替换
-                    // 因此使用multimap
-                    fea_qua_id.insert(make_pair(quality,j));
-                }
-
-                // 新点中最高的quality数值
-                float max_quality = fea_qua_id.begin()->first;
-                auto last_it = fea_qua_id.end();
-                // 注意，从后往前数的时候是--
-                last_it--;
-                // 最低的quality数值
-                float min_quality = last_it->first;
-                // 直接用最高分和最低分的调和比例来获取阈值的话，容易导致参与F矩阵估计的点太少。应该使用中位数
-                // float thres_qua = max_quality * 1.0/2 + min_quality * 2.0/2;
-                int thres_num = 3.0/5 * num_new;
-                bool higher_thres = true;
-                
-                multimap<float,int,greater<float>>::iterator it, iter;
-                // 点的quality已经从大到小排列，质量越高的点越先加入
-                // upper_bound(k)的意思是跳到比 给定key值k 大的key的第一个元素的iterator或者直接整个multimap的end()
-                // 因为不同key值的之间的元素的iterator不能直接用++来连接
-                
-                for(it = fea_qua_id.begin(); it != fea_qua_id.end(); it = fea_qua_id.upper_bound(it->first))
-                {
-                    auto iter = it;
-                    quality = iter->first;
-                    // 记录第一个不大于thres_qua的点的序号，其及之后的新点不会参与F矩阵的估计.
-                    // 改为后一半的新点不参与F矩阵的估计
-                    // if(quality <= thres_qua && higher_thres) 
-                    if(num_fea >= thres_num && higher_thres)
-                    {
-                        thres_pt_id = num_fea + num_orig_FAST;
-                        higher_thres = false;
-                    }
-                    
-                    int nums = fea_qua_id.count(quality);
-                    while(nums--) 
-                    {
-                        Point2f &p = new_FAST_bg_temp[iter->second];
-                        // 位于左图像最左和最右边小部分区域的点暂不考虑
-                        if (!inBorder(p)) continue;
-                        // 记录之后需要检测右观测点的上一帧点!
-                        // new_FAST_bg.push_back(p);
-                        
-                        int row_bloc = p.y/60;
-
-                        if(row_bloc < 3) continue;
-
-                        int col_bloc = p.x/200;
-                        if(col_bloc == 6) col_bloc = 5;
-                        if(row_bloc == 6) row_bloc = 5;
-
-                        if(num_new_FAST_detect[row_bloc-3][col_bloc] == 0) continue;
-
-                        num_new_FAST_detect[row_bloc-3][col_bloc] -= 1;
-                        
-                        // 将所有的点加入cur_FAST，进行前后2帧的跟踪
-                        prev_FAST.push_back(p);
-
-                        prev_FAST_global_obj_id.push_back(0);
-                        track_cnt_FAST.push_back(1);
-                        ids_FAST.push_back(n_id);
-                        // status_FAST.push_back(1);
-                        obj_cls_id_FAST.emplace_back(0,0);
-                        // 这些新点在完成跟踪之后会再检测其右跟踪点
-                        prev_FAST_dep.push_back(-1.0);
-                        prevLeftFeaMap[n_id] = p;
-
-                        undistortedPts(p, prev_un_pt, m_camera[0]);
-                        prev_un_Fea_map[n_id] = Vec4f(prev_un_pt.x, prev_un_pt.y, 0.0, 0.0);
-
-                        ++n_id;
-                        iter++;
-                        ++num_fea;
-                    }
-                }
-            }
-            else
-            {
-                for(auto &p: new_FAST_bg_temp)
-                {
-                    // 位于左图像边界区域的点暂不考虑
-                    if (!inBorder(p)) continue;
-                    // 记录之后需要检测右观测点的上一帧点!
-                    // new_FAST_bg.push_back(p);
-                    
-                    int row_bloc = p.y/60;
-
-                    if(row_bloc < 3) continue;
-
-                    int col_bloc = p.x/200;
-                    if(col_bloc == 6) col_bloc = 5;
-                    if(row_bloc == 6) row_bloc = 5;
-
-                    if(num_new_FAST_detect[row_bloc-3][col_bloc] == 0) continue;
-
-                    num_new_FAST_detect[row_bloc-3][col_bloc] -= 1;
-                    
-                    // 将所有的点加入cur_FAST，进行前后2帧的跟踪
-                    prev_FAST.push_back(p);
-
-                    prev_FAST_global_obj_id.push_back(0);
-                    track_cnt_FAST.push_back(1);
-                    ids_FAST.push_back(n_id);
-                    // status_FAST.push_back(1);
-                    obj_cls_id_FAST.emplace_back(0,0);
-                    // 后续再为这些上一帧新点检测其右匹配点
-                    prev_FAST_dep.push_back(-1.0);
-                    prevLeftFeaMap[n_id] = p;
-
-                    undistortedPts(p, prev_un_pt, m_camera[0]);
-                    prev_un_Fea_map[n_id] = Vec4f(prev_un_pt.x, prev_un_pt.y, 0.0, 0.0);
-
-                    ++n_id;
-                    ++num_fea;
-                }
-            }
-            cout << "final num of new detected fea: " << num_fea << endl;
-        }
-    }
-
-    // 对所有上一帧的FAST点进行跟踪
-    if (prev_FAST.size() > 0)
-    {
-        // 如果是在当前帧才添加上一帧的新FAST点，则要在此处再为所有FAST点提供flow预测值
-        if(add_new_sift_in_next_frame)
-        {
-            // 使用恒速运动模型假设来估计静态点和动态物体点的位置，对于新物体，可以使用运动预测或者后续使用flow_map
-            if(use_motion_to_pred_fea_pos)
-            {
-                Ptspredict_motion(frame_count, Rs[0], Ps[0], Rs[1], Ps[1], false, true);
-            }
-            else
-            {
-                int num_pt = prev_FAST.size();
-                // predict_dep_FAST.clear();
-                cur_FAST.resize(num_pt,Point2f(0.0,0.0));
-                
-                FAST_new_objs.resize(num_pt);
-                std::iota(FAST_new_objs.begin(), FAST_new_objs.end(), 0);
-                // 第二帧的点的深度预测要怎么给出？这里直接用上一帧该点的深度值是否合理。后面直接用了depth_map？
-                // 注意，此时部分上一帧的点还没插入depth值，因此这里不应该直接赋值
-                // predict_dep_FAST = prev_FAST_dep;
-                // FAST_pred_motion = true;
-            }
-        }
-        else
-        {
-            while(!FAST_pred_motion)
-            {
-                usleep(300);
-            }
-            FAST_pred_motion = false;
-        }
-        
-        // 如果当前帧中还有特征点(如上一帧的新物体点）没有像素坐标预测，则意味着需要用flow_map来获取预测值。
-        // todo: 也可以使用极线约束来提供一定的约束
-        if(!FAST_new_objs.empty())
-        {
-            while(!end_flow_post)
-            {
-                usleep(300);
-            }
-
-            if (!seg_map.empty() && !flow_map.empty())
-            {
-                // predict_FAST.clear();
-                //predict_sift.clear();
-                // 这里只用flow_map来给出上一帧的"新物体点"提供预测点，非新物体则是之前就用物体的运动模型来变换和投影得到预测点
-                Ptspredict_flow(flow_map, seg_map);
-            }
-            else
-            {
-                fprintf(stderr, "For predict of FAST in the second frame should provide the seg_map and flow_map!");
-                abort(); 
-            }
-        }
-        
-        hasPrediction = true;
-        vector<float> err;
-        // 是否有对当前帧特征点所在位置的预测（可以是根据上一帧中计算的特征点的二维速度来推测，但是由于KITTI等数据集中的相机帧率低，且可能有动态物体，所以最好是使用物体的3D运动模型来投影上一帧的点作为预测）
-        // 针对背景点 和 动态物体点，分别进行flow估计。如果都能有预估位置，则可以统一使用相同的参数（窗口大小 和 最大层数），否则（应该是指前两帧）对于动态物体，应该一开始就增大窗口？
-        if(hasPrediction)
-        {
-            // cur_FAST = predict_FAST;
-            // 参数1表示所要使用的最大的图像金字塔层数，0意味着不使用金字塔，1表示最多有2层的金字塔（可以拥有一定的尺度不变性）。因为有预测值，所以一开始尝试层数较少的金字塔
-            // status和prev_pts的长度是一样的，表征上一帧每个点在当前帧中是否能被光流追踪到
-            
-            // todo:可以根据err的大小来作为匹配质量的排序
-            cv::calcOpticalFlowPyrLK(prev_img, cur_img, prev_FAST, cur_FAST, status_FAST, err, cv::Size(21, 21), 2, 
-            cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
-            
-            // int succ_num = 0;
-            // for (size_t i = 0; i < status_FAST.size(); ++i)
-            // {
-            //     if (status_FAST[i])
-            //         ++succ_num;
-            // }
-            // 如果跟踪的点数太少，则增加金字塔的最大层数到4层
-            // if (succ_num < 5)
-            //     //  重新计算时，是否要重新为cur_FAST赋值？
-            //     // 如果不设置cv::OPTFLOW_USE_INITIAL_FLOW，则默认是copy prev_FAST到cur_FAST作为初始值
-            //    cv::calcOpticalFlowPyrLK(prev_img, cur_img, prev_FAST, cur_FAST, status_FAST, err, cv::Size(21, 21), 3);
-               
-            hasPrediction = false;
-        }
-        else
-        {
-            cur_FAST = prev_FAST;
-            cv::calcOpticalFlowPyrLK(prev_img, cur_img, prev_FAST, cur_FAST, status_FAST, err, cv::Size(21, 21), 3);
-        }
-
-        FLOW_BACK = true;
-        // reverse check  逆向光流计算，用上面光流计算出的当前帧中特征点位置 再 计算到上一帧的光流匹配，如果得到检测位置和上一帧的点原始位置距离相差很小，则认为光流成功
-        if(FLOW_BACK)
-        {
-            vector<float> err_c_p;
-            vector<uchar> reverse_status;
-            vector<cv::Point2f> reverse_pts = prev_FAST;
-            cv::calcOpticalFlowPyrLK(cur_img, prev_img, cur_FAST, reverse_pts, reverse_status, err_c_p, cv::Size(15, 15), 2, 
-            cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
-            //cv::calcOpticalFlowPyrLK(cur_img, prev_img, cur_FAST, reverse_pts, reverse_status, err_c_p, cv::Size(21, 21), 3); 
-            for(size_t i = 0; i < status_FAST.size(); ++i)
-            {
-                if(status_FAST[i] && reverse_status[i] && distance(prev_FAST[i], reverse_pts[i]) < 0.5)
-                {
-                    err[i] = err[i] + err_c_p[i];
-                    continue;
-                }
-                else
-                    status_FAST[i] = 0;
-            }
-        }
-        
-        // 如果所有待跟踪点在上一帧就已经确定（VINS的思路），则需要等待其他线程把这些点在上一帧的mask中进行标注
-        if(!add_new_sift_in_next_frame)
-        {
-            // 等待完成绘制上一帧特征点的mask，因此其中需要使用到obj_cls_id_FAST等变量，这些变量在下面会被修改为存储当前帧点的信息
-            while(!use_prev_fea)
-            {
-                usleep(300);
-            }
-        }
-
-        // 按照err对跟踪点进行排序
-        vector<pair<float,int>> err_id_FAST;
-        float error;
-        int num_track = cur_FAST.size();
-        for(int j = 0; j < num_track; ++j)
-        {
-            if(status_FAST[j] == 0) continue;
-            error = err[j];
-            // map不允许有多个相同的key，如果相同，这里后插入的会把之前的替换
-            // 因此使用multimap
-            err_id_FAST.emplace_back(error,j);
-        }
-
-        // 按err从小到大排序
-        sort(err_id_FAST.begin(), err_id_FAST.end(), [](const pair<float, int> &a, const pair<float, int> &b)
-        {
-            return a.first < b.first;
-        });
-        
-        float x, y, disp_x, disp_y;
-        Vec2b pt_info;
-        int num_orig_track = err_id_FAST.size();
-        int num_final_track = 0;
-        
-        // 基于极线约束，使用预测的相机运动构建F矩阵来过滤静态点的匹配（注意，这对动态物体点无效，因为动态点仍可能满足相机的极线约束，参考rigidmask）
-        bool check_flow_with_epi = true;
-        if(!use_motion_to_pred_fea_pos) check_flow_with_epi = false;
-        
-        Matrix3d cam_F;
-        if(check_flow_with_epi)
-        {
-            if(frame_count > 1)
-            {
-                // 构建有效的F矩阵需要非0位移
-                if(P_cam_motion.norm() > 0.08)
-                {
-                    // Quaterniond delta_Q(R_cam_motion);
-                    // float delta_angle = fabs(acos(delta_Q.w()) * 2.0 / 3.1416 * 180.0);
-
-                    // 是否需要 预测的旋转较小?
-                    // if(delta_angle < 0.6)
-                    {
-                        Matrix3d t_up;
-                        t_up << 0.0, -P_cam_motion(2), P_cam_motion(1), P_cam_motion(2), 0.0, -P_cam_motion(0), -P_cam_motion(1), P_cam_motion(0), 0.0;
-                        // 本质矩阵到关键矩阵
-                        cam_F = K_trans_inv * t_up * R_cam_motion * K_inv;
-                    }
-                    // else
-                    // {
-                    //     check_flow_with_epi = false;
-                    // }
-                }
-                else
-                    check_flow_with_epi = false;
-            }
-            else
-                check_flow_with_epi = false;
-        }
-        
-        // for (int i = 0; i < cur_FAST.size(); ++i)
-        for (int k = 0; k < num_orig_track; ++k)
-        {
-            int i = err_id_FAST[k].second;
-            
-            if (status_FAST[i])
-            {
-                Point2f &pt_prev = prev_FAST[i];
-                Point2f &pt_cur = cur_FAST[i];
-
-                x = pt_cur.x;
-                y = pt_cur.y;
-                pt_info = seg_map.at<Vec2b>(y, x);
-
-                // 在左图像的左侧的一些区域内的点要么不可能在右图像中有观测，要么其深度超过了相应的阈值
-                // 使用seg_map来查询点的类别
-                uchar cls_label = pt_info[0];
-
-                if (cls_label == 1 || cls_label == 2 || cls_label == 4 || cls_label == 7) 
-                {
-                    status_FAST[i] = 0;
-                    continue;
-                }
-                // if (cls_label == 0 && x <= bg_left_border_left_img) 
-                // {
-                //     status_FAST[i] = 0;
-                //     continue;
-                // }
-
-                uchar prev_cls = obj_cls_id_FAST[i].first;
-
-                if ((prev_cls > 0 || cls_label > 0) && x <= obj_left_border_left_img)
-                {
-                    status_FAST[i] = 0;
-                    continue;
-                }
-                
-                // 如果上一帧为背景点，且该点之前已经被跟踪了至少2帧（则上上帧也最终一定是背景点），则其当前帧不可能变为物体点
-                if (prev_cls == 0 && cls_label != 0 && track_cnt_FAST[i] > 1) 
-                {
-                    status_FAST[i] = 0;
-                    continue;
-                }
-
-                // 判断是否会超出上下边界
-                if (inBorder(pt_cur))
-                {
-                    bool is_close_static_fea = false;
-
-                    int prev_obj_state = obj_cls_id_FAST[i].second;
-                    int gl_id = ids_FAST[i];
-
-                    bool is_invalid_sta_fea = false;
-
-                    if(check_flow_with_epi)
-                    {
-                        int gl_obj_id = prev_FAST_global_obj_id[i];
-
-                        if(gl_obj_id > 0 && status_objs_prev.find(gl_obj_id) == status_objs_prev.end())
-                        {
-                            cout << "Weired!" << endl;
-                            exit(-1);
-                        }
-
-                        // 静态点需要离预测的极线不能太远
-                        if(gl_obj_id == 0 || status_objs_prev[gl_obj_id] == 1)
-                        {
-                            // 极线的参数
-                            float a = cam_F(0,0) * pt_prev.x + cam_F(0,1) * pt_prev.y + cam_F(0,2);
-                            float b = cam_F(1,0) * pt_prev.x + cam_F(1,1) * pt_prev.y + cam_F(1,2);
-                            float c = cam_F(2,0) * pt_prev.x + cam_F(2,1) * pt_prev.y + cam_F(2,2);
-
-                            float num = a * pt_cur.x + b * pt_cur.y + c;
-
-                            float den = a * a + b * b;
-
-                            // F矩阵无效，一般是因为相机位移t为0? 也有可能是误差造成的
-                            if(den != 0) 
-                            {
-                                // 点到线的距离 的平方
-                                float dsqr = num*num/den;
-                                
-                                // 如何设定这个距离阈值？越近的点，其绝对匹配误差就会越大，但是相对地，相同的绝对误差所造成的深度或位移的估计绝对误差越小
-                                // 由于这是预测的运动构成的极线，精度不高，所以不应该限制太大
-                                if(dsqr > Th_epipolar_con * Th_epipolar_con) 
-                                {
-                                    // 只排除掉背景匹配，静态物体可能变成了动态物体？
-                                    if(gl_obj_id == 0)
-                                    {
-                                        status_FAST[i] = 0;
-                                        continue;
-                                    }
-                                    else
-                                    {
-                                        is_invalid_sta_fea = true;
-                                    }
-                                }
-                                
-                            }
-                        }
-                    }
-
-                    // 确定该跟踪点是否能参与F或H矩阵的估计和验证
-                    // 纯背景跟踪点
-                    if(prev_cls == 0 && cls_label == 0)
-                    {
-                        is_close_static_fea = true;
-
-                    }
-                    else if(prev_cls > 0 && prev_cls == cls_label && prev_obj_state == 0)
-                    {
-                        // 静态物体的跟踪点，只使用其中在上一帧中有立体匹配的点（这样其深度值较为准确）来估计F或H矩阵
-                        // 第3帧开始才会有相机的运动预测
-                        if(frame_count > 1 && reject_with_F && prevRightFeaMap.find(gl_id) != prevRightFeaMap.end())
-                        {
-                            int prev_dep = prev_FAST_dep[i];
-                            // 上一帧7m以内的静态物体点
-                            // float th_sta_obj_fea = (float)max(mThDepthBg/2.0,7.0);
-                            float th_sta_obj_fea = 14;
-                            if(!is_invalid_sta_fea && prev_dep > 0 && prev_dep <= th_sta_obj_fea)
-                            {
-                                if(prev_un_Fea_map.find(gl_id) != prev_un_Fea_map.end())
-                                {
-                                    Vec4f &prev_fea = prev_un_Fea_map[gl_id];
-                                    float prev_x = prev_fea(0) * prev_dep;
-                                    float prev_y = prev_fea(1) * prev_dep;
-                                    Vector3d prev_pt(prev_x,prev_y,prev_dep);
-                                    
-                                    Vector3d pred_cur = (R_cam_motion * prev_pt + P_cam_motion);
-                                    if(pred_cur(2) > 0)
-                                    {
-                                        float pred_x = pred_cur(0)/pred_cur(2);
-                                        float pred_y = pred_cur(1)/pred_cur(2);
-                                        Vector2d pred_un_pt(pred_x,pred_y);
-
-                                        Point2f cur_un_fea;
-                                        undistortedPts(pt_cur,cur_un_fea,m_camera[0]);
-                                        Vector2d cur_un_pt(cur_un_fea.x,cur_un_fea.y);
-                                        
-                                        float err = (pred_un_pt - cur_un_pt).norm();
-                                        // 重投影误差小于8个像素点
-                                        if(err < 8.0/FOCAL_LENGTH_X)
-                                        {
-                                            is_close_static_fea = true;
-                                        }
-                                    }
-
-                                    // is_close_static_fea = true;
-                                }
-                            }
-                        }
-                    }
-
-                    // 如果上一帧和当前帧都是静态点，则把这些点作为当前帧的背景静态点
-                    //if (obj_cls_id_FAST[i].second == 0 && 0 == cls_label) ++num_track_FAST_bg;
-                    // 如果上一帧和当前帧都是背景点，则把这些点作为当前帧的背景静态点
-
-                    int obj_label = pt_info[1];
-                    
-                    // 第二个元素暂时存储当前帧的临时物体id，待物体关联完成后在修改为全局物体id。第一个元素存储该点的全局类别（基于上一帧对齐），但如果上一帧的点为背景点，则保存当前帧该点的检测类别
-                    if (prev_cls == 0 || is_close_static_fea)
-                    {
-                        // 如果是某个物体在上一帧漏检了，则要求上一帧其漏检特征点必须具有该帧下的深度值（否则后续无法进行运动估计以判断该点是否为动态）
-                        if(prev_cls == 0 && cls_label > 0)
-                        {
-                            if(prev_FAST_dep[i] <= 0)
-                            {
-                                if(prevRightFeaMap.find(gl_id) != prevRightFeaMap.end())
-                                {
-                                    float disp_x_prev = prevLeftFeaMap[gl_id].x - prevRightFeaMap[gl_id].x;
-                                    if(disp_x_prev <= 0)
-                                        assert(false);
-                                    float dep = mbf/disp_x_prev;
-
-                                    if(dep > 1.5 && dep < mThDepthObj)
-                                        prev_FAST_dep[i] = dep;
-                                    else
-                                    {
-                                        status_FAST[i] = 0;
-                                        continue;
-                                    }
-                                }
-                                else
-                                {
-                                    status_FAST[i] = 0;
-                                    continue;
-                                }
-                            }
-                        }
-
-                        // if(cls_label == 0)
-                        if(is_close_static_fea)
-                        {
-                            int row_in_bloc = pt_prev.y/60;
-
-                            // 上半部分图像中拒绝那些flow绝对值太小的背景点匹配
-                            if(row_in_bloc < 3 && prev_cls == 0 && cls_label == 0)
-                            {
-                                disp_x = pt_cur.x - pt_prev.x;
-                                disp_y = pt_cur.y - pt_prev.y;
-
-                                if(disp_x * disp_x + disp_y * disp_y < Min_dist_flow * Min_dist_flow)
-                                {
-                                    status_FAST[i] = 0;
-                                    
-                                    continue;
-                                }
-                            }
-
-                            // 记录纯背景跟踪点用于校验要估计的F或H矩阵
-                            if(prev_cls == 0)
-                            {
-                                // 先不在这里记录纯背景跟踪点，而是在下面对添加的上一帧新背景点寻找立体匹配后 再记录所有有效的背景跟踪点
-                                // id_bg_track_FAST.push_back(i);
-                                ++num_track_FAST_bg;
-                            }
-                            
-                            if(reject_with_F && !only_use_track_sift_for_F)
-                            {
-                                int col_in_bloc = pt_prev.x/200;
-                                
-                                if(col_in_bloc == 6) col_in_bloc = 5;
-                                if(row_in_bloc == 6) row_in_bloc = 5;
-
-                                // 近处的点多添加一些
-                                if(row_in_bloc >= 3)
-                                {
-                                    int num_total = 7;
-                                    if(row_in_bloc > 3)
-                                    {
-                                        num_total = NUM_FEA_IN_BLOC;
-                                        // 如果该bloc内有静态物体，适当减少特征点（物体上的特征点太多且集中）
-                                        if(prev_cls > 0) 
-                                        {
-                                            num_total = 6;
-                                            // cout << "Got a static obj fea tracking!" << endl;
-                                        }
-                                    }
-
-                                    if(id_best_track_bloc[row_in_bloc][col_in_bloc] < num_total)
-                                    {
-                                        // 是否只选择多帧跟踪（这些点是否也有办法记录其quality?)，以及quality值足够高的新检测点用于估计F矩阵
-                                        // 最后还是要根据点匹配的质量的大小来排序，而不是根据点检测的质量。匹配质量越好的点，越先放入temp_pts_for_F中！
-                                        // if(i < thres_pt_id)
-                                        {
-                                            id_best_track_bloc[row_in_bloc][col_in_bloc] += 1;
-                                            temp_pts_for_F.push_back(i+1);
-                                        }
-                                        // pts_stereo_for_F;
-                                    }
-                                }
-                                else
-                                {
-                                    int num_total = 5;
-                                    float prev_dep = prev_FAST_dep[i];
-                                    // 如果该bloc内包含了近处的背景点，则增加该bloc的点数，因为一般一个物体上不会只有一个特征点
-                                    if(prev_dep > 0 && prev_dep <= 18)
-                                    {
-                                        num_total = 9;
-                                    }
-
-                                    // FAST的跟踪点中还是有在上半部分的。其来自于sift
-                                    if(id_best_track_bloc[row_in_bloc][col_in_bloc] < num_total)
-                                    {
-                                        // 是否只选择多帧跟踪（这些点是否也有办法记录其quality?)，以及quality值足够高的新检测点用于估计F矩阵
-                                        // 最后还是要根据点匹配的质量来选择，而不是根据点检测的质量
-                                        // if(i < thres_pt_id)
-                                        {
-                                            id_best_track_bloc[row_in_bloc][col_in_bloc] += 1;
-                                            temp_pts_for_F.push_back(i+1);
-                                        }
-                                        // pts_stereo_for_F;
-                                    }
-                                }
-                            }
-                        }
-
-                        if(prev_cls == 0)
-                            // 上一帧为背景点，则当前帧跟踪点的cls label与其当前帧的检测类别相一致（要么背景要么物体）
-                            obj_cls_id_FAST[i] = std::pair<uchar, int>(cls_label, obj_label);
-                        else
-                            obj_cls_id_FAST[i] = std::pair<uchar, int>(prev_cls, obj_label);
-                    }
-                    else
-                    {
-                        // 如果上一帧是物体点，需要该点在上一帧必须有深度值。物体的所有被跟踪点均在上一帧已经确定，且具有深度值！
-                        if(prev_FAST_dep[i] <= 0) 
-                        {
-                            status_FAST[i] = 0;
-                            continue;
-                        }
-
-                        // 上一帧为物体点，则当前帧跟踪点的cls label与上一帧的点一致，obj_id则仍然用临时检测物体的id
-                        obj_cls_id_FAST[i] = std::pair<uchar, int>(prev_cls, obj_label);
-                    }
-                    
-                    // 跟踪的FAST静态点(包括静态物体）数量。需要该点在上一帧为静态点（但是如果上一帧为背景点，而当前帧匹配的是物体点，则不算为静态点跟踪）
-                    if (prev_obj_state == 0 && (prev_cls > 0 || cls_label == 0))
-                    {
-                        ++num_track_FAST_static;
-                        // 长跟踪的静态FAST点数
-                        if(track_cnt_FAST[i] > 1) ++num_sta_FAST_long_track;
-                    }
-
-                    // 对于跟踪成功的物体点，在上一帧中对其进行标注
-                    if(add_new_sift_in_next_frame)
-                    {
-                        // 如果关联的两个点有一个不是背景点，则认为是物体点
-                        if(prev_cls != 0 || cls_label != 0)
-                        {
-                            circle(mask_prev_fea_objs, prev_FAST[i], 3, 0, -1);
-                        }
-                    }
-                    
-                    ++num_final_track;
-
-                    if(obj_cls_id_FAST[i].first == 0)
-                    {
-                        id_bg_track_FAST.push_back(i);
-                    }
-                }
-                else 
-                {
-                    status_FAST[i] = 0;
-                }
-            }
-        }
-
-        // 根据跟踪结果，为临时添加的上一帧新FAST点检测右图像观测
-        // 上一帧的物体FAST点 是否有立体匹配已经是在上一帧就决定了的
-        if(add_new_sift_in_next_frame)
-        {
-            int num = prev_FAST.size();
-            // 在上一帧处理后保留的点 在上一帧中的立体匹配是在上一帧中就尝试寻找了，这里只为那些在当前帧新添加的上一帧点（指的是上面检测的新背景点。不包括从sift转化来的新FAST点）
-            if(num > num_orig_FAST)
-            {
-                vector<Point2f> tracked_new_pt;
-                vector<int> id_for_r;
-                for(int k = num_orig_FAST; k < num; ++k)
-                {
-                    if(status_FAST[k])
-                    {
-                        tracked_new_pt.push_back(prev_FAST[k]);
-                        id_for_r.push_back(k);
-                    }
-                }
-                
-                if(tracked_new_pt.size() > 0)
-                {
-                    // 首先为这些新特征点设置右匹配点的预测值
-                    float ave_disp_x_bg = mbf/(2.0/3*mMinDepthPt + 1.0/3*mThDepthBg);
-                    float ave_disp_y_bg = Y_shift_right_image/(2.0/3*mMinDepthPt + 1.0/3*10);
-                    vector<Point2f> pts_right;
-                    float r_x, r_y;
-
-                    for(auto &pt:tracked_new_pt)
-                    {
-                        float disp = prev_dep_map.at<float>(pt.y,pt.x);
-                        if(disp <= 0)
-                        {
-                            // assert(disp>0 && "Why value in disp_map <= 0?");
-                            r_x = pt.x - ave_disp_x_bg;
-                            r_y = min(pt.y+ave_disp_y_bg, (float)(row-5));
-                        }
-                        else
-                        {
-                            float depth = mbf/disp;
-                            float shift_y = Y_shift_right_image/depth;
-                            r_x = pt.x - disp;
-                            r_y = min(pt.y+shift_y, (float)(row-5));
-                        }
-
-                        if(r_x >= 5 && r_x <= bg_right_border_right_img)
-                            pts_right.emplace_back(r_x, r_y);
-                        else if (r_x < 5)
-                            pts_right.emplace_back(5, r_y);
-                        else
-                            pts_right.emplace_back(bg_right_border_right_img, r_y);
-                    }
-                    
-                    // 为上一帧每个新点寻找立体匹配
-                    vector<uchar> statusLR;
-                    vector<cv::Point2f> reverseLeftPts;
-                    vector<uchar> statusRL;
-                    vector<float> err;
-                    Point2f prev_pt_r, prev_un_pt_r;
-                    float disp_x, disp_y;
-
-                    // float max_disp = mbf/mMinDepthPt;
-                    float max_disp = mbf/1.5;
-
-                    float min_disp = mbf/mThDepthBg;
-                    // float min_disp = mbf/15.0;
-
-                    float close_pt_disp = mbf/18.0;
-
-                    // cout << "Start stereo match for FAST in right image!" << endl;
-                    // // cur left ---- cur right
-                    // // 注意，无论有没有预测值，cur_right_pts和status的长度都与cur_pts的是一样的，status的值会指示cur_right_pts中的对应元素是否为有效的光流估计匹配点
-                    cv::calcOpticalFlowPyrLK(prev_img, prev_img_r, tracked_new_pt, pts_right, statusLR, err, cv::Size(21, 21), 2,
-                                            cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
-                    FLOW_BACK = 1;
-                    if(FLOW_BACK)
-                    {
-                        vector<float> err_reserve;
-                        reverseLeftPts = tracked_new_pt;
-                        cv::calcOpticalFlowPyrLK(prev_img_r, prev_img, pts_right, reverseLeftPts, statusRL, err_reserve, cv::Size(15, 15), 2,
-                                                cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
-                    }
-                    
-                    uchar succ;
-                    for(int i = 0; i < statusLR.size(); ++i)
-                    {
-                        if(FLOW_BACK)
-                        {
-                            succ = statusLR[i] * statusRL[i];
-                        }
-                        
-                        Point2f &prev_pt = tracked_new_pt[i];
-                        int row_in_bloc = prev_pt.x/60;
-                        int id = id_for_r[i];
-
-                        if(succ && distance(tracked_new_pt[i], reverseLeftPts[i]) < 0.6)
-                        {
-                            Point2f &prev_pt_r = pts_right[i];
-                            disp_x = prev_pt.x - prev_pt_r.x;
-                            disp_y = prev_pt.y - prev_pt_r.y;
-                            
-                            // 太远或太近的跟踪点放弃
-                            // if(disp_x < min_disp || disp_x > max_disp) continue;
-                            if(disp_x < min_disp || disp_x > max_disp) 
-                            {
-                                status_FAST[id] = 0;
-                                continue;
-                            }
-
-                            // 大于18m的点仍为深度估计不够准确，放弃该立体匹配
-                            if(disp_x < close_pt_disp)
-                            {
-                                // 只是放弃该立体匹配，但是不放弃该跟踪点
-                                // status_FAST[id] = 0;
-                                continue;
-                            }
-
-                            // 如果该立体匹配不太准确，则放弃该立体匹配，但是仍保留该跟踪点
-                            // disp_y如何限制？KITTI的标定数据表明img2的相同点要比在img_3中的位置高（y坐标小），这个差距与点的depth有关
-                            if(abs(disp_y) > 1.1) continue;
-
-                            int g_id = ids_FAST[id];
-
-                            float dep = mbf/disp_x;
-
-                            // 基于该深度值，使用预测的相机位姿进行重投影，如果与flow估计的当前帧匹配点的误差大于阈值，则放弃该深度
-                            if(frame_count > 1)
-                            {
-                                Vec4f &un_pt_prev = prev_un_Fea_map[g_id];
-                                float p_X = un_pt_prev(0) * dep;
-                                float p_Y = un_pt_prev(1) * dep;
-                                
-                                Vector3d prev_3d(p_X, p_Y, dep);
-                                Vector3d proj_cur = R_cam_motion * prev_3d + P_cam_motion;
-                                
-                                if(proj_cur(2) == 0)
-                                    continue;
-                                else
-                                {
-                                    Point2f pred_cur;
-                                    spaceToPlane(proj_cur, pred_cur, m_camera[0]);
-                                    Point2f &cur_fea = cur_FAST[id];
-                                    
-                                    // 由于恒速运动模型得到的运动预测不是很精确，因此阈值反大一些
-                                    if((pred_cur.x - cur_fea.x)*(pred_cur.x - cur_fea.x) + (pred_cur.y - cur_fea.y)*(pred_cur.y - cur_fea.y) > 18 * 18)
-                                        continue;
-                                }
-                            }
-
-                            prevRightFeaMap[g_id] = prev_pt_r;
-                            undistortedPts(prev_pt_r, prev_un_pt_r, m_camera[1]);
-                            prev_un_r_Fea_map[g_id] = Vec4f(prev_un_pt_r.x, prev_un_pt_r.y, 0.0, 0.0);
-
-                            if(!use_tria_stereo)
-                            {                       
-                                prev_FAST_dep[id] = dep;
-                            }
-                        }
-                        else
-                        {
-                            // 上半部分的跟踪点只能是来自之前某帧的sift？
-                            // 每一帧只在图像下半部检测新的背景跟踪点，上上帧新检测的FAST点应该不会在上一帧中出现在上半部图像，除非汽车倒退运动
-                            // 因此上半部分的跟踪点不会是这里的新跟踪点
-                            if(row_in_bloc < 3)
-                            {
-                                if(obj_cls_id_FAST[id].first > 0) 
-                                    status_FAST[id] = 0;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 记录纯背景跟踪点
-        // 应该在上面遍历跟踪结果时记录，这样可以按照跟踪质量从好到坏先后记录
-        // for(int i = 0; i < ids_FAST.size(); ++i)
-        // {
-        //     if(status_FAST[i] == 0) continue;
-        //     if(obj_cls_id_FAST[i].first == 0)
-        //     {
-        //         id_bg_track_FAST.push_back(i);
-        //     }
-        // }
-    }
-
-    end_FAST_track = true;
-    printf("optical flow of FAST costs: %fms \n", t_o.toc());
-}
-
-// 将当前帧检测和完成匹配的sift，分配到相应变量中，包括当前左图像中的sift点（与上一帧有匹配关系，不论其在当前帧中是否有深度匹配；以及当前左图像中的新sift点，需要有有效深度匹配）
-void FeatureTracker::select_sift_V1(int frame_count, const cv::Mat &_img1, const cv::Mat &seg_map_prev, const cv::Mat &seg_map_cur, 
-                                    const cv::Mat &map_depth_prev, const cv::Mat &flow_map, bool &end_flow_post, bool init_succ_IMU, bool use_mask_img)
-{
-    cout << "Start selcct sift!" << endl;
-    TicToc t_o;
-
-    frame_cnt = frame_count;
-    // add_new_FAST_from_sift = false;
-    
-    // 去除GPU线程中的postprocess()!将sift的后处理（选择有效的match）放在此处，减少GPU中其他任务的等待时间。
-    // 对于sift点，其允许检测的最小深度值改为1.5m，因为暴力匹配允许更大的视差估计（1.5m对应的视差值为256）
-    // float max_shift_y = Y_shift_right_image/mMinDepthPt;
-    float max_shift_y = Y_shift_right_image/1.5;
-    vector<int> temp_flow_pt_id;
-
-    // 选择sift跟踪点 和 潜在跟踪点
-    if(frame_cnt > 0) 
-        Sift_->select_flow_matching(Y_shift_right_image/mMinDepthPt, seg_map_prev, seg_map_cur, mask_bg_prev, num_flow_pt_in_bloc, num_temp_flow_pt_in_bloc, 
-                                num_long_track_FAST_in_bloc, prev_FAST, track_cnt_FAST, temp_flow_pt_id, prev_color_img_l, use_mask_img);
-    
-    Sift_->select_stereo_matching(Y_shift_right_image/mMinDepthPt);
-    
-    num_track_sift_bg = 0;
-    num_track_sift_static = 0;
-    num_sta_sift_long_track = 0;
-    
-    if(!cur_sift.empty()) cur_sift.clear();
-    
-    cur_sift_index.clear();
-    
-    int shift_index = 10000;
-
-    sift_no_stereo_bg.clear();
-    
-    // 在上一帧中就已经被跟踪的背景点或物体点（在当前帧如果再被跟踪，则为long track），以及上一帧添加的新物体点（有深度值）
-    set<int> tracked_objs_long_bg;
-    
-    vector<uchar> is_tracked;
-    // 前后帧中sift跟踪点的筛选
-    // prev_sift中保存的点，是上一帧中的跟踪点；即每一帧在prev_sift中只保留跟踪点，而不放入新的sift点（也可以选择放入，代码有这样的设计）。
-    // 因此，如果是prev_sift中的点在当前帧仍被观测到，则意味是观测至少连续3帧的点
-    if (prev_sift.size() > 0)
-    {
-        // status_sift.resize(prev_sift.size(),0);
-        int* valid_match_flow_ptr;
-        SiftData *sift_data;
-        SiftPoint *h1_siftpts;
-        int init_index, end_index;
-        int shift_id;
-        int num_sift_bg_prev_ = num_sift_bg_prev;
-        
-        status_sift.resize(prev_sift_index.size(), 0);
-
-        int num_prev_sift = prev_sift.size();
-
-        cur_sift.resize(prev_sift_index.size(), cv::Point2f(0, 0));
-        cur_sift_index.resize(prev_sift_index.size(), 0);
-
-        for(int n_img = 0; n_img < 2; ++n_img)
-        {
-            // 设置参数的值
-            if(n_img == 0)
-            {
-                valid_match_flow_ptr = Sift_->img1.h_matching_pts_flow;
-                sift_data = &(Sift_->siftData1);
-                h1_siftpts = Sift_->siftData1.h_data;
-                init_index = 0;
-                // 对于原始图像上的sift跟踪，由于上一帧masked_img上的跟踪点排在原始图像上new sift点前面，因此这里只能全部遍历
-                // end_index = num_sift_bg_prev_;
-                end_index = num_prev_sift;
-                shift_id = 0;
-            }
-            else if(use_mask_img)
-            {
-                valid_match_flow_ptr  = Sift_->img4.h_matching_pts_flow;
-                sift_data = &(Sift_->siftData4);
-                h1_siftpts = Sift_->siftData4.h_data;
-                init_index = num_sift_bg_prev_;
-                end_index = num_prev_sift;
-                shift_id = shift_index;
-            }
-            else
-                break;
-            
-            int num_match_flow = valid_match_flow_ptr[0];
-            if(num_match_flow == 0) continue;
-
-            vector<int> valid_match_flow;
-            valid_match_flow.reserve(num_match_flow);
-            // 用reserve和assign来快速将数组中的元素复制到vector中，注意，assign中的第二个元素应该是对应vector的end()位置，因此应该是被最后一个被复制数组元素的下一位
-            valid_match_flow.assign(valid_match_flow_ptr+1, valid_match_flow_ptr+num_match_flow+1);
-
-            if(n_img == 0) is_tracked.resize(num_match_flow,0);
-
-            const vector<float> &valid_disp_x = sift_data->valid_disp_x;
-            const vector<float> &valid_disp_y = sift_data->valid_disp_y;
-            Vec2b info_pt;
-            int id_in_pts;
-            Point2f cur_pt;
-
-            // TODO：对于sift点，应该也可以计算其在当前帧的预测像素坐标，这样就可以计算出flow_u、flow_v以及disp_x和disp_y的预估值，用于这里匹配点的筛选！！
-            for (int i = init_index; i < end_index; ++i)
-            {
-                // int validpts_id = valid_match_flow[i];
-                // 只从上一帧的有效sift点（包括与上上帧的匹配点，也包括没与上上帧匹配，但是在上一帧中有立体匹配且深度值符合要求的sift点）中选取与当前帧的匹配点
-                // 上一帧的img2和当前帧的img1的数据是完全相同的，每帧保留img2中保留的sift点（包括与img1的匹配以及img2中的新sift点）的index，这些点就是当前img1的待跟踪点
-                // vector<int>::iterator iter = std::find(prev_sift_index.begin(),prev_sift_index.end(), validpts_id); 
-                // if (iter==prev_sift_index.end()) {
-                //     continue;
-                // }
-
-                int validpts_id = prev_sift_index[i];
-                // 上一帧的某些跟踪点，是通过上上帧的sift检测点（有立体匹配）和光流金字塔的得到的匹配点，其本质应该是上一帧的FAST点了
-                if(validpts_id < 0)
-                {
-                    continue;
-                }
-
-                if(validpts_id >= shift_index)
-                {
-                    if(n_img == 0) continue;
-                    validpts_id -= shift_index;
-                }
-
-                vector<int>::iterator iter = std::find(valid_match_flow.begin(),valid_match_flow.end(),validpts_id);
-                // 如果跟踪点不在上一帧保留的sift点集中
-                if (iter == valid_match_flow.end())
-                {
-                    continue;
-                }
-                
-                if(n_img == 0)
-                {
-                    int id = std::distance(valid_match_flow.begin(),iter);
-                    is_tracked[id] = 1;
-                }
-
-                //int cord_x = h1_siftpts[validpts_id].xpos;
-                //int cord_y = h1_siftpts[validpts_id].ypos;
-                
-                float match_x = h1_siftpts[validpts_id].match_xpos;
-                float match_y = h1_siftpts[validpts_id].match_ypos;
-                info_pt = seg_map_cur.at<Vec2b>(match_y,match_x);
-                uchar cls_label = info_pt[0];
-                
-                // don't consider points of person, rider, bicycle and train. Consider points of car, bus, truck
-                if (cls_label == 1 || cls_label == 2 || cls_label == 4 || cls_label == 7) continue;
-
-                cur_pt.x = match_x;
-                cur_pt.y = match_y;
-
-                if(!inBorder(cur_pt)) continue;
-                
-                uchar obj_id = info_pt[1];
-
-                float disp_x = valid_disp_x[validpts_id];
-                float disp_y = valid_disp_y[validpts_id];
-                // int id_index = std::distance(prev_sift_index.begin(), iter);
-                int id_index = i;
-                uchar cls_prev = obj_cls_id_sift[id_index].first;
-
-                // obj_cls_id_sift :fist - class label of point; second - dynamic object id (static object and background - 0)
-                // 前后两帧都是背景点，则光流值应该很小。太过近处的静态SIFT即使会被错误滤除，也很可能可以用FAST点来替补。
-                // 直接舍弃连续两帧yolo都漏检同个动态物体的那部分特征点！
-                //if (cls_label == obj_cls_id_sift[id_index].first && obj_id == 0 && abs(disp_x) < 1280/10.0 && abs(disp_y) < 384/6.0)
-                // 匹配的disp其实已经在select_matching中进行筛选过了，但是这里再根据所属物体的动态性来细化点的匹配可信度
-                // if (cls_label == obj_cls_id_sift[id_index].first && cls_label == 0)
-                if (cls_label == obj_cls_id_sift[id_index].first && cls_label == 0 && abs(disp_x) < 1280/10.0 && abs(disp_y) < 384/6.5)
-                {
-                    ++num_track_sift;
-                    cur_sift[id_index] = cur_pt;
-                    // 当前点的匹配点在其siftdata检测点集中的index,这里是siftdata2
-                    cur_sift_index[id_index] = (h1_siftpts[validpts_id].match+shift_id);
-                    status_sift[id_index] = 1;
-                    // 后续根据物体的运动状态的判定结果和这里的局部obj_id来更改sift点的全局id！obj_cls_id_sift这个量由上一帧的量修改为表示当前帧的，然后用reduceVector来去除多余
-                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(0, obj_id);
-                    // 记录背景上的sift点个数
-                    ++num_track_sift_bg;
-                    // 记录跟踪的静态sift点数
-                    ++num_track_sift_static;
-                    // 记录长跟踪静态点的个数
-                    if(track_cnt_sift[id_index] > 1) ++num_sta_sift_long_track;
-
-                    if(n_img == 0) id_bg_track_sift.push_back(id_index);
-
-                }
-                // 上一帧的静态物体sift点（即上一帧的全局obj id为0，但cls不为0），即使其（所在物体）在当前两帧之间变为动态的，其光流值也不会太大（物体刚启动运动）。
-                // 这些sift点暂时不归为背景sift点，等到确定该物体是否运动后再归类！
-                else if (cls_label == obj_cls_id_sift[id_index].first && cls_label > 0 && obj_cls_id_sift[id_index].second == 0 && abs(disp_x) < 1280/10.0 && abs(disp_y) < 384/6.5)
-                {
-                    ++num_track_sift;
-                    cur_sift[id_index] = cur_pt;
-                    cur_sift_index[id_index] = (h1_siftpts[validpts_id].match+shift_id);
-                    status_sift[id_index] = 1;
-                    // 物体id按当前帧的局部编号来，等物体关联之后再等其进行更新。
-                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(cls_label, obj_id);
-                    ++num_track_sift_static;
-
-                    // id_bg_track_sift.push_back(id_in_pts);
-
-                    if(track_cnt_sift[id_index] > 1) ++num_sta_sift_long_track;
-                }
-                // 上上帧与上一帧之间是动态或新的物体，其在上一帧到当前帧之间也可能变成静态的。这种情况在这里可以也按动态物体的标准来衡量（虽然可能会造成一定的误匹配，但概率会比较小）。
-                // 后续根据物体运动状态的判定来更改其对应sift点的全局id。
-                else if (cls_label == obj_cls_id_sift[id_index].first && obj_cls_id_sift[id_index].second > 0 && abs(disp_x) < 1280/8.0 && abs(disp_y) < 384/5.0)
-                //else if (cls_label == obj_cls_id_sift[id_index].first && obj_id > 0 && abs(disp_x) < 1280/4.0 && abs(disp_y) < 384/2.0)
-                {
-                    ++num_track_sift;
-                    cur_sift[id_index] = cur_pt;
-                    cur_sift_index[id_index] = (h1_siftpts[validpts_id].match+shift_id);
-                    status_sift[id_index] = 1;
-                    // 物体id按当前帧的局部编号来，等物体关联之后再等其进行更新。
-                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(cls_label, obj_id);
-                }
-                // 漏检或者错检的物体的配对，在系统前两帧暂时不考虑，因为首帧无法得知各物体的运动状态！！对于首帧的误检物体的特征点匹配，依赖于flow_map提供FAST点的预测和匹配。
-                // 上一帧点为运动或新的物体，且与当前帧匹配点类别不同（当前帧可能为背景，也可能为物体），则可能是当前帧漏检该运动物体（为背景点）或者错分类该物体，则按照动态光流来约束
-                else if (cls_label != obj_cls_id_sift[id_index].first && obj_cls_id_sift[id_index].second > 0 && abs(disp_x) < 1280/8.0 && abs(disp_y) < 384/5.0)
-                {
-                    ++num_track_sift;
-                    cur_sift[id_index] = cur_pt;
-                    cur_sift_index[id_index] = (h1_siftpts[validpts_id].match+shift_id);
-                    status_sift[id_index] = 1;
-                    uchar prev_cls = obj_cls_id_sift[id_index].first;
-                    // 物体id按当前帧的局部编号来，等物体关联之后再对其进行更新。
-                    // 物体类别则与上一帧的匹配物体点对齐，当前帧匹配点的检测分类可以从seg_map中查询
-                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(prev_cls, obj_id);
-                }
-                // 上一帧点为静态物体(明确不是背景），且与当前帧匹配点类别不同（当前帧可能为背景或其他物体），则可能是当前帧漏检该静态物体（为背景点）或者错分类该物体，则按照静态光流来约束
-                else if (cls_label != obj_cls_id_sift[id_index].first && cls_label >0 && obj_cls_id_sift[id_index].second == 0 && abs(disp_x) < 1280/10.0 && abs(disp_y) < 384/6.5)
-                {
-                    ++num_track_sift;
-                    cur_sift[id_index] = cur_pt;
-                    cur_sift_index[id_index] = (h1_siftpts[validpts_id].match+shift_id);
-                    status_sift[id_index] = 1;
-                    uchar prev_cls = obj_cls_id_sift[id_index].first;
-                    // 物体id按当前帧的局部编号来，等物体关联之后再对其进行更新。
-                    // 物体类别则与上一帧的匹配物体点对齐，当前帧匹配点的检测分类可以从seg_map中查询
-                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(prev_cls, obj_id);
-                    ++num_track_sift_static;
-                    if(track_cnt_sift[id_index] > 1) ++num_sta_sift_long_track;
-                }
-                // 上一帧点为背景点，当前帧点为物体点，则可能是上一帧漏检了该物体且该点没有与上上帧的物体SIFT点相关联（因为没有被校正cls），则此时无法确定该物体是否为动态的。还是采用动态光流的阈值
-                else if (cls_label != obj_cls_id_sift[id_index].first && obj_cls_id_sift[id_index].first == 0 && abs(disp_x) < 1280/8.0 && abs(disp_y) < 384/5.0)
-                {
-                    // 如果该背景点被多帧观测（多帧观测的情况下则确定该点原本为背景点），则不太可能当前帧突然变为物体点
-                    if (track_cnt_sift[id_index] > 1) continue;
-                    // 如果该点在上一帧中没有深度值，则不采用该跟踪点，因为这样无法参与估计该漏检物体的运动！
-                    if(prev_sift_dep[id_index] <= 0) continue;
-                    ++num_track_sift;
-                    cur_sift[id_index] = cur_pt;
-                    cur_sift_index[id_index] = (h1_siftpts[validpts_id].match+shift_id);
-                    status_sift[id_index] = 1;
-                    // 物体id按当前帧的局部编号来，等物体关联之后再对其进行更新。
-                    // 上一帧的背景点对齐到当前帧的物体点时，使用当前帧的物体类别，后续则可以根据上一帧的点的全局id来判断该点是否为背景点
-                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(cls_label, obj_id);
-                }
-
-                if(add_new_sift_in_next_frame)
-                {
-                    // 如果关联的两个点有一个不是背景点，则认为是物体点
-                    if(cls_prev != 0 || cls_label != 0)
-                    {
-                        circle(mask_prev_fea_objs, prev_sift[id_index], 3, 0, -1);
-                    }
-                    
-                    tracked_objs_long_bg.insert(validpts_id);
-                }
-            }
-            // 这个值不是单指背景上的跟踪点，而是在原始的seg_map上的跟踪点，包含了背景和物体的跟踪点
-            if(n_img == 0) num_sift_bg_cur = num_track_sift;
-            // 重置图像的有效跟踪点数，以免下帧没有sift跟踪点（可能在别处该点没重置？）
-            if(n_img == 1 && use_mask_img) valid_match_flow_ptr[0] = 0;
-        }
-    }
-    
-    // 如果下面要进行rejectWithF，则这里先不删除外点，而是等到rejectWithF中进行。
-    // 算了，即使不进行极线约束的筛选，跟踪的sift点也不一定全部都会被保留，这取决于FAST跟踪点和sift跟踪点的优先级，有些情况下FAST跟踪点需要先标注，这可能会覆盖某些sift跟踪点。sift无效点的删除放在之后
-    // if(!ids_sift.empty())
-    // {
-    //     if(!reject_with_F)
-    //         reduce_invalid_fea(true);
-    // }
-
-    // 添加当前帧图像中有效的背景跟踪sift点中 不在上一帧保留点中 的点
-    // 这部分点其实占当前帧sift跟踪点的大多数，如果要通过三角化测量来获取更多有深度值的点，则必须添加这部分点
-    int prev_pts_with_stereo = 0;
-    set<int> pt_stereo_with_flow;
-    if(frame_count > 0)
-    {
-        int* valid_match_flow_ptr = Sift_->img1.h_matching_pts_flow;
-        SiftData *sift_data = &(Sift_->siftData1);
-        SiftPoint *h1_siftpts = Sift_->siftData1.h_data;
-
-        int num_match_flow = valid_match_flow_ptr[0];
-        
-        const vector<float> &valid_disp_x = sift_data->valid_disp_x;
-        const vector<float> &valid_disp_y = sift_data->valid_disp_y;
-        Point2f prev_pt, prev_pt_r, cur_pt, prev_un_pt, prev_un_pt_r, cur_un_pt;
-
-        int id_in_pts = cur_sift.size();
-
-        bool has_track = !is_tracked.empty();
-        // bool first_add = true;
-        float disp_prev, dep_prev;
-        float match_xpos_r, match_ypos_r, disp_match_x_r, disp_match_y_r;
-
-        vector<Point2f> temp_track;
-        vector<int> temp_track_pt_g_id, temp_track_pt_l_id;
-
-        for(int k = 0; k < num_match_flow; ++k)
-        {
-            int pts_id = valid_match_flow_ptr[(k+1)];
-            // 在上面已经添加了的跟踪点
-            if(has_track && is_tracked[k] == 1) 
-            {
-                if(find(temp_flow_pt_id.begin(),temp_flow_pt_id.end(),pts_id) != temp_flow_pt_id.end())
-                {
-                    pt_stereo_with_flow.insert(pts_id);
-                    ++prev_pts_with_stereo;
-                }    
-                
-                continue;
-            }
-
-            float prev_x = h1_siftpts[pts_id].xpos;
-            float prev_y = h1_siftpts[pts_id].ypos;
-            float match_x = h1_siftpts[pts_id].match_xpos;
-            float match_y = h1_siftpts[pts_id].match_ypos;
-            
-            // 均匀化分布的设置已经在match_selecting()函数中完成了。这里无需再次标注和查看
-
-            // uchar cls_label_prev = mask_bg_prev.at<uchar>(prev_y,prev_x);
-            // uchar cls_label_cur = mask_bg.at<uchar>(match_y,match_x);
-            // // 只增加背景中的跟踪点，且不能和上一帧保留的bg上的sift点靠得太近
-            // if (cls_label_prev == 0 || cls_label_cur == 0) continue;
-            
-            uchar cls = seg_map_prev.at<Vec2b>(prev_y, prev_x)(0);
-            Vec2b pt_cur = seg_map_cur.at<Vec2b>(match_y, match_x);
-            // 物体的跟踪点中，所有在上一帧有深度估计的点均在上面已经选取了(其中有深度的点包括sift立体匹配，也包括在上一帧用光流金字塔估计得到的深度值，或者用估计的运动来计算深度值)
-            // 即每一帧保留的物体sift点都必须是有深度值的，包括跟踪点和新点
-            if(cls != 0) continue;
-
-            // 非考虑类别的物体
-            uchar cls_cur = pt_cur(0);
-            if(cls_cur == 1 || cls_cur == 2 || cls_cur == 4 || cls_cur == 7) continue;
-
-            auto iter = find(temp_flow_pt_id.begin(),temp_flow_pt_id.end(),pts_id);
-            bool valid_prev_stereo, valid_prev_dep_pred;
-            valid_prev_stereo = false;
-            // 如果该跟踪点在上一帧没有立体匹配
-            if(iter == temp_flow_pt_id.end())
-            {
-                temp_track.emplace_back(prev_x, prev_y);
-                temp_track_pt_g_id.push_back(n_id);
-                temp_track_pt_l_id.push_back(id_in_pts);
-
-                // 用上一帧的depth_map给上一帧的点提供深度值，后续用预测的2帧间相机运动（IMU积分或者相机恒速模型）来排除明显不符合的深度值
-                disp_prev = map_depth_prev.at<float>(prev_y,prev_x);
-                valid_prev_dep_pred = true;
-                if(disp_prev <= 0 || disp_prev >= 192) valid_prev_dep_pred = false;
-                dep_prev = mbf/disp_prev;
-                if(dep_prev < mMinDepthPt || dep_prev > mThDepthBg) valid_prev_dep_pred = false;
-            }
-            else
-            {
-                pt_stereo_with_flow.insert(pts_id);
-
-                float *prev_info_ptr = Sift_->prev_stereo_match_info + 5 * pts_id;
-                match_xpos_r = prev_info_ptr[3]; 
-                match_ypos_r = prev_info_ptr[4];
-
-                disp_match_x_r = prev_x - match_xpos_r;
-                disp_match_y_r = prev_y - match_ypos_r;
-                assert(disp_match_x_r > 0);
-                dep_prev = mbf/disp_match_x_r;
-                valid_prev_stereo = true;
-            }
-
-            prev_pt.x = prev_x;
-            prev_pt.y = prev_y;
-            cur_pt.x = match_x;
-            cur_pt.y = match_y;
-
-            undistortedPts(prev_pt, prev_un_pt, m_camera[0]);
-
-            prev_sift.emplace_back(prev_x, prev_y);
-
-            cur_sift.emplace_back(match_x,match_y);
-
-            // 对于用depth_map获取的上一帧的sift点深度，就不添加右观测点了。后续如果参与LBA，则只会根据前后帧的投影误差来优化首帧点深度
-            // if(prevLeftFeaMap.empty()) assert(false && "Weired! There is no any fea in last frame!");
-            prevLeftFeaMap[n_id] = prev_pt;
-            prev_un_Fea_map[n_id] = Vec4f(prev_un_pt.x, prev_un_pt.y, 0.0, 0.0);
-            ids_sift.push_back(n_id);
-            
-            // 在上一帧中是否保留了有立体匹配的新sift点的信息。这里倾向于不保存
-            if(0 && new_sift_stereo_prev.find(pts_id) != new_sift_stereo_prev.end())
-            {
-                Vec<float,8> &prev_new = new_sift_stereo_prev[pts_id];
-                prevRightFeaMap[n_id] = Point2f(prev_new(4), prev_new(5));
-                prev_un_r_Fea_map[n_id] = Vec4f(prev_new(6), prev_new(7), 0.0 ,0.0);
-                
-                if(!use_tria_stereo)
-                {
-                    assert(prev_x == prev_new(0) && "something worng with new_sift_stereo_prev!");
-                    dep_prev = mbf/(prev_x - prev_new(4));
-                    valid_prev_dep_pred = true;
-                }
-
-                if(has_track) is_tracked[k] = 1;
-                new_sift_stereo_prev.erase(pts_id);
-            }
-
-            // if(has_track) is_tracked[k] = 1;
-            if(valid_prev_stereo)
-            {
-                prev_pt_r.x = match_xpos_r;
-                prev_pt_r.y = match_ypos_r;
-                undistortedPts(prev_pt_r, prev_un_pt_r, m_camera[1]);
-
-                prevRightFeaMap[n_id] = prev_pt_r;
-                prev_un_r_Fea_map[n_id] = Vec4f(prev_un_pt_r.x, prev_un_pt_r.y, 0.0 ,0.0);
-            }
-
-            // if(first_add)
-            // {
-            //     id_new_track_sift = n_id;
-            //     first_add = true;
-            // }
-
-            // 是否要从depth_map中获取深度值。
-            // 这部分点寻求使用2帧的三角化来获得在上一帧中的深度值，包括首帧左右2帧或者前后2帧
-            if(use_tria_stereo)
-            {
-                prev_sift_dep.push_back(-1.0);
-            }
-            else
-            {
-                if(valid_prev_stereo)
-                {
-                    prev_sift_dep.push_back(dep_prev);
-                }
-                else
-                    prev_sift_dep.push_back(-1.0);
-            }
-
-            // 记录当前帧该跟踪点在当前帧的检测sift点集中的序号
-            cur_sift_index.push_back(h1_siftpts[pts_id].match);
-            prev_sift_global_obj_id.push_back(0);
-            // 因为上一帧该点是背景点，因此按照当前帧匹配点的检测cls 和 local obj_id
-            obj_cls_id_sift.emplace_back(pt_cur(0),pt_cur(1));
-            track_cnt_sift.push_back(1);
-            status_sift.push_back(1);
-            ++n_id;
-
-            // ++num_sift_bg_cur;
-            ++num_track_sift;
-
-            // 记录用于估计F矩阵的sift跟踪点在cur_sift中的序号
-            
-            // 如果上一帧和当前帧都是背景点，则是背景点
-            if(pt_cur(0) == 0) id_bg_track_sift.push_back(id_in_pts);
-            ++id_in_pts;
-        }
-
-        // 为跟踪的sift点在上一帧寻找右观测点
-        if(!temp_track.empty())
-        {
-            float ave_disp_x_bg = mbf/(2.0/3*mMinDepthPt + 1.0/3*mThDepthBg);
-            float ave_disp_y_bg = Y_shift_right_image/(2.0/3*mMinDepthPt + 1.0/3*10);
-            vector<Point2f> temp_track_r;
-            float r_x, r_y;
-            for(auto &pt:temp_track)
-            {
-                float disp = map_depth_prev.at<float>(pt.y,pt.x);
-                if(disp <= 0)
-                {
-                    // assert(disp>0 && "Why value in disp_map <= 0?");
-                    r_x = pt.x - ave_disp_x_bg;
-                    r_y = min(pt.y+ave_disp_y_bg, (float)(row-5));
-                }
-                else
-                {
-                    float depth = mbf/disp;
-                    float shift_y = Y_shift_right_image/depth;
-                    r_x = pt.x - disp;
-                    r_y = min(pt.y+shift_y, (float)(row-5));
-                }
-                if(r_x >= 5 && r_x <= bg_right_border_right_img)
-                    temp_track_r.emplace_back(r_x, r_y);
-                else if (r_x < 5)
-                    temp_track_r.emplace_back(5, r_y);
-                else
-                    temp_track_r.emplace_back(bg_right_border_right_img, r_y);
-            }
-
-            vector<float> err;
-            vector<uchar> status_temp;
-            cv::calcOpticalFlowPyrLK(prev_img, prev_img_r, temp_track, temp_track_r, status_temp, err, cv::Size(21, 21), 3, 
-            cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
-            
-            // FLOW_BACK = false;
-            // reverse check  逆向光流计算，用上面光流计算出的当前帧中特征点位置 再 计算到上一帧的光流匹配，如果得到检测位置和上一帧的点原始位置距离相差很小，则认为光流成功
-            FLOW_BACK = true;
-            if(FLOW_BACK)
-            {
-                vector<uchar> reverse_status;
-                vector<cv::Point2f> reverse_pts = temp_track;
-                cv::calcOpticalFlowPyrLK(prev_img_r, prev_img, temp_track_r, reverse_pts, reverse_status, err, cv::Size(15, 15), 1, 
-                cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
-                //cv::calcOpticalFlowPyrLK(cur_img, prev_img, cur_FAST, reverse_pts, reverse_status, err, cv::Size(21, 21), 3); 
-                for(size_t i = 0; i < status_temp.size(); ++i)
-                {
-                    if(status_temp[i] && reverse_status[i] && distance(temp_track[i], reverse_pts[i]) <= 0.5)
-                    {
-                        continue;
-                    }
-                    else
-                        status_temp[i] = 0;
-                }
-            }
-
-            Point2f prev_un_pt_r;
-            for (size_t i = 0; i < status_temp.size(); ++i)
-            {
-                if (!status_temp[i])
-                {
-                    int l_id = temp_track_pt_l_id[i];
-                    // 物体点在上一帧的漏检点如果没有深度值，则放弃该点（其实也可以不用放弃，用作2个物体的点关联，以便开启像素关联验证）
-                    if(obj_cls_id_sift[l_id].first > 0) 
-                        status_sift[l_id] = 0;
-                    // 如果背景跟踪点在上一帧没有立体匹配，且此系统不允许2-frame的三角化深度测量，则放弃此点
-                    else if(!USE_TRIANGULATE_TWO_FRAME)
-                        status_sift[l_id] = 0;
-                    continue;
-                }
-                
-                Point2f &prev_pt = temp_track[i];
-                Point2f &prev_pt_r = temp_track_r[i];
-                float disp_r = prev_pt.x - prev_pt_r.x;
-
-                // 大于最大深度，或小于1.5m的点，都不要了
-                if(disp_r <= mbf/mThDepthBg || disp_r > 256) 
-                {
-                    // assert(false && "Find a right point with r_x less than r_l!");
-                    continue;
-                }
-
-                ++prev_pts_with_stereo;
-                int gl_id = temp_track_pt_g_id[i];
-                prevRightFeaMap[gl_id] = prev_pt_r;
-                undistortedPts(prev_pt_r, prev_un_pt_r, m_camera[1]);
-                prev_un_r_Fea_map[gl_id] = Vec4f(prev_un_pt_r.x, prev_un_pt_r.y, 0.0 ,0.0);
-
-                // 如果不需要三角化才得到深度值（即认为立体校正足够好）
-                if(!use_tria_stereo) 
-                {
-                    int l_id = temp_track_pt_l_id[i];
-                    float dep = mbf/disp_r;
-                    prev_sift_dep[l_id] = dep;
-                }
-            }
-        }
-
-        valid_match_flow_ptr[0] = 0;
-    
-    
-        // 注意，temp_flow_pt_id中前面部分点是跟踪点，即在pt_stereo_with_flow中，应该略去！
-        // 这些上一帧有立体匹配的sift点，采用与FAST一样的跟踪方式，因此就相当于是上一帧的新FAST点了！
-        // 因此，FAST的跟踪要在这里完成之后才进行。
-        bool find_flow_for_stereo_match = true;
-        if(find_flow_for_stereo_match)
-        {
-            // vector<Point2f> temp_track_prev, temp_track_cur, temp_track_prev_r, temp_track_cur_r;
-            Point2f prev_pt, prev_un_pt, prev_pt_r, prev_un_pt_r;
-            if(!temp_flow_pt_id.empty())
-            {
-                SiftPoint *all_pt_ptr = Sift_->siftData1.h_data;
-                float prev_x, prev_y, prev_x_r, prev_y_r;
-                for(auto iter: temp_flow_pt_id)
-                {
-                    if(pt_stereo_with_flow.find(iter) != pt_stereo_with_flow.end()) continue;
-
-                    float *prev_info_ptr = Sift_->prev_stereo_match_info + 5 * iter;
-                    prev_x = all_pt_ptr[iter].xpos;
-                    prev_y = all_pt_ptr[iter].ypos;
-                    
-                    prev_x_r = prev_info_ptr[3];
-                    prev_y_r = prev_info_ptr[4];
-                    
-                    assert(prev_x - prev_x_r > 0);
-
-                    prev_FAST.emplace_back(prev_x,prev_y);
-                    prev_FAST_global_obj_id.push_back(0);
-                    track_cnt_FAST.push_back(1);
-                    ids_FAST.push_back(n_id);
-                    // status_FAST.push_back(1);
-                    obj_cls_id_FAST.emplace_back(0,0);
-
-                    prev_pt.x = prev_x;
-                    prev_pt.y = prev_y;
-                    prevLeftFeaMap[n_id] = prev_pt;
-
-                    undistortedPts(prev_pt, prev_un_pt, m_camera[0]);
-                    prev_un_Fea_map[n_id] = Vec4f(prev_un_pt.x, prev_un_pt.y, 0.0, 0.0);
-
-                    prev_pt_r.x = prev_x_r;
-                    prev_pt_r.y = prev_y_r;
-                    prevRightFeaMap[n_id] = prev_pt_r;
-
-                    undistortedPts(prev_pt_r, prev_un_pt_r, m_camera[1]);
-                    prev_un_r_Fea_map[n_id] = Vec4f(prev_un_pt_r.x, prev_un_pt_r.y, 0.0, 0.0);
-
-                    if(use_tria_stereo)
-                        prev_FAST_dep.push_back(-1.0);
-                    else
-                    {
-                        assert(prev_x-prev_x_r > 0);
-                        float dep = mbf/(prev_x-prev_x_r);
-                        prev_FAST_dep.push_back(dep);
-                    }
-
-                    ++n_id;
-                }
-            }
-        }
-        // 通知FAST track线程已经完成了来自sift的新FAST的添加。
-        // 之后再在FAST的跟踪函数中查看各个bloc中特征点数是否足够，如果不够，添加上一帧图像中检测的FAST新点（有立体匹配的在前，无立体匹配的在后）（可以不在上一时刻检测，而是在当前帧中再从上一帧的图像剩余区域检测FAST点，这样就不需要排除多余的FAST点）
-        add_new_FAST_from_sift = true;
-
-        // 为上一帧有立体匹配的sift新点寻找跟踪点。这些点其实相当于是FAST点了！即跟踪方式与FAST相同了
-        // 这里暂时不使用new_sift_stereo_prev来存储每一帧中的只有立体匹配的sift点
-        if(0 && find_flow_for_stereo_match) 
-        {
-            int id_in_pts = cur_sift.size();
-
-            vector<Point2f> temp_track_prev, temp_track_cur;
-            vector<int> id_temp;
-    
-            if(!new_sift_stereo_prev.empty())
-            {
-                for(auto &iter: new_sift_stereo_prev)
-                {
-                    Vec<float,8> &pt_prev = iter.second;
-
-                    if(pt_prev(1) < (1.0/7*row) && (pt_prev(0) > 2.0/5*col && pt_prev(0) < 3.0/5*col))
-                    {
-                        continue;
-                    }
-
-                    temp_track_prev.emplace_back(pt_prev(0),pt_prev(1));
-                    id_temp.push_back(iter.first);
-                }
-            }
-
-            // 用什么来设置预测值？运动模型还是光流图？
-            while(!end_flow_post)
-            {
-                usleep(300);
-            }
-            
-            float up_border_v = row - 3.0;
-            float up_border_u = col - 3.0;
-            float low_border = 3.0;
-            for(auto &pt:temp_track_prev)
-            {
-                float prev_x = pt.x;
-                float prev_y = pt.y;
-                // !!要注意，at的坐标索引是(row, col)！flow_map的值代表 后一帧点坐标 - 前一帧点坐标
-                float flow_x = flow_map.at<Vec2f>(int(prev_y), int(prev_x))[0];
-                float flow_y = flow_map.at<Vec2f>(int(prev_y), int(prev_x))[1];
-                
-                float pred_x = max(low_border, min(prev_x+flow_x, up_border_u));
-                float pred_y = max(low_border, min(prev_y+flow_y, up_border_v));
-
-                // 不管点的label值，因为可能存在误检或漏检等情况，而且这里也只是匹配点的预测值
-                // uchar cls_label = seg_map.at<Vec2f>(int(pred_x), int(pred_y))[0];
-                
-                temp_track_cur.emplace_back(pred_x, pred_y);
-            }
-
-            // 使用光流来跟踪这些在上一帧中有立体匹配的点
-            vector<float> err;
-            vector<uchar> status_temp;
-            cv::calcOpticalFlowPyrLK(prev_img, cur_img, temp_track_prev, temp_track_cur, status_temp, err, cv::Size(21, 21), 2, 
-                                    cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
-            
-            // FLOW_BACK = false;
-            // reverse check  逆向光流计算，用上面光流计算出的当前帧中特征点位置 再 计算到上一帧的光流匹配，如果得到检测位置和上一帧的点原始位置距离相差很小，则认为光流成功
-            FLOW_BACK = true;
-            if(FLOW_BACK)
-            {
-                vector<uchar> reverse_status;
-                vector<cv::Point2f> reverse_pts = temp_track_prev;
-                cv::calcOpticalFlowPyrLK(cur_img, prev_img, temp_track_cur, reverse_pts, reverse_status, err, cv::Size(15, 15), 2, 
-                                        cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
-                //cv::calcOpticalFlowPyrLK(cur_img, prev_img, cur_FAST, reverse_pts, reverse_status, err, cv::Size(21, 21), 3); 
-                for(size_t i = 0; i < status_temp.size(); ++i)
-                {
-                    if(status_temp[i] && reverse_status[i] && distance(temp_track_prev[i], reverse_pts[i]) <= 0.5)
-                    {
-                        continue;
-                    }
-                    else
-                        status_temp[i] = 0;
-                }
-            }
-
-            for (size_t i = 0; i < status_temp.size(); ++i)
-            {
-                if (!status_temp[i])
-                    continue;
-                
-                Point2f &cur_pt = temp_track_cur[i];
-                if(cur_pt.y < (1.0/7*row) && (cur_pt.x > 2.0/5*col && cur_pt.x < 3.0/5*col))
-                {
-                    continue;
-                }
-
-                uchar cls_label_cur = mask_bg_cur.at<uchar>(cur_pt.y,cur_pt.x);
-                // 只增加背景中的跟踪点，且不能和上一帧保留的bg上的sift点靠得太近
-                // 如果当前帧是物体点，是否保留该上一帧的物体漏检点？
-                if (cls_label_cur == 0) continue;
-
-                ++prev_pts_with_stereo;
-
-                Vec<float,8> &temp_pt = new_sift_stereo_prev[id_temp[i]];
-                prev_sift.push_back(temp_track_prev[i]);
-                cur_sift.push_back(temp_track_cur[i]);
-                
-                // 对于用depth_map获取的上一帧的sift点深度，就不添加右观测点了。后续如果参与LBA，则只会根据前后帧的投影误差来优化首帧点深度
-                // if(prevLeftFeaMap.empty()) assert(false && "Weired! There is no any fea in last frame!");
-                prevLeftFeaMap[n_id] = temp_track_prev[i];
-                prev_un_Fea_map[n_id] = Vec4f(temp_pt(2), temp_pt(3), 0.0, 0.0);
-                ids_sift.push_back(n_id);
-
-                prevRightFeaMap[n_id] = Point2f(temp_pt(4), temp_pt(5));
-                prev_un_r_Fea_map[n_id] = Vec4f(temp_pt(6), temp_pt(7), 0.0 ,0.0);
-                ++n_id;
-
-                float dep_prev;
-                if(!use_tria_stereo)
-                {
-                    dep_prev = mbf/(temp_pt(0) - temp_pt(4));
-                }
-                else
-                {
-                    dep_prev = -1.0;
-                }
-                
-                prev_sift_dep.push_back(dep_prev);
-
-                cur_sift_index.push_back(-1);
-                prev_sift_global_obj_id.push_back(0);
-                obj_cls_id_sift.emplace_back(0,0);
-                track_cnt_sift.push_back(1);
-                // 最后该点在当前帧的状态是取决于后续在当前帧是否有立体匹配
-                status_sift.push_back(1);
-                
-                // ++num_sift_bg_cur;
-                ++num_track_sift;
-                // 这部分跟踪点的精度应该是不及sift匹配的，所以这部分是否要参与F矩阵的估计？
-                id_bg_track_sift.push_back(id_in_pts);
-                ++id_in_pts;
-            }
-            new_sift_stereo_prev.clear();
-        }
-
-        cout << "Num of tracked prev pts with stereo match: " << prev_pts_with_stereo << endl;
-
-        // 是否需要根据极线约束去除异常匹配点
-        if(frame_count > 0 && reject_with_F)
-        {
-            rejectWithFV1(true, init_succ_IMU);
-        }
-        
-        if(!track_cnt_sift.empty())
-        {
-            for(auto &n : track_cnt_sift)
-                ++n;
-        }
-        // assert(num_track_sift == ids_sift.size() && "Something wrong with num_track_sift!");
-
-        num_track_sift = cur_sift.size();
-        cout << "num of tracked sift in cur frame: " << num_track_sift << endl;
-    
-        if(num_track_sift > 0)
-        {
-            cv::Point2f temp_pt(0.0,0.0);
-            cur_right_sift.resize(num_track_sift,temp_pt);
-            cur_sift_dep.resize(num_track_sift,-1.0);
-
-            // 可能还未删除cur_sift中的无效跟踪点
-            // if(!status_sift.empty()) status_sift.clear();
-            // status_sift.resize(num_track_sift,0);
-        }
-    }
-
-    // 当前帧跟踪到的点中的最大全局id。其中有些跟踪点是无效的（已经被确认无效，或者之后setMask时会跟FAST过近而无效），但因为每个点的id都是独一无二的，因此后面的新点的id肯定不会比这里的跟踪点大
-    if(!ids_sift.empty())
-        last_id_track_fea_cur = *(std::max_element(ids_sift.begin(),ids_sift.end()));
-    
-    if(!obj_fea_disp_num.empty()) 
-        obj_fea_disp_num.clear();
-
-    num_bg_sift_with_dep = 0;
-    
-    // 寻找跟踪sift点的右图像匹配点。并添加新的sift点（有立体匹配或者深度值的物体点）
-    if(STEREO && !_img1.empty())
-    {
-        int* valid_match_stereo;
-        SiftData* sift_data;
-        
-        SiftPoint *h2_siftpts;
-        int init_track, num_track;
-        int num_sift_bg_cur_ = num_sift_bg_cur;
-        int shift_id;
-        
-        num_new_sift_bg = 0;
-        int num_new_sift = 0;
-
-        // todo： 暂不添加当前帧中有立体匹配的背景sift新点，改为下一帧根据flow匹配结果添加
-        // add_new_sift_in_next_frame = true;
-
-        for(int n_img = 0; n_img < 2; ++n_img)
-        {
-            if(n_img == 0)
-            {
-                valid_match_stereo  = Sift_->img2.h_matching_pts_stereo;
-                sift_data = &(Sift_->siftData2);
-                h2_siftpts = Sift_->siftData2.h_data;
-                init_track = 0;
-                num_track = num_track_sift;
-                shift_id = 0;
-            }
-            else if(use_mask_img)
-            {
-                valid_match_stereo  = Sift_->img5.h_matching_pts_stereo;
-                sift_data = &(Sift_->siftData5);
-                h2_siftpts = Sift_->siftData5.h_data;
-                // init_track = num_sift_bg_cur_;
-                init_track = 0;
-                num_track = num_track_sift;
-                shift_id = shift_index;
-            }
-            else 
-                break;
-            
-            int num_match_stereo = valid_match_stereo[0];
-            if(num_match_stereo == 0) continue;
-
-            vector<uchar> status_sift_stereo_flow(num_match_stereo, 0);
-            Vec2b info_pt;
-            if(num_track > 0)
-            {
-                // 也可以像上面一样使用reserve和assign函数来转化为vector，只是下面这种方式更简洁
-                // 同样的，vetcor vec(ptr_begin, ptr_end)，其中ptr_end位置处的元素是不算的
-                vector<int> match_stereo(valid_match_stereo + 1, valid_match_stereo + 1 + num_match_stereo);
-
-                assert(match_stereo.size() == num_match_stereo && "Something wrong with stereo-matching number!");
-
-                uchar obj_cls;
-                int obj_id;
-                //printf("stereo image; track feature on right image\n");
-                // cur left ---- cur right
-                for (int i = init_track; i < num_track; ++i)
-                {
-                    if(status_sift[i] == 0) continue;
-
-                    int id_pt = cur_sift_index[i];
-                    if(id_pt > shift_index) id_pt -= shift_index;
-                    vector<int>::iterator iter = std::find(match_stereo.begin(),match_stereo.end(),id_pt);
-                    // 使用跟踪点的cls而不是obj_id来判断,是因为当前帧有些背景点可能关联的是上一帧的物佑(当前帧漏检)
-                    uchar obj_cls = obj_cls_id_sift[i].first;
-                    if (iter == match_stereo.end()) 
-                    {
-                        // 对于左图像中没有在右图像找到匹配的sift跟踪点，后续是否要尝试用depth_map来获取其深度估计？
-                        // 对于物体点可以，但对于背景点则没必要，精度没法保证
-                        if (obj_cls > 0)
-                        {
-                            id_sift_no_depth.push_back(i);
-                            status_sift[i] = 1;
-                            continue;
-                        }
-                        else
-                        {
-                            // 是否保留该跟踪点是在上面已经决定了，这里无需再判断。这里只记录该跟踪点在当前帧是否有立体匹配
-
-                            // 此处不能只用prev_sift_dep或use_tria_stereo判断该点在上一帧是否有立体匹配（因为有些点跟踪点是当前帧才临时添加的，还没通过左右2帧的三角化得到深度值），应该查看该点是否在Map_prev_r中
-                            // int obj_id = ids_sift[i];
-                            // bool has_stereo_prev = (prevRightFeaMap.find(obj_id) != prevRightFeaMap.end());
-                            // if(USE_TRIANGULATE_TWO_FRAME || has_stereo_prev)
-                            {
-                                // 记录没有右匹配的背景跟踪点在cur_sift中的序号 
-                                sift_no_stereo_bg.push_back(i);
-                                // 当前帧没有深度值的bg跟踪点的状态记为2
-                                status_sift[i] = 2;
-                            }
-                            continue;
-                        }
-                    }
-                    int index_valid_match = std::distance(match_stereo.begin(), iter);
-                    status_sift_stereo_flow[index_valid_match] = 1;
-                    int id_siftdata = match_stereo[index_valid_match];
-                    float cord_x = h2_siftpts[id_siftdata].xpos;
-                    float cord_y = h2_siftpts[id_siftdata].ypos;
-                    float match_x = h2_siftpts[id_siftdata].match_xpos;
-                    float match_y = h2_siftpts[id_siftdata].match_ypos;
-
-                    // 对于n_img == 1,已经在cudaSift中完成了此项过滤
-                    // 右匹配点超过了规定的图像边界，那么是否应该保存其中的左图像的bg跟踪点？在右图像中快超出图像，意味着该点下一帧很可能离开相机视野？sift跟踪点的作用不是用于长跟踪，而是为当前帧跟踪提供3D-2D的PnP
-                    if (n_img == 0 && !(inBorder(cv::Point2f(match_x,match_y)))) 
-                    {
-                        int gl_id = ids_sift[i];
-                        
-                        // if(obj_cls == 0 && prev_sift_dep[i] > 0)
-                        if(obj_cls == 0)
-                        {
-                            sift_no_stereo_bg.push_back(i);
-                            status_sift[i] = 2;
-                        }
-                        continue;
-                    }
-                    
-                    // 在左图像的左侧的一些区域内的点要么不可能在右图像中有观测，要么其深度超过了相应的阈值;同时右图像的右侧区域也不可能在左侧有观测点
-                    if (obj_cls == 0) 
-                    {
-                        if(cord_x <= bg_left_border_left_img || match_x >= bg_right_border_right_img)
-                        {
-                            sift_no_stereo_bg.push_back(i);
-                            status_sift[i] = 2;
-                            
-                            continue;
-                        }
-                    }
-                    else if(cord_x <= obj_left_border_left_img || match_x >= obj_right_border_right_img)
-                        continue;
-
-                    // 左右图像的立体视差为 左图像点 - 右图像点
-                    float disp_x = Sift_->siftData2.valid_disp_x[index_valid_match];
-                    float disp_y = Sift_->siftData2.valid_disp_y[index_valid_match];
-                    
-                    if (disp_x <= 0) 
-                    {
-                        cout << "Weired! Get a disp_x < 0 for sift!" << endl;
-                        if (obj_cls == 0)
-                        {
-                        
-                            sift_no_stereo_bg.push_back(i);
-                            status_sift[i] = 2;
-                        
-                            continue;
-                        }
-                        else
-                        {
-                            status_sift[i] = 1;
-                            id_sift_no_depth.push_back(i);
-                            continue;
-                        }
-                    }
-                        
-                    float depth = mbf/disp_x;
-
-                    if (obj_cls == 0)
-                    {
-                        // if (depth >= mThDepthBg || depth < mMinDepthPt) continue;
-                        if (depth >= mThDepthBg || depth < 1.5) 
-                        {
-                            sift_no_stereo_bg.push_back(i);
-                            status_sift[i] = 2;
-                            
-                            continue;
-                        }
-                        // 左相机坐标系中按照估计深度得到的3D点是否在右相机的视锥体内部。如果不在，则此立体匹配是错误的
-                        // float err = (r_cam_3D_plane[0]*cur_un_sift[i].x+r_cam_3D_plane[1]*cur_un_sift[i].y+r_cam_3D_plane[2])*depth+r_cam_3D_plane[3];
-                        // if (err <= 0) continue;
-                    }
-                    // 当前帧的物体无论是否运动，都只取25m内的物体
-                    else 
-                    {
-                        // if (depth >= mThDepthObj || depth < mMinDepthPt) continue;
-                        // 对于特征点匹配，可以适当减小深度值
-                        if (depth >= mThDepthObj || depth < 1.5) continue;
-                        // float err = (r_cam_3D_plane[0]*cur_un_sift[i].x+r_cam_3D_plane[1]*cur_un_sift[i].y+r_cam_3D_plane[2])*depth+r_cam_3D_plane[3];
-                        // if (err <= 0) continue;
-                    }
-
-                    float y_shift = Y_shift_right_image/depth;
-
-                    // 右匹配点的v坐标超出图像下边界,则直接放弃该跟踪点
-                    if ((cord_y+y_shift) > row - 5) continue;
-
-                    // 从相机2和相机3的校正矩阵P_rect_xx来看,右相机的点的v坐标应该始终比左相机的对象点的v坐标要大,因此disp应该是小于0的!
-                    // if(abs(disp_y + y_shift) > 1.0)
-                    if(abs(disp_y) > 1.0)
-                    {
-                        if (obj_cls == 0)
-                        {
-                            sift_no_stereo_bg.push_back(i);
-                            status_sift[i] = 2;
-                            
-                            continue;
-                        }
-                        else
-                        {
-                            status_sift[i] = 1;
-                            id_sift_no_depth.push_back(i);
-                            continue;
-                        }
-                    }
-                    
-                    // 是否要直接使用右图像中的匹配点的v坐标?
-                    cur_right_sift[i] = cv::Point2f(match_x, match_y);
-                    // cur_right_sift[i] = cv::Point2f(match_x, cord_y+y_shift);
-                    
-                    // 之后记得给当前帧那些来自上一帧跟踪但是在当前帧却没有右图像sift的点 分配深度值（通过depth_map）
-                    if(obj_cls == 0)
-                    {
-                        if(use_tria_stereo)
-                            cur_sift_dep[i] = -1.0;
-                        else
-                            cur_sift_dep[i] = depth;
-                    }
-                    else
-                        cur_sift_dep[i] = depth;
-                    
-                    status_sift[i] = 1;
-
-                    obj_id = obj_cls_id_sift[i].second;
-                    if(obj_id > 0)
-                    {
-                        if(obj_fea_disp_num.find(obj_id) == obj_fea_disp_num.end())
-                        {
-                            obj_fea_disp_num[obj_id] = make_pair(disp_x,1);
-                        }
-                        else
-                        {
-                            obj_fea_disp_num[obj_id].first += disp_x;
-                            obj_fea_disp_num[obj_id].second += 1;
-                        }
-                    }
-                    else
-                    {
-                        ave_dep_bg_cur_frame += depth;
-                        ++num_bg_with_dep;
-                        ++num_bg_sift_with_dep;
-                    }
-                }
-            }
-            // int num_track_sift_depth = cur_right_sift.size();
-            
-            Point2f tmp_undist_pt;
-            
-            vector<float> &valid_disp_x = sift_data->valid_disp_x;
-            vector<float> &valid_disp_y = sift_data->valid_disp_y;
-            float disp_x, disp_y;
-            float cord_x, cord_y, match_x, match_y;
-            int validpts_id;
-            
-            // cout << "start add new stereo sift!" << endl;
-            // 往当前帧添加新的sift点，需要该点具有有效的右图像匹配点（深度估计）
-            Point2f cur_un_new, cur_un_new_r;
-            
-            for(int i = 0; i < num_match_stereo; ++i)
-            {
-                int num_sift_add = cur_sift.size();
-                bool no_stereo = false;
-                bool invalid_depth = false;
-                // 跟踪的点已经算过了
-                if(status_sift_stereo_flow[i] == 1) continue;
-
-                validpts_id = valid_match_stereo[i+1];
-
-                cord_x = h2_siftpts[validpts_id].xpos;
-                cord_y = h2_siftpts[validpts_id].ypos;
-                match_x = h2_siftpts[validpts_id].match_xpos;
-                match_y = h2_siftpts[validpts_id].match_ypos;
-
-                info_pt = seg_map_cur.at<Vec2b>(cord_y,cord_x);
-                uchar cls_label = info_pt[0];
-                
-                // 如果sift背景点新点要到下一帧再决定，则这里跳过
-                if(add_new_sift_in_next_frame && cls_label == 0) continue;
-
-                // do not consider points of person, rider or bicycle or train
-                if(cls_label == 1 || cls_label == 2 || cls_label == 4 || cls_label == 7) continue;
-
-                // 太靠近图像顶端的区域，有可能是树木之类的，也可能是建筑，去除这部分区域的点，会损失一部分点，但是可以提高运动估计的精度？
-                // 最好是使用全景分割来得到更广泛的类别区分
-                // 这里最后是只针对物体了
-                if(cord_y < (1.0/6*row) && (cord_x > 1.0/6*col && cord_x < 5.0/6*col))
-                {
-                    continue;
-                }
-                
-                if(cls_label == 0 && (cord_x <= bg_left_border_left_img || match_x >= bg_right_border_right_img)) continue;
-                if(cls_label > 0 && (cord_x <= obj_left_border_left_img || match_x >= obj_right_border_right_img)) continue;
-
-                // 3通道uchar则用Vec3b，单通道uchar则用uchar
-                if(!inBorder(cv::Point2f(match_x,match_y))) 
-                    continue;
-                else
-                {
-                    disp_x = valid_disp_x[i];
-                    disp_y = valid_disp_y[i];
-                    // 人为sift匹配是较为准确的立体匹配，即y方向上没有视差。disp_x<=0已经在sift后处理阶段筛除过了
-                    // disp_x is the (x_left_img - x_right_img), so disp_x should be > 0
-                    //if (disp_x <= 0) continue;
-
-                    if(disp_x <= 0)
-                    {
-                        cout << "Weired! Get disp_x < 0 for a sift!" << endl;
-                        continue;
-                    }
-
-                    float depth = mbf/disp_x;
-
-                    float y_shift = Y_shift_right_image/depth;
-
-                    if((cord_y+y_shift) > row - 5) continue;
-
-                    // 当前帧背景点
-                    if(n_img == 0 && cls_label == 0)
-                    {
-                        // 当计算出来的深度太小时，是否可信？sift的立体匹配可信度较高，但是光流匹配就不一定（因为缺少预测值，只能暴力匹配）
-                        // 对于新的背景点，如果深度为1m，则下一帧它很可能就不在相机前方了（相机的频率为100hz，如果按10m/s速度前行，那么两帧之间间隔距离为1m）
-                        // 但是也可能相机处于静止状态，所以这里也可以取1.5m为最小深度
-                        // if(depth >= mThDepthBg || depth < mMinDepthPt) continue;
-                        if(depth >= mThDepthBg || depth < 1.5) continue;
-                        
-                        if(abs(disp_y) > 1.0) continue;
-
-                        // cv::Point2f new_sift(cord_x, cord_y);
-                        // undistortedPts(new_sift, tmp_undist_pt, m_camera[0]);
-                        // float err = (r_cam_3D_plane[0]*tmp_undist_pt.x+r_cam_3D_plane[1]*tmp_undist_pt.y+r_cam_3D_plane[2])*depth+r_cam_3D_plane[3];
-                        // if (err <= 0) continue;
-                        
-                        // ++num_new_sift_bg;
-                    }
-                    // 新的sift点中，即使有静态物体，这里也暂时只选择那些在动态物体深度阈值（2m-25m）内的静态物体点，这样的深度估计比较精确。
-                    // 事实上用sift是可以得到较小深度的左右匹配，但是这部分点很可能不够多，但是又无法使用像素点的匹配（因为太近的点的depth_map估计结果肯定是不准确的）
-                    // 同时深度太小的点在下一帧不容易被跟踪到（因为靠得近的点光流大）。对于动态物体而言，其可能是朝着远离相机的方向运动（即同向但速度比相机快），那么下一帧它还是可能出现在视野内的
-                    // 可以保留物体上深度值较小的点，但需要当前帧该物体的特征跟踪点数较多（至少8个），否则后续无法进行运动估计
-                    // 另外分割模型不太准确，不在物体上的点应该如何排除？（物体匹配期间有外点排除机制）
-                    else
-                    {
-                        // 这里应该都是物体上的点
-                        assert(cls_label > 0 && "Weirde! Why here get a tracked sift in bg?");
-                        // if(depth >= mThDepthObj || depth < mMinDepthPt) continue;
-                        if(depth >= mThDepthObj || depth < 1.5) continue;
-
-                        // 是否要保留这部分物体点，后续用depth_map查看是否能获得深度估计。可以
-                        // if(abs(disp_y + y_shift) > 0.6)
-                        if(abs(disp_y) > 1.0)
-                        {
-                            // 记录没有右匹配的新sift物体点，后期尝试用depth_map来寻找其深度值
-                            id_sift_no_depth.push_back(num_sift_add);
-                            invalid_depth = true;
-                            // 在id_sift_no_depth后这里千万不能continue,否则下面就忘记添加这个点的右观测点信息了
-                            // continue
-                        }
-                        
-                        // cv::Point2f new_sift(cord_x, cord_y);
-                        // undistortedPts(new_sift, tmp_undist_pt, m_camera[0]);
-                        // float err = (r_cam_3D_plane[0]*tmp_undist_pt.x+r_cam_3D_plane[1]*tmp_undist_pt.y+r_cam_3D_plane[2])*depth+r_cam_3D_plane[3];
-                        // if (err <= 0) continue;
-                    }
-
-                    // 在不插入背景中新sift点的情况下，是否还要额外记录这些有立体匹配的新点
-                    if(!add_new_sift_in_next_frame && no_add_new_sift)
-                    {
-                        if(cls_label == 0)
-                        {
-                            // continue;
-
-                            Point2f cur_new(cord_x, cord_y);
-                            undistortedPts(cur_new, cur_un_new, m_camera[0]);
-                            Point2f cur_new_r(match_x, match_y);
-                            undistortedPts(cur_new_r, cur_un_new_r, m_camera[1]);
-                            new_sift_stereo_prev[validpts_id] = Vec<float,8>(cord_x, cord_y, cur_un_new.x, cur_un_new.y, match_x, match_y, cur_un_new_r.x, cur_un_new_r.y);
-                            continue;
-                        }
-                    }
-
-                    int obj_id = (int)info_pt[1];
-                    cur_sift_index.push_back(validpts_id+shift_id);
-                    ids_sift.push_back(n_id++);
-                    cur_sift.emplace_back(cord_x, cord_y);
-                    track_cnt_sift.push_back(1);
-                    obj_cls_id_sift.emplace_back(cls_label,obj_id);
-                    // 记录当前帧sift点所匹配的上一帧中的sift点的全局obj id，当一个物体在两帧间的特征点匹配数足够多时，可以直接关联此两物体！
-                    // 此处为各个物体的新sift点，在进行物体关联之后，要来修改当前帧各个特征点所属物体的全局id，尤其是当前帧新添加的点！！
-                    prev_sift_global_obj_id.push_back(obj_id);
-                    if(no_stereo)
-                    {
-                        cur_right_sift.emplace_back(0, 0);
-                        // cur_right_sift.emplace_back(match_x, cord_y+y_shift);
-                        cur_sift_dep.push_back(-1.0);
-                        // 当前帧没有深度值的bg新点的状态记为3
-                        status_sift.push_back(3);
-                    }
-                    else
-                    {
-                        cur_right_sift.emplace_back(match_x, match_y);
-                        // cur_right_sift.emplace_back(match_x, cord_y+y_shift);
-                        if(invalid_depth)
-                        {
-                            // status_sift.push_back(0);
-                            status_sift.push_back(1);
-                            cur_sift_dep.push_back(-1.0);
-                        }
-                        else
-                        {
-                            status_sift.push_back(1);
-                            if(use_tria_stereo && cls_label == 0)
-                                cur_sift_dep.push_back(-1.0);
-                            else
-                                cur_sift_dep.push_back(depth);
-                        }
-                    }
-
-                    ++num_new_sift;
-
-                    // 物体点如果有有效的深度估计,则记录
-                    if(obj_id > 0 && !invalid_depth)
-                    {
-                        if(obj_fea_disp_num.find(obj_id) == obj_fea_disp_num.end())
-                        {
-                            obj_fea_disp_num[obj_id] = make_pair(disp_x,1);
-                        }
-                        else
-                        {
-                            obj_fea_disp_num[obj_id].first += disp_x;
-                            obj_fea_disp_num[obj_id].second += 1;
-                        }
-                    }
-                    else if(obj_id == 0 && !no_stereo)
-                    {
-                        ave_dep_bg_cur_frame += depth;
-                        ++num_bg_with_dep;
-                        ++num_bg_sift_with_dep;
-                    }
-                }   
-            }
-        }
-        
-        if(!add_new_sift_in_next_frame && !no_add_new_sift)
-            cout << "Num of detected new sift (for bg and objs) in cur frame is: " << num_new_sift << endl;
-        else
-            cout << "Num of detected new sift (only for objs) in cur frame  is: " << num_new_sift << endl;
-    }
-    
-    done_select_sift = true;
-    // 当前帧特征点"关联阶段"的最后一个sift（包含跟踪与新检测的）的全局id。注意，实际上当前帧新sift点的最大全局id不是这里的值，因为后续sift中的跟踪外点还会被转为新点！
-    // last_id_sift_cur = n_id - 1; 
-
-    // 后处理，将当前帧的部分信息保存为prev
-    Sift_->Postprocess();
-    
-    // ------------------------------------------------------------------------
-    printf("Sift select costs: %fms \n", t_o.toc());
-}
-
-
-// 新版的select_sift函数，去除了前期的一些尝试，例如单独在物体mask中检测物体点，简化了函数逻辑；
-// 添加了一些新的操作，如在每个bloc中选择ambi值最低的2个点参与F矩阵的估计，如果每个bloc中有深度小于3m的点，则全部加入
-void FeatureTracker::select_sift_V2(int frame_count, const cv::Mat &_img1, const cv::Mat &seg_map_prev, const cv::Mat &seg_map_cur, 
-                                    const cv::Mat &map_depth_prev, const cv::Mat &flow_map, bool &end_flow_post, bool init_succ_IMU, bool use_mask_img)
-{
-    cout << "Start selcct sift!" << endl;
-    TicToc t_o;
-
-    frame_cnt = frame_count;
-    // add_new_FAST_from_sift = false;
-    
-    // 去除GPU线程中的postprocess()!将sift的后处理（选择有效的match）放在此处，减少GPU中其他任务的等待时间。
-    // 对于sift点，其允许检测的最小深度值改为1.5m，因为暴力匹配允许更大的视差估计（1.5m对应的视差值为256）
-    // float max_shift_y = Y_shift_right_image/mMinDepthPt;
-    float max_shift_y = Y_shift_right_image/1.5;
-    vector<int> temp_flow_pt_id;
-
-    // 选择sift跟踪点 和 潜在跟踪点
+    int num_valid_track = 0;
     if(frame_cnt > 0)
-        Sift_->select_flow_matching(Y_shift_right_image/mMinDepthPt, seg_map_prev, seg_map_cur, mask_bg_prev, num_flow_pt_in_bloc, num_temp_flow_pt_in_bloc, 
-                                num_long_track_FAST_in_bloc, prev_FAST, track_cnt_FAST, temp_flow_pt_id, prev_color_img_l, use_mask_img);
-    
-    // 挑选当前帧中的有效立体匹配点
-    Sift_->select_stereo_matching(Y_shift_right_image/mMinDepthPt);
-    
-    num_track_sift_bg = 0;
-    num_track_sift_static = 0;
-    num_sta_sift_long_track = 0;
-    
-    int* valid_match_flow_ptr = Sift_->img1.h_matching_pts_flow;
-    int num_match_flow = valid_match_flow_ptr[0];
-    
-    set<int> pt_stereo_with_flow;
-    int prev_pts_with_stereo = 0;
-    
-    // vector<int> id_long_tracked_sift;
-    
-    vector<int> gl_id_stat_obj_fea;
-    
-    // 从第2帧开始有跟踪点
-    if(frame_count > 0)
     {
-        // 部分跟踪点是上一帧就已经被跟踪了，为long_tracked sift
-        int num_prev_sift = prev_sift.size();
+        // 是否要为跟踪点设置预测值
+        hasPrediction = true;
 
-        assert(num_prev_sift == prev_sift_index.size());
+        int valid_long_track_bg = 0;
+
+        int num_before_add_up = prev_FAST.size();
+        if(!ambi_NCC_new_FAST.empty()) ambi_NCC_new_FAST.clear();
+        ambi_NCC_new_FAST.resize(num_before_add_up, 1.0);
         
-        cur_sift.resize(num_prev_sift, cv::Point2f(0, 0));
-        cur_sift_index.resize(num_prev_sift, 0);
-        status_sift.resize(num_prev_sift,0);
-
-        int id_in_pts = num_prev_sift;
-
-        SiftData *sift_data = &(Sift_->siftData1);
-        SiftPoint *h1_siftpts = Sift_->siftData1.h_data;
-        
-        const vector<float> &valid_disp_x = sift_data->valid_disp_x;
-        const vector<float> &valid_disp_y = sift_data->valid_disp_y;
-        Point2f prev_pt, prev_pt_r, cur_pt, prev_un_pt, prev_un_pt_r, cur_un_pt;
-
-        float disp_prev, dep_prev;
-        float match_xpos_r, match_ypos_r, disp_match_x_r, disp_match_y_r;
-
-        Vec2b info_pt_cur;
-
-        vector<Point2f> temp_track;
-        vector<int> temp_track_pt_g_id, temp_track_pt_l_id;
-
-        // vector<int> orig_prev_sift_index = prev_sift_index;
-
-        // 让特征点尽可能均匀地分布在图像中
-        // 此外，每个bloc中选取一定数量的跟踪点用于估计F或H矩阵并分解得到R和t
-        for(int i = 0; i < 6; ++i)
-            for(int j = 0; j < 6; ++j)
-                id_best_track_bloc[i][j] = 0;
-
-        // vector<int> pts_stereo_for_F;
-        vector<int> id_pts_flow_for_F;
-        int l_pt_id, match_id;
-        bool old_track = false;
-        bool is_stat_obj_fea_track;
-        int col_in_bloc, row_in_bloc;
-
-        // 基于极线约束，使用预测的相机运动构建F矩阵来过滤静态点的匹配（注意，这对动态物体点无效，因为动态点仍可能满足相机的极线约束，参考rigidmask）
-        bool check_flow_with_epi = true;
-        if(!use_motion_to_pred_fea_pos) check_flow_with_epi = false;
-
-        Matrix3d cam_F;
-        if(check_flow_with_epi)
+        // 首先当前已有的上一帧FAST点进行跟踪（注意，其中可能有部分点是来自sift的转化，其在上一帧有立体匹配的sift点，这取决于是否执行此方案）
+        if(num_before_add_up > 0)
         {
-            if(frame_count > 1)
+            if(hasPrediction)
             {
-                // 构建有效的F矩阵需要非0位移
-                if(P_cam_motion.norm() > 0.06)
+                // 如果是在当前帧才添加上一帧的新FAST点，则要在此处再为所有FAST点提供flow预测值
+                if(add_new_fea_in_next_frame)
                 {
-                    // Quaterniond delta_Q(R_cam_motion);
-                    // float delta_angle = fabs(acos(delta_Q.w()) * 2.0 / 3.1416 * 180.0);
+                    // 使用恒速运动模型假设来估计静态点和动态物体点的位置或在当前帧的深度，对于新物体，可以使用背景的运动预测或者后续使用flow_map
+                    if(frame_cnt > 1 && (use_motion_to_pred_fea_pos ||use_motion_to_pred_fea_dep))
+                    {
+                        Ptspredict_motion(false, false, true);
+                    }
+                    else
+                    {
+                        // 如果不用运动预测来设置跟踪点预测值，则使用flow_map
+                        if(!cur_FAST.empty()) cur_FAST.clear();
+                        cur_FAST.resize(num_before_add_up,Point2f(0.0,0.0));
+                        FAST_pred_by_flow_map.resize(num_before_add_up);
+                        std::iota(FAST_pred_by_flow_map.begin(), FAST_pred_by_flow_map.end(), 0);
+                    }
+                }
+                else
+                {
+                    while(!FAST_pred_motion)
+                    {
+                        usleep(300);
+                    }
+                    FAST_pred_motion = false;
+                }
+            }
+            
+            // 如果当前帧中有特征点(如上一帧的新物体点）没有像素坐标预测，则意味着需要用flow_map来获取预测值
+            if(!FAST_pred_by_flow_map.empty())
+            {
+                while(!end_flow_post)
+                {
+                    usleep(300);
+                }
 
-                    // todo:是否需要预测的旋转较小
-                    // if(delta_angle < 0.7)
+                if (!seg_map_cur.empty() && !flow_map.empty())
+                {
+                    // predict_FAST.clear();
+                    //predict_sift.clear();
+                    // 这里只用flow_map来给出上一帧的"新物体点"提供预测点，非新物体则是之前就用物体的运动模型来变换和投影得到预测点
+                    Pts_pred_by_flow_map(prev_FAST, FAST_pred_by_flow_map, cur_FAST, flow_map, seg_map_cur);
+                }
+                else
+                {
+                    fprintf(stderr, "For predict of FAST in the second frame should provide the seg_map and flow_map!");
+                    abort(); 
+                }
+            }
+            // 有效的静态跟踪点（包括纯背景点和NCC值较高（部分经过重投影检验）的近处静态物体点）
+            valid_long_track_bg = Track_and_Filter_FAST(prev_FAST, cur_FAST, status_FAST, hasPrediction, seg_map_cur);
+        }
+        
+        int num_track_up_half = 0, num_track_low_half = 0;
+        // 现有的有效静态跟踪点（包含FAST点和sift点）数量
+        for(int k = 0; k < 4; ++k)
+        {
+            num_valid_track += num_fea_2D2D_big_bloc[k];
+            if(k < 2) 
+                num_track_up_half += num_fea_2D2D_big_bloc[k];
+            else
+                num_track_low_half += num_fea_2D2D_big_bloc[k];
+        }
+        
+        if(add_new_fea_in_next_frame)
+        {
+            // 从上一帧的图像检测新的点，使得当前帧有足够的跟踪点
+            // 往上一帧的bg图中标注上一帧保留的FATS背景点
+            draw_bg_fea_in_mask_prev(mask_bg_fea_prev, prev_FAST, 0);
+            
+            // 尝试在下半部分图像检测ORB特征并显示
+            if(0)
+            {
+                Mat exp_mat = prev_img.clone();
+                Mat mask = mask_bg_fea_prev.clone();
+
+                Rect targetRect(0, 0, col, 3*60);
+                // 给定像素的值一定要是显式的Scalar类型，不能直接给定0这种int值！！否则编译器会报错
+                Mat allZeroZone(targetRect.height, targetRect.width, CV_8UC1, Scalar(0));
+                // 获取要涂黑的图像区域的ptr
+                Mat dest_zone = mask(targetRect);
+                allZeroZone.copyTo(dest_zone);
+
+                vector<cv::KeyPoint> detect_FAST;
+                cv::Ptr<FeatureDetector> detector = cv::ORB::create();
+                detector->detect(exp_mat, detect_FAST, mask);
+
+                cv::drawKeypoints(exp_mat, detect_FAST, exp_mat);
+
+                cv::imshow("ORB corners", exp_mat);
+                cv::waitKey(0);
+            }
+            
+            while(!end_flow_post)
+            {
+                usleep(300);
+            }
+            
+            // 是否首先在上一帧的整张图像中检测新的FAST点并跟踪，如果某个大bloc中的点数不足，后续再单独在该bloc中进行检测？
+            // 这样的好处是可以优先选出整幅图像中最好的一些点（因为筛选规则是点质量不低于全局最佳质量的n%），避免仅在某个局部区域中提取时得到太多质量很低的点
+            if(1)
+            {
+                int num_need = 0;
+                float quality_level = 0.01;
+                
+                vector<Point2f> new_det_FAST_prev;
+
+                // 是否要先在整幅图像随机选取检测点？也可以选择在上下半幅图像分开检测，以保证足够的近点
+                bool detect_in_two_half_img = true;
+                vector<Mat> mask_img_to_draw_invalid_pt;
+
+                // 理想情况下整张图像要120-130个静态2D-2D跟踪点
+                if(!detect_in_two_half_img)
+                {
+                    num_need = 120 - num_valid_track;
+                    // 如果数量已足够，但不是非常多，则再检测10个新的背景FAST点
+                    if(num_need <= 0 && num_valid_track < 125) num_need = 10;
+                    detect_new_FAST_prev(num_need, mask_bg_fea_prev, mask_img_to_draw_invalid_pt, new_det_FAST_prev, quality_level);
+                }
+                else
+                {
+                    int num_detect = 0;
+                    // 上半幅图像总数要求45个，下半幅图像总数要求75个
+                    if(num_track_up_half < 45)
+                    {
+                        num_need = 45 - num_track_up_half;
+                        num_detect = num_need;
+                        if(num_need < 5) num_detect = 5;
+                        detect_new_FAST_prev(num_detect, mask_up_half_img, mask_img_to_draw_invalid_pt, new_det_FAST_prev, quality_level);
+                    }
+
+                    if(num_track_low_half < 75)
+                    {
+                        num_detect = (75 - num_track_low_half);
+                        num_need += num_detect;
+                        if(num_detect < 5) num_detect = 5;
+                        detect_new_FAST_prev(num_detect, mask_low_half_img, mask_img_to_draw_invalid_pt, new_det_FAST_prev, quality_level);
+                    }
+                }
+                
+                if(!new_det_FAST_prev.empty())
+                {
+                    // 用于查看具体某一帧的新检测点
+                    if(0 && total_frame == 500)
+                    {
+                        Mat img_for_new_detected_bg_fea = prev_img.clone();
+                        for(auto &pt: new_det_FAST_prev)
+                        {
+                            circle(img_for_new_detected_bg_fea, pt, 4, Scalar(1.0,1.0,1.0), 1, 16);
+                        }
+                        
+                        while(true)
+                        {
+                            cv::imshow("pts for detected new bg fea in prev left image", img_for_new_detected_bg_fea);
+                            // 一直等待用户按下ESC键（ASCI码为27）
+                            if(waitKey(0) == 27)
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // 如果有F/H估计得到的R，则用它代替恒速模型运动预测中的旋转
+                    if(frame_cnt > 1 && (has_valid_F || has_valid_H))
                     {
                         Matrix3d t_up;
                         t_up << 0.0, -P_cam_motion(2), P_cam_motion(1), P_cam_motion(2), 0.0, -P_cam_motion(0), -P_cam_motion(1), P_cam_motion(0), 0.0;
                         // 本质矩阵到关键矩阵
-                        cam_F = K_trans_inv * t_up * R_cam_motion * K_inv;
+                        F_cam = K_trans_inv * t_up * R_from_E * K_inv;
                     }
-                    // else
-                    // {
-                    //     check_flow_with_epi = false;
-                    // }
+
+                    vector<Point2f> temp_track_FAST_cur;
+                    vector<uchar> temp_track_status;
+                    if(hasPrediction)
+                    {
+                        // 这些新检测的点还没有深度值，因此只能用flow_map来设置跟踪点预测
+                        track_pred_for_new_det_prev_fea(new_det_FAST_prev, temp_track_FAST_cur, flow_map, seg_map_cur);
+                    }
+
+                    float high_th_NCC = 0.99, low_th_NCC = 0.97;
+                    int orig_num_FAST = prev_FAST.size();
+                    int num_add_new = Track_and_Filter_FAST(new_det_FAST_prev, temp_track_FAST_cur, temp_track_status, hasPrediction, seg_map_cur, true, num_need, high_th_NCC, low_th_NCC);
+                    
+                    num_valid_track += num_add_new;
+                    draw_bg_fea_in_mask_prev(mask_bg_fea_prev, prev_FAST, orig_num_FAST);
                 }
-                else
-                    check_flow_with_epi = false;
+            }
+            
+            // 之前得到的跟踪点在各个大bloc中可能极不均匀，为了保证后续在各个bloc中有足够数量的3D-2D点，这里将各个大bloc的2D-2D点数量增加到最小规定值
+            vector<int> min_num_per_bloc_need(4,0);
+            int num_low, num_up;
+            // 最小总数取40个（即参与F/H估计的最小点数）
+            if(pred_delta_angle_cam < 0.65)
+            {
+                num_low = 14;
+                num_up = 6;
+            }
+            else if(pred_delta_angle_cam <= 1.5)
+            {
+                num_low = 12;
+                num_up = 8;
             }
             else
-                check_flow_with_epi = false;
-        }
-
-        // 跟踪点的信息记录
-        for(int k = 0; k < num_match_flow; ++k)
-        {
-            old_track = false;
-            is_stat_obj_fea_track = false;
-            dep_prev = -1.0;
-            int validpts_id = valid_match_flow_ptr[(k+1)];
-
-            float prev_x = h1_siftpts[validpts_id].xpos;
-            float prev_y = h1_siftpts[validpts_id].ypos;
-            float cur_x = h1_siftpts[validpts_id].match_xpos;
-            float cur_y = h1_siftpts[validpts_id].match_ypos;
-
-            // 注意，valid_disp_的索引是用k，不是用validpts_id！！
-            float disp_x = valid_disp_x[k];
-            float disp_y = valid_disp_y[k];
-            
-            info_pt_cur = seg_map_cur.at<Vec2b>(cur_y,cur_x);
-            uchar cls_cur = info_pt_cur[0];
-
-            if (cls_cur == 1 || cls_cur == 2 || cls_cur == 4 || cls_cur == 7) continue;
-            
-            prev_pt.x = prev_x;
-            prev_pt.y = prev_y;
-            cur_pt.x = cur_x;
-            cur_pt.y = cur_y;
-
-            uchar cls_prev;
-
-            uchar det_cls_prev = seg_map_prev.at<Vec2b>(prev_y,prev_x)(0);
-
-            if(reject_with_F)
             {
-                col_in_bloc = prev_x/200;
-                row_in_bloc = prev_y/60;
-
-                if(col_in_bloc == 6) col_in_bloc = 5;
-                if(row_in_bloc == 6) row_in_bloc = 5;
+                num_low = 10;
+                num_up = 10;
             }
             
-            auto iter = find(prev_sift_index.begin(),prev_sift_index.end(),validpts_id);
-
-            // if it is a long-tracked sift
-            if(iter != prev_sift_index.end())
-            {
-                if(!inBorder(cur_pt)) 
-                {
-                    if(reject_with_F && det_cls_prev == 0 && cls_cur == 0) num_flow_pt_in_bloc[row_in_bloc][col_in_bloc] -= 1;
-
-                    continue;
-                }
-
-                uchar obj_id = info_pt_cur[1];
-
-                int id_index = std::distance(prev_sift_index.begin(),iter);
-                // 注意，如果是上一帧的保留点，则判断其在上一帧的cls应该要用cls_prev而不是det_cls_prev，因为保留点的cls可能与其检测的cls不一致
-                cls_prev = obj_cls_id_sift[id_index].first;
-                int obj_status_prev = obj_cls_id_sift[id_index].second;
-                
-                bool invalid_sta_obj_fea = false;
-                old_track = true;
-                // 纯背景跟踪点 或者 静态物体跟踪点，需要前后2帧的物体标签一致
-                if((cls_cur == cls_prev && cls_cur == 0) || (cls_cur == cls_prev && cls_cur > 0 && obj_status_prev == 0))
-                {
-                    if(check_flow_with_epi)
-                    {
-                        int gl_obj_id = prev_sift_global_obj_id[id_index];
-
-                        if(gl_obj_id > 0 && status_objs_prev.find(gl_obj_id) == status_objs_prev.end())
-                        {
-                            cout << "Weired!" << endl;
-                            exit(-1);
-                        }
-
-                        if(gl_obj_id > 0 && status_objs_prev[gl_obj_id] != 1)
-                        {
-                            cout << "Weired!" << endl;
-                            exit(-1);
-                        }
-
-                        int succ = check_flow_with_F(cam_F, prev_pt, cur_pt);
-
-                        // 静态点需要离预测的极线不能太远
-                        // 对于不成立的点，只删除纯背景点
-                        // 静态物体点可能变为了动态点
-                        if(succ <= 0)
-                        {
-                            if(cls_cur == cls_prev && cls_cur == 0)
-                            {
-                                status_sift[id_index] = 0;
-
-                                if(reject_with_F)
-                                    num_flow_pt_in_bloc[row_in_bloc][col_in_bloc] -= 1;
-                                
-                                continue;
-                            }
-                            else
-                            {   
-                                invalid_sta_obj_fea = true;
-                            }
-                        }
-                    }
-                }
-
-                // 下面遍历的这些条件，很可能不能覆盖所有的条件，为了避免某些遗漏条件下的上一帧点被保留下来，在每一条件下单独修改status，即status_sift[id_index] = 1;
-                if (cls_cur == cls_prev && cls_cur == 0 && abs(disp_x) < 1280/8.0 && abs(disp_y) < 384/6.0)
-                {
-                    // 后续根据物体的运动状态的判定结果和这里的局部obj_id来更改sift点的全局id！obj_cls_id_sift这个量由上一帧的量修改为表示当前帧的，然后用reduceVector来去除多余
-                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(0, obj_id);
-                    // 记录背景上的sift点个数
-                    ++num_track_sift_bg;
-                    // 记录跟踪的静态sift点数
-                    ++num_track_sift_static;
-                    // 记录长跟踪静态点的个数
-                    if(track_cnt_sift[id_index] > 1) ++num_sta_sift_long_track;
-
-                    if(reject_with_F && only_use_track_sift_for_F) id_bg_track_sift.push_back(id_index);
-                }
-                // 上一帧的静态物体sift点（即上一帧的全局obj id为0，但cls不为0），即使其（所在物体）在当前两帧之间变为动态的，其光流值也不会太大（物体刚启动运动）。
-                // 这些sift点暂时不归为背景sift点，等到确定该物体是否运动后再归类！
-                else if (cls_cur == cls_prev && cls_cur > 0 && obj_status_prev == 0 && abs(disp_x) < 1280/8.0 && abs(disp_y) < 384/6.0)
-                {
-                    // 物体id按当前帧的局部编号来，等物体关联之后再等其进行更新。
-                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(cls_prev, obj_id);
-                    ++num_track_sift_static;
-
-                    // id_bg_track_sift.push_back(id_in_pts);
-
-                    if(track_cnt_sift[id_index] > 1) ++num_sta_sift_long_track;
-
-                    // 系统第3帧开始才会有相机运动的预测
-                    // 该静态物体点需要在上面通过极线约束的检验
-                    if(frame_count > 1 && reject_with_F && !invalid_sta_obj_fea)
-                    {
-                        // 静态物体的跟踪点，如果基于预测的相机运动的重投影误差小于阈值，
-                        // 则可以参与当前帧相机运动的F矩阵的估计（因为有些情景除了路边停的车，近处几乎没有任何可靠的点，甚至没有车道线），前提是上一帧的该物体点有立体匹配（深度的精度较高）
-                        int gl_id = ids_sift[id_index];
-                        // 只选择那些在上一帧有立体匹配的静态物体点
-                        if(prevRightFeaMap.find(gl_id) != prevRightFeaMap.end())
-                        {
-                            int prev_dep = prev_sift_dep[id_index];
-                            // 上一帧12m以内的静态物体点。需要该点在上一帧中立体三角化成功（对于有立体匹配的最新跟踪点，其深度值只来自于立体三角化或前后帧三角化，不来自于运动变换更新）
-                            if(prev_dep > 0 && prev_dep < 12.0)
-                            {
-                                // 对每个map进行索引时，最好先判断一下相关的key是否存在，否则如果不在的话，只要进行了索引就会创建默认的键值对，value是随机的！
-                                if(prev_un_Fea_map.find(gl_id) != prev_un_Fea_map.end())
-                                {
-                                    Vec4f &prev_fea = prev_un_Fea_map[gl_id];
-                                    float prev_x = prev_fea(0) * prev_dep;
-                                    float prev_y = prev_fea(1) * prev_dep;
-                                    Vector3d prev_pt(prev_x,prev_y,prev_dep);
-                                    
-                                    Vector3d pred_cur = (R_cam_motion * prev_pt + P_cam_motion);
-                                    if(pred_cur(2) > 0)
-                                    {
-                                        float pred_x = pred_cur(0)/pred_cur(2);
-                                        float pred_y = pred_cur(1)/pred_cur(2);
-
-                                        Point2f cur_un_fea;
-                                        undistortedPts(cur_pt,cur_un_fea,m_camera[0]);
-
-                                        float err = (pred_x - cur_un_fea.x)*(pred_x - cur_un_fea.x) + (pred_y - cur_un_fea.y)*(pred_y - cur_un_fea.y);
-                                        // 重投影误差小于5个像素点
-                                        if(err < (5.0/FOCAL_LENGTH_X)*(5.0/FOCAL_LENGTH_X))
-                                        {
-                                            is_stat_obj_fea_track = true;
-                                            
-                                            if(only_use_track_sift_for_F)
-                                                id_bg_track_sift.push_back(id_index);
-                                            // else
-                                            // {
-                                            //     // 记录该静态物体跟踪点的全局id，因为后续要先reduceVector，使用其全局id查看其在剩下vector中的序号
-                                            //     gl_id_stat_obj_fea.push_back(ids_sift[id_index]);
-                                            // }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // 上上帧与上一帧之间是动态或新的物体，其在上一帧到当前帧之间也可能变成静态的。这种情况在这里可以也按动态物体的标准来衡量（虽然可能会造成一定的误匹配，但概率会比较小）。
-                // 后续根据物体运动状态的判定来更改其对应sift点的全局id。
-                else if (cls_cur == cls_prev && obj_status_prev > 0 && abs(disp_x) < 1280/6.5 && abs(disp_y) < 384/4.5)
-                //else if (cls_label == obj_cls_id_sift[id_index].first && obj_id > 0 && abs(disp_x) < 1280/4.0 && abs(disp_y) < 384/2.0)
-                {
-                    // 物体id按当前帧的局部编号来，等物体关联之后再等其进行更新。
-                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(cls_prev, obj_id);
-                    // 对于上一帧的新物体的跟踪点，这里暂时不加入
-                }
-                // 漏检或者错检的物体的配对，在系统前两帧暂时不考虑，因为首帧无法得知各物体的运动状态！！对于首帧的误检物体的特征点匹配，依赖于flow_map提供FAST点的预测和匹配。
-                // 上一帧点为运动或新的物体，且与当前帧匹配点类别不同（当前帧可能为背景，也可能为物体），则可能是当前帧漏检该运动物体（为背景点）或者错分类该物体，则按照动态光流来约束
-                else if (cls_cur != cls_prev && obj_status_prev > 0 && abs(disp_x) < 1280/6.5 && abs(disp_y) < 384/4.5)
-                {
-                    // 物体id按当前帧的局部编号来，等物体关联之后再对其进行更新。
-                    // 物体类别则与上一帧的匹配物体点对齐，当前帧匹配点的检测分类可以从seg_map中查询
-                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(cls_prev, obj_id);
-                }
-                // 上一帧点为静态物体(明确不是背景），且与当前帧匹配点类别不同（当前帧可能为背景或其他物体），则可能是当前帧漏检该静态物体（为背景点）或者错分类该物体，则按照静态光流来约束
-                else if (cls_cur != cls_prev && cls_prev >0 && obj_status_prev == 0 && abs(disp_x) < 1280/8.0 && abs(disp_y) < 384/6.0)
-                {
-                    // 物体类别则与上一帧的匹配物体点对齐，当前帧匹配点的检测分类可以从seg_map中查询
-                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(cls_prev, obj_id);
-                    ++num_track_sift_static;
-                    if(track_cnt_sift[id_index] > 1) ++num_sta_sift_long_track;
-                }
-                // 上一帧点为背景点，当前帧点为物体点，则可能是上一帧漏检了该物体且该点没有与上上帧的物体SIFT点相关联（因为没有被校正cls），则此时无法确定该物体是否为动态的。还是采用动态光流的阈值
-                else if (cls_cur != cls_prev && cls_prev == 0 && abs(disp_x) < 1280/6.5 && abs(disp_y) < 384/4.5)
-                {
-                    // 如果该背景点被多帧观测（多帧观测的情况下则确定该点原本为背景点），则不太可能当前帧突然变为物体点
-                    // 如果该点在上一帧中没有深度值，则不采用该跟踪点，因为这样无法参与估计该漏检物体的运动！
-                    if (track_cnt_sift[id_index] > 1) 
-                    {
-                        continue;
-                    }
-                    
-                    // 对于上一帧的漏检物体点，要求其有深度值。
-                    if(prev_sift_dep[id_index] <= 0)
-                    {
-                        int gl_id = ids_sift[id_index];
-                        if(prevRightFeaMap.find(gl_id) == prevRightFeaMap.end())
-                        {
-                            continue;
-                        }
-                        else
-                        {
-                            float dep;
-                            float prev_x_r = prevRightFeaMap[gl_id].x;
-                            dep = mbf/(prev_x - prev_x_r);
-                            if(dep > 1.5 && dep < mThDepthObj)
-                                prev_sift_dep[id_index] = dep;
-                            else
-                                continue;
-                        }
-                    }
-                    
-                    // 上一帧的背景点对齐到当前帧的物体点时，使用当前帧的物体类别，后续则可以根据上一帧的点的全局id来判断该点是否为背景点
-                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(cls_cur, obj_id);
-                }
-                else
-                {
-                    if(reject_with_F && det_cls_prev == 0 && cls_cur == 0) 
-                    {
-                        num_flow_pt_in_bloc[row_in_bloc][col_in_bloc] -= 1;
-                    }
-                    
-                    continue;
-                }
-                
-                status_sift[id_index] = 1;
-                l_pt_id = id_index;
-                ++num_track_sift;
-                cur_sift[id_index] = cur_pt;
-                // 当前点的匹配点在其siftdata检测点集中的index,这里是siftdata2
-                match_id = h1_siftpts[validpts_id].match;
-                cur_sift_index[id_index] = match_id;
-
-                // 注意，上一帧的就已被跟踪的sift的stereo不一定是来自sift的暴力匹配。
-                // 对于背景点，是来自于暴力匹配；而对于物体点，其立体匹配可能是来自于depth_map（其实也可以让depth_map只提供深度值，而不提供右图像观测）
-                // int gl_id = ids_sift[id_index];
-                // if(prevRightFeaMap.find(gl_id) != prevRightFeaMap.end()) 
-                // {
-                //     // has_stereo = true;
-                //     dep_prev = prev_sift_dep[id_index];
-                // }
-
-                if(add_new_sift_in_next_frame)
-                {
-                    // 如果关联的两个点有一个不是背景点，则认为是物体跟踪点
-                    if(cls_prev != 0 || cls_cur != 0)
-                    {
-                        // 此mask是标注上一帧中所有被当前帧跟踪到的点，为了后续物体关联时采样用于运动估计的像素点关联而用
-                        circle(mask_prev_fea_objs, prev_sift[id_index], 3, 0, -1);
-                    }
-                    // tracked_objs_long_bg.insert(validpts_id);
-                }
+            int max_cnt = 0;
+            for(int i = 0; i < 4; ++i)
+            {   
+                if(num_fea_2D2D_big_bloc[i] > max_cnt) max_cnt = num_fea_2D2D_big_bloc[i];
             }
-            // 如果被跟踪点是上一帧的新点。这只会是纯背景跟踪点
-            else
-            {
-                // 只保留上一帧新的背景跟踪点
-                // cls_prev = seg_map_prev.at<Vec2b>(prev_y, prev_x)(0);
-                cls_prev = det_cls_prev;
-                
-                // 上一帧被检测的物体的点，无论是被跟踪点还是新点，都已经在上一帧添加了，所以不会出现在当前帧的新跟踪点中。
-                if(cls_prev != 0) 
-                {
-                    continue;
-                }
-
-                // 纯背景跟踪点需要通过极线约束的检验
-                if(check_flow_with_epi && cls_cur == 0)
-                {
-                    int succ = check_flow_with_F(cam_F, prev_pt, cur_pt);
-
-                    // 背景点需要离预测的极线不能太远
-                    if(succ <= 0)
-                    {
-                        // status_sift[id_index] = 0;
-
-                        if(reject_with_F)
-                            num_flow_pt_in_bloc[row_in_bloc][col_in_bloc] -= 1;
-                        
-                        continue;
-                    }
-                }
-
-                // 是否有立体匹配
-                auto it = find(temp_flow_pt_id.begin(),temp_flow_pt_id.end(),validpts_id);
-                
-                bool valid_prev_stereo = false;
-                // 如果该跟踪点在上一帧没有立体匹配
-                if(it == temp_flow_pt_id.end())
-                {
-                    temp_track.emplace_back(prev_x, prev_y);
-                    temp_track_pt_g_id.push_back(n_id);
-                    temp_track_pt_l_id.push_back(id_in_pts);
-                }
-                else
-                {
-                    pt_stereo_with_flow.insert(validpts_id);
-
-                    float *prev_info_ptr = Sift_->prev_stereo_match_info + 5 * validpts_id;
-                    match_xpos_r = prev_info_ptr[3];
-                    match_ypos_r = prev_info_ptr[4];
-
-                    disp_match_x_r = prev_x - match_xpos_r;
-                    // disp_match_y_r = prev_y - match_ypos_r;
-                    assert(disp_match_x_r > 0);
-                    dep_prev = mbf/disp_match_x_r;
-
-                    // 图像上半部分的跟踪点，要求深度值较小
-                    int row_in_bloc = prev_y/60;
-
-                    // todo: 是否可以接受上半图像中深度较大的点？有些路况基本无法在地面上检测到特征点，因此还是需要较远的点
-                    if(0 && row_in_bloc < 3 && dep_prev > 5.0)
-                    {
-                        // 图像上半部分的跟踪点数不需要再统计，因为不会在该区域检测新的FAST背景点
-                        // if(reject_with_F && det_cls_prev == 0 && cls_cur == 0) num_flow_pt_in_bloc[row_in_bloc][col_in_bloc] -= 1;
-                        continue;
-                    }
-                    
-                    // 根据ORB-SLAM2的设置，大于40倍基线的深度的背景点为远点，这些远点的立体匹配一般比较不准确（会影响估计F和H以及PnP和LBA），因此放弃它们的立体匹配，而是用前后2帧三角化来计算它们的深度
-                    // 这里取得比40倍基线(KITTI基线长度为0.54m，40倍为21m)
-                    if(cls_cur == 0) 
-                    {
-                        if(dep_prev > mMinDepthPt && dep_prev < 21)
-                            valid_prev_stereo = true;
-                    }
-                    else
-                    {
-                        // 如果漏检的物体点在上一帧的深度超过阈值，则放弃该物体点跟踪
-                        if(dep_prev > mMinDepthPt && dep_prev <= mThDepthObj)
-                            valid_prev_stereo = true;
-                        else
-                            continue;
-                    }
-                }
-                
-                undistortedPts(prev_pt, prev_un_pt, m_camera[0]);
-
-                prev_sift.emplace_back(prev_x, prev_y);
-                cur_sift.emplace_back(cur_x,cur_y);
-                prevLeftFeaMap[n_id] = prev_pt;
-                prev_un_Fea_map[n_id] = Vec4f(prev_un_pt.x, prev_un_pt.y, 0.0, 0.0);
-                ids_sift.push_back(n_id);
-
-                // 添加上一帧的右匹配点
-                if(valid_prev_stereo)
-                {
-                    prev_pt_r.x = match_xpos_r;
-                    prev_pt_r.y = match_ypos_r;
-                    undistortedPts(prev_pt_r, prev_un_pt_r, m_camera[1]);
-
-                    prevRightFeaMap[n_id] = prev_pt_r;
-                    prev_un_r_Fea_map[n_id] = Vec4f(prev_un_pt_r.x, prev_un_pt_r.y, 0.0 ,0.0);
-                }
-
-                // 这部分点寻求使用2帧的三角化来获得在上一帧中的深度值，包括首帧左右2帧或者前后2帧
-                if(use_tria_stereo && cls_cur == 0)
-                {
-                    prev_sift_dep.push_back(-1.0);
-                }
-                else
-                {
-                    // 如果匹配的当前点为物体点，或者背景点可以在这里直接三角化
-                    if((cls_cur > 0 || !use_tria_stereo) && valid_prev_stereo)
-                    {
-                        prev_sift_dep.push_back(dep_prev);
-                    }
-                    else
-                    {
-                        // 等待后续完成深度预测
-                        prev_sift_dep.push_back(-1.0);
-                    }
-                }
-
-                // 记录当前帧该跟踪点在当前帧的检测sift点集中的序号
-                match_id = h1_siftpts[validpts_id].match;
-                cur_sift_index.push_back(match_id);
-                prev_sift_global_obj_id.push_back(0);
-                // 因为上一帧该点是背景点，因此按照当前帧匹配点的检测cls 和 local obj_id
-                obj_cls_id_sift.emplace_back(cls_cur,info_pt_cur(1));
-                track_cnt_sift.push_back(1);
-                status_sift.push_back(1);
-                ++n_id;
-
-                l_pt_id = id_in_pts;
-                // ++num_sift_bg_cur;
-                ++num_track_sift;
-
-                // 记录用于估计F矩阵的sift跟踪点在cur_sift中的序号
-                
-                // 如果上一帧和当前帧都是背景点，则是背景点
-                if(cls_cur == 0) 
-                {
-                    if(reject_with_F && only_use_track_sift_for_F) 
-                        id_bg_track_sift.push_back(id_in_pts);
-                }
-
-                ++id_in_pts;
-            }
-
-            // 记录跟踪点中有立体匹配的点
-            if(find(temp_flow_pt_id.begin(),temp_flow_pt_id.end(),validpts_id) != temp_flow_pt_id.end())
-            {
-                // set不会有重复元素
-                pt_stereo_with_flow.insert(validpts_id);
-                ++prev_pts_with_stereo;
-            }
-
-            // 选取背景跟踪点用于计算相机运动的F矩阵
-            if(reject_with_F)
-            {
-                // 如果是纯背景跟踪点，或者静态物体的跟踪点
-                if((cls_prev == 0 && cls_cur == 0) || is_stat_obj_fea_track)
-                {   
-                    // 上半部分的跟踪点要求深度较小（一般都是路杆、路牌之类的），这类点一般较少
-                    if(row_in_bloc < 3)
-                    {
-                        // 上半部分的跟踪点是否要参与F矩阵的估计？对估计R的影响大吗？
-                        // continue;
-                        
-                        // 近处的物体点不允许出现在图像上半部分
-                        if(is_stat_obj_fea_track) continue;
-
-                        // 上半部分每个bloc只添加5个点。由于CudaSift中对上半图像中没有深度或者深度较大的点 有数量限制，因此这里可以适当增大bloc允许的点数
-                        int num_total = 5;
-                        // 上半部分中如果有近点，则一般不会是只有一个点，可以多添加这部分点非地面点，有利于F矩阵的估计
-                        // todo:但是深度误估计（即sift立体匹配错误点）的点较多怎么办？
-                        if(dep_prev > 0)
-                        {
-                            // if(dep_prev < 4.5)
-                            //     num_total = 10;
-                            // else if(dep_prev < 16)
-                            //     num_total = 9;
-
-                            if(dep_prev < 16)
-                                num_total = 9;
-                        }
-                        
-                        if(id_best_track_bloc[row_in_bloc][col_in_bloc] < num_total)
-                        {
-                            id_best_track_bloc[row_in_bloc][col_in_bloc] += 1;
-                            
-                            if(only_use_track_sift_for_F) 
-                                pts_for_cal_F.insert(-l_pt_id);
-                            else
-                                id_pts_flow_for_F.push_back(match_id);
-                        }
-                    }
-                    else
-                    {
-                        int num_total = 6;
-                        // 近处的点多添加一些
-                        // 最下面2行的每个框增加多一些点
-                        if(row_in_bloc > 3)
-                        {
-                            num_total = NUM_FEA_IN_BLOC;
-                            // 如果该框中出现了静态物体，则一般而言物体会占据比较大的区域，则适当减少一下点
-                            if(is_stat_obj_fea_track)
-                                num_total = 6;
-                        }
-                        
-                        if(id_best_track_bloc[row_in_bloc][col_in_bloc] < num_total)
-                        {
-                            id_best_track_bloc[row_in_bloc][col_in_bloc] += 1;
-
-                            if(only_use_track_sift_for_F) 
-                                pts_for_cal_F.insert(-l_pt_id);
-                            else
-                                id_pts_flow_for_F.push_back(match_id);
-                        }
-                    }
-
-                    // 记录有立体匹配的背景跟踪点，用于选择分解得到的R和t，并估计t的真实尺度
-                    // if(has_stereo)
-                    // {
-                    //     pts_stereo_for_F.push_back(l_pt_id);
-                    // }
-                }
-            }
-        }
-
-        // 为部分跟踪的sift点（即背景中的新跟踪点）在上一帧寻找右观测点
-        if(!temp_track.empty())
-        {
-            float ave_disp_x_bg = mbf/(2.0/3*mMinDepthPt + 1.0/3*mThDepthBg);
-            float ave_disp_y_bg = Y_shift_right_image/(2.0/3*mMinDepthPt + 1.0/3*mThDepthBg);
-            vector<Point2f> temp_track_r;
-            float r_x, r_y;
-            for(auto &pt:temp_track)
-            {
-                float disp = map_depth_prev.at<float>(pt.y,pt.x);
-                if(disp <= 0)
-                {
-                    // assert(disp>0 && "Why value in disp_map <= 0?");
-                    r_x = pt.x - ave_disp_x_bg;
-                    r_y = min(pt.y+ave_disp_y_bg, (float)(row-5));
-                }
-                else
-                {
-                    float depth = mbf/disp;
-                    float shift_y = Y_shift_right_image/depth;
-                    r_x = pt.x - disp;
-                    r_y = min(pt.y+shift_y, (float)(row-5));
-                }
-
-                if(r_x >= 5 && r_x <= bg_right_border_right_img)
-                    temp_track_r.emplace_back(r_x, r_y);
-                else if (r_x < 5)
-                    temp_track_r.emplace_back(5, r_y);
-                else
-                    temp_track_r.emplace_back(bg_right_border_right_img, r_y);
-            }
-
-            vector<float> err;
-            vector<uchar> status_temp;
-            cv::calcOpticalFlowPyrLK(prev_img, prev_img_r, temp_track, temp_track_r, status_temp, err, cv::Size(21, 21), 2, 
-            cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
             
-            // FLOW_BACK = false;
-            // reverse check  逆向光流计算，用上面光流计算出的当前帧中特征点位置 再 计算到上一帧的光流匹配，如果得到检测位置和上一帧的点原始位置距离相差很小，则认为光流成功
-            FLOW_BACK = true;
-            if(FLOW_BACK)
+            for(int i = 0; i < 4; ++i)
             {
-                vector<uchar> reverse_status;
-                vector<cv::Point2f> reverse_pts = temp_track;
-                vector<float> reverse_err;
-                cv::calcOpticalFlowPyrLK(prev_img_r, prev_img, temp_track_r, reverse_pts, reverse_status, reverse_err, cv::Size(15, 15), 1, 
-                cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
-                //cv::calcOpticalFlowPyrLK(cur_img, prev_img, cur_FAST, reverse_pts, reverse_status, err, cv::Size(21, 21), 3); 
-                for(size_t i = 0; i < status_temp.size(); ++i)
-                {
-                    if(status_temp[i] && reverse_status[i] && distance(temp_track[i], reverse_pts[i]) < 0.8)
-                    {
-                        continue;
-                    }
-                    else
-                        status_temp[i] = 0;
-                }
-            }
-
-            Point2f prev_un_pt_r;
-            for (size_t i = 0; i < status_temp.size(); ++i)
-            {
-                Point2f &prev_pt = temp_track[i];
-                Point2f &prev_pt_r = temp_track_r[i];
-                float disp_x_stereo = prev_pt.x - prev_pt_r.x;
-                float disp_y_stereo = prev_pt.y - prev_pt_r.y;
-                int l_id = temp_track_pt_l_id[i];
-                uchar cls_ = obj_cls_id_sift[l_id].first;
-                int row_in_bloc = prev_pt.y/60;
-                // 没有或者不正确的匹配
-                if (!status_temp[i] || abs(disp_y_stereo) > 1.2 || disp_x_stereo <= 0)
-                {
-                    // 物体点在上一帧的漏检点如果没有深度值或者深度值，则放弃该点（其实也可以不用放弃，用作2个物体的点关联，以便开启像素关联验证?）
-                    if(cls_ > 0) 
-                        status_sift[l_id] = 0;
-                    // 如果背景跟踪点在上一帧没有立体匹配，且此系统不允许2-frame的三角化深度测量，则放弃此点
-                    else if(!USE_TRIANGULATE_TWO_FRAME)
-                        status_sift[l_id] = 0;
-                    else
-                    {
-                        // todo:对于图像上半部分的跟踪点，如果在上一帧没有立体匹配，是否放弃该跟踪点？应该要保留，有利于估计矩阵的旋转
-                        if(0 && row_in_bloc < 3)
-                        {
-                            status_sift[l_id] = 0;
-                        }
-                    }
-                    continue;
-                }
-
-                // 对于图像上半部分的点，对深度要求进一步加强
-                // if(row_in_bloc < 3)
-                // {
-                //     if(cls_ == 0)
-                //     {
-                //         // 对于纯背景跟踪点，如果上一帧该点深度大于18.0m，则放弃该立体匹配（认为不够准确），但不放弃该跟踪点！小于1.5的点还是可以保留的，例如距离汽车很近的杆，且汽车静止
-                //         if(disp_x_stereo < mbf/18.0)
-                //         {
-                //             // 上半部分的跟踪点数不需要再统计
-                //             // if(reject_with_F) num_flow_pt_in_bloc[row_in_bloc][col_in_bloc] -= 1;
-                //             // status_sift[l_id] = 0;
-                //             continue;
-                //         }
-                //     }
-                // }
+                if(i < 2) 
+                    min_num_per_bloc_need[i] = num_up;
+                else
+                    min_num_per_bloc_need[i] = num_low;
                 
-                // 物体点在上一帧的漏检点如果深度值超过阈值，则放弃该点
-                if(cls_ > 0)
-                {
-                    if(disp_x_stereo <= mbf/mThDepthObj || disp_x_stereo > 256)
-                    {
-                        status_sift[l_id] = 0;
-                        continue;
-                    }
-                }
-                // 纯背景点的深度值不能太大，超过20m就认为不可靠；也不能太小
-                else if(disp_x_stereo < mbf/20.0 || disp_x_stereo > 256) 
-                    continue;
-
-                ++prev_pts_with_stereo;
-                int gl_id = temp_track_pt_g_id[i];
-                prevRightFeaMap[gl_id] = prev_pt_r;
-                undistortedPts(prev_pt_r, prev_un_pt_r, m_camera[1]);
-                prev_un_r_Fea_map[gl_id] = Vec4f(prev_un_pt_r.x, prev_un_pt_r.y, 0.0 ,0.0);
-
-                // 如果不需要三角化才得到深度值（即认为立体校正足够好）
-                if(cls_ > 0 || !use_tria_stereo) 
-                {
-                    float dep = mbf/disp_x_stereo;
-                    prev_sift_dep[l_id] = dep;
-                }
-                
-                // if(obj_cls_id_sift[l_id].first == 0)
-                // {
-                //     pts_stereo_for_F.push_back(l_id);
-                // }
+                // min_num_per_bloc_need[i] = max(10, max_cnt);
             }
-        }
-
-        valid_match_flow_ptr[0] = 0;
-        
-        // 这些上一帧有立体匹配的sift点，采用与FAST一样的跟踪方式，因此就相当于是上一帧的新FAST点了！
-        // 因此，FAST的跟踪要在这里完成之后才进行。注意，这部分有立体匹配的sift点可以出现在图像的上半部分，此时其深度值比较小
-        bool find_flow_for_stereo_match = true;
-        if(find_flow_for_stereo_match)
-        {
-            if(!temp_flow_pt_id.empty())
-            {
-                SiftPoint *all_pt_ptr = Sift_->siftData1.h_data;
-                float prev_x, prev_y, prev_x_r, prev_y_r;
-                for(auto iter: temp_flow_pt_id)
-                {
-                    // 注意，temp_flow_pt_id中前面部分点是跟踪点，即在pt_stereo_with_flow中，应该略去！
-                    if(pt_stereo_with_flow.find(iter) != pt_stereo_with_flow.end()) continue;
-
-                    float *prev_info_ptr = Sift_->prev_stereo_match_info + 5 * iter;
-                    prev_x = all_pt_ptr[iter].xpos;
-                    prev_y = all_pt_ptr[iter].ypos;
-                    
-                    prev_x_r = prev_info_ptr[3];
-                    prev_y_r = prev_info_ptr[4];
-                    
-                    assert(prev_x - prev_x_r > 0);
-
-                    float dep = mbf/(prev_x-prev_x_r);
-                    if(dep > 24) continue;
-
-                    prev_FAST.emplace_back(prev_x,prev_y);
-                    prev_FAST_global_obj_id.push_back(0);
-                    track_cnt_FAST.push_back(1);
-                    ids_FAST.push_back(n_id);
-                    // status_FAST.push_back(1);
-                    obj_cls_id_FAST.emplace_back(0,0);
-
-                    prev_pt.x = prev_x;
-                    prev_pt.y = prev_y;
-                    prevLeftFeaMap[n_id] = prev_pt;
-
-                    undistortedPts(prev_pt, prev_un_pt, m_camera[0]);
-                    prev_un_Fea_map[n_id] = Vec4f(prev_un_pt.x, prev_un_pt.y, 0.0, 0.0);
-
-                    prev_pt_r.x = prev_x_r;
-                    prev_pt_r.y = prev_y_r;
-                    prevRightFeaMap[n_id] = prev_pt_r;
-
-                    undistortedPts(prev_pt_r, prev_un_pt_r, m_camera[1]);
-                    prev_un_r_Fea_map[n_id] = Vec4f(prev_un_pt_r.x, prev_un_pt_r.y, 0.0, 0.0);
-
-                    if(use_tria_stereo)
-                        prev_FAST_dep.push_back(-1.0);
-                    else
-                    {
-                        float dep = mbf/(prev_x-prev_x_r);
-                        prev_FAST_dep.push_back(dep);
-                    }
-
-                    ++n_id;
-                }
-            }
-        }
-
-        // 通知FAST track线程已经完成了来自sift的新FAST的添加。
-        // 之后再在FAST的跟踪函数中查看各个bloc中特征点数是否足够，如果不够，添加上一帧图像中检测的FAST新点（有立体匹配的在前，无立体匹配的在后）（可以不在上一时刻检测，而是在当前帧中再从上一帧的图像剩余区域检测FAST点，这样就不需要排除多余的FAST点）
-        add_new_FAST_from_sift = true;
-
-        cout << "Num of tracked prev sift fea with stereo match: " << prev_pts_with_stereo << endl;
-
-        // 是否需要根据极线约束去除异常匹配点
-        // 如果需要，是否只使用sift跟踪来估计F矩阵？
-        if(reject_with_F && only_use_track_sift_for_F)
-        {
-            if(pts_for_cal_F.size() > 8)
-                rejectWithFV1(true, init_succ_IMU, pts_for_cal_F);
-            else
-                rejectWithFV1(true, init_succ_IMU);
-        }
-        else
-        {
-            // 删除无有效跟踪的prev_sift点
-            reduce_invalid_fea(true);
+            
+            // 在每个大bloc中最多检测3次
+            new_FAST_detect_and_track(mask_bg_fea_prev, 0.985, 0.97, num_valid_track, seg_map_cur, flow_map, min_num_per_bloc_need, 3);
         }
         
-        if(!track_cnt_sift.empty())
+        // 为所有点增加跟踪次数
+        for(auto &iter: track_cnt_FAST)
         {
-            for(auto &n : track_cnt_sift)
-                ++n;
-        }
-        // assert(num_track_sift == ids_sift.size() && "Something wrong with num_track_sift!");
-
-        num_track_sift = cur_sift.size();
-        cout << "num of tracked sift in cur frame: " << num_track_sift << endl;
-        
-        if(num_track_sift > 0)
-        {
-            cv::Point2f temp_pt(0.0,0.0);
-            cur_right_sift.resize(num_track_sift,temp_pt);
-            cur_sift_dep.resize(num_track_sift,-1.0);
-
-            // 如果上面删减了失败的prev_sift点，则剩下的点都是有效跟踪点了，因此这里可以把所有点的status赋为0，下面根据立体匹配结果来最后决定是否保留该跟踪点。
-            // 也可以换种思路，不重置，下面根据跟踪点是否有立体匹配来决定是否删除该点
-            if(!status_sift.empty()) status_sift.clear();
-            status_sift.resize(num_track_sift,0);
-
-            // 使用背景跟踪点中的部分点来估计F矩阵
-            if(reject_with_F && !only_use_track_sift_for_F)
-            {
-                vector<int> valid_track;
-                // id_pts_flow_for_F保存的是按照ambi score从小到大排序的有效跟踪点（包含纯背景点，和近处的静态物体点）的sift match的index
-                // 为每个bloc选取最大固定数量的最佳跟踪点来估计F矩阵
-                for(int k = 0; k < id_pts_flow_for_F.size(); ++k)
-                {
-                    int index_in_flow_match = id_pts_flow_for_F[k];
-                    auto it_index = find(cur_sift_index.begin(),cur_sift_index.end(),index_in_flow_match);
-
-                    // 有些跟踪点在寻找上一帧立体匹配时可能被删除了
-                    // assert(it_index != cur_sift_index.end());
-                    if(it_index == cur_sift_index.end()) continue;
-
-                    int l_index = std::distance(cur_sift_index.begin(),it_index);
-                    
-                    valid_track.push_back(l_index);
-
-                    // id_bg_track_sift中只添加纯背景跟踪点，而不添加静态物体跟踪点（它们只用来估计F或H矩阵），因为即使物体点是F或H估计的外点，也不删除该物体跟踪点（因为该物体可能变为动态的
-                    if(obj_cls_id_sift[k].first == 0)
-                    {
-                        id_bg_track_sift.push_back(k);
-                        ++num_sift_bg_cur;
-                    }
-
-                    // uchar cls_cur = obj_cls_id_sift[l_index].first;
-                    // 跟踪点的cls_cur为0，意味着上一帧和当前帧该点均位于背景中。但是添加的静态跟踪点中还包含静态物体点！
-                    // if(cls_cur == 0)
-                    // {
-                        // 这里不需要再进行分区挑选了，因为在上面已经进行了
-
-                        // Point2f &prev_pt = prev_sift[l_index];
-                        // int col_in_bloc = prev_pt.x/200;
-                        // int row_in_bloc = prev_pt.y/60;
-
-                        // if(col_in_bloc == 6) col_in_bloc = 5;
-                        // if(row_in_bloc == 6) row_in_bloc = 5;
-                        
-                        // if(row_in_bloc < 3)
-                        // {
-                        //     // continue;
-
-                        //     // 上半部分每个bloc只添加一个点
-                        //     if(id_best_track_bloc[row_in_bloc][col_in_bloc] < 1)
-                        //     {
-                        //         id_best_track_bloc[row_in_bloc][col_in_bloc] += 1;
-
-                        //         pts_for_cal_F.insert(-l_index);
-                        //     }
-
-                        // }
-                        // else
-                        // {
-                        //     int num_total = 2;
-                        //     if(row_in_bloc > 3) num_total = 3;
-                        //     // 近处的点多添加一些，每个bloc三个点
-                        //     if(id_best_track_bloc[row_in_bloc][col_in_bloc] < num_total)
-                        //     {
-                        //         id_best_track_bloc[row_in_bloc][col_in_bloc] += 1;
-
-                        //         pts_for_cal_F.insert(-l_index);
-                        //     }
-                        // }
-
-                        // 由于id_pts_flow_for_F中的跟踪是按照匹配score从小到大排序放入的，因此这里pts_for_cal_F的点也是越靠前匹配质量越高！
-                        // pts_for_cal_F.insert(-l_index);
-                    // }
-                }
-
-                // 优先取前 n% 的点参与F或H矩阵的估计
-                int num_valid = valid_track.size();
-                int num_ada = num_valid * 4/5.0;
-                // todo:是否要专门添加上半图像中的点？不需要，如果近点实在不足，自然会添加远点
-                bool add_up_half_img_fea = false;
-                num_up_half = 0;
-                int total_add = 0;
-                for(int i = 0; i < num_valid; ++i)
-                {
-                    int id = valid_track[i];
-                    float y = cur_sift[id].y;
-                    // 如果已经添加了足够多的sift跟踪点，则看是否有足够多的远点
-                    // if(i > num_ada && total_add > 20)
-                    if(i > num_ada)
-                    {
-                        // 选取一定的远点用以估计R
-                        if(add_up_half_img_fea && num_up_half < 5)
-                        {
-                            if(y >= 3)
-                                continue;
-                        }
-                        else
-                        {
-                            break;
-                        }
-                    }
-
-                    pts_for_cal_F.insert(-id);
-                    ++total_add;
-
-                    if(y/60 < 3) ++num_up_half;
-                }
-            }
+            iter += 1;
         }
     }
-
-    // 当前帧跟踪到的点中的最大全局id。其中有些跟踪点是无效的（已经被确认无效，或者之后setMask时会跟FAST过近而无效），但因为每个点的id都是独一无二的，因此后面的新点的id肯定不会比这里的跟踪点大
-    if(!ids_sift.empty())
-        last_id_track_fea_cur = *(std::max_element(ids_sift.begin(),ids_sift.end()));
     
-    // 记录各个检测物体上的特征点的平均深度和点数，当没有使用depth_map时可以提供各个物体上的点的近似深度值预测
-    // if(use_motion_to_pred_fea_dep)
+    printf("optical flow of FAST costs: %fms \n", t_o.toc());
+    
+    // 下面开始进行E_H矩阵的估计，对内点寻找其在上一帧的立体匹配，限制跟踪点的数量
+    if(frame_cnt > 0)
     {
-        if(!obj_fea_disp_num.empty()) 
-            obj_fea_disp_num.clear();
-    }
-
-    num_bg_sift_with_dep = 0;
-    
-    // 寻找跟踪sift点在当前帧的右图像匹配点。并添加新的sift点（有立体匹配或者深度值的物体点）
-    if(STEREO && !_img1.empty())
-    {
-        int* valid_match_stereo = Sift_->img2.h_matching_pts_stereo;
-        SiftData* sift_data = &(Sift_->siftData2);
-        
-        SiftPoint *h2_siftpts = Sift_->siftData2.h_data;
-        int init_track = 0, num_track = num_track_sift;
-        int num_sift_bg_cur_ = num_sift_bg_cur;
-        
-        num_new_sift_bg = 0;
-        int num_new_sift = 0;   
-
-        int num_match_stereo = valid_match_stereo[0];
-        // todo： 暂不添加当前帧中有立体匹配的背景sift新点，改为下一帧根据flow匹配结果添加
-        // add_new_sift_in_next_frame = true;
-
-        if(num_match_stereo > 0)
-        {
-            vector<uchar> status_sift_stereo_flow(num_match_stereo, 0);
-            Vec2b info_pt;
-            if(num_track > 0)
-            {
-                // 也可以像上面一样使用reserve和assign函数来转化为vector，只是下面这种方式更简洁
-                // 同样的，vetcor vec(ptr_begin, ptr_end)，其中ptr_end位置处的元素是不算的
-                vector<int> match_stereo(valid_match_stereo + 1, valid_match_stereo + 1 + num_match_stereo);
-
-                assert(match_stereo.size() == num_match_stereo && "Something wrong with stereo-matching number!");
-
-                uchar obj_cls;
-                int obj_id;
-                //printf("stereo image; track feature on right image\n");
-                // cur left ---- cur right
-                for (int i = init_track; i < num_track; ++i)
-                {
-                    // 这里是否要滤除，取决于上面是否将status_sift所有值进行重置
-                    // if(status_sift[i] == 0) continue;
-
-                    int id_pt = cur_sift_index[i];
-
-                    vector<int>::iterator iter = std::find(match_stereo.begin(),match_stereo.end(),id_pt);
-                    // 使用跟踪点的cls而不是obj_id来判断,是因为当前帧有些背景点可能关联的是上一帧的物体(当前帧漏检)，这样可以表示该跟踪点是否为纯背景跟踪点
-                    uchar obj_cls = obj_cls_id_sift[i].first;
-                    // 该点在当前帧没有立体匹配
-                    if (iter == match_stereo.end()) 
-                    {
-                        // 对于左图像中没有在右图像找到匹配的sift跟踪点，后续是否要尝试用depth_map来获取其深度估计？
-                        // 对于物体点可以，但对于背景点则没必要，精度没法保证
-                        
-                        if (obj_cls > 0)
-                        {
-                            id_sift_no_depth.push_back(i);
-                            status_sift[i] = 2;
-                            continue;
-                        }
-                        else
-                        {
-                            // 是否保留该跟踪点是在上面已经决定了，这里无需再判断。这里只记录该跟踪点在当前帧是否有立体匹配
-
-                            // 此处不能只用prev_sift_dep或use_tria_stereo判断该点在上一帧是否有立体匹配（因为有些点跟踪点是当前帧才临时添加的，还没通过左右2帧的三角化得到深度值），应该查看该点是否在Map_prev_r中
-                            // int obj_id = ids_sift[i];
-                            // bool has_stereo_prev = (prevRightFeaMap.find(obj_id) != prevRightFeaMap.end());
-                            // if(USE_TRIANGULATE_TWO_FRAME || has_stereo_prev)
-                            {
-                                // 记录没有右匹配的背景跟踪点在cur_sift中的序号 
-                                sift_no_stereo_bg.push_back(i);
-                                // 当前帧没有深度值的bg跟踪点的状态记为2
-                                status_sift[i] = 2;
-                            }
-                            continue;
-                        }
-                    }
-
-                    int index_valid_match = std::distance(match_stereo.begin(), iter);
-                    status_sift_stereo_flow[index_valid_match] = 1;
-                    int id_siftdata = match_stereo[index_valid_match];
-                    float cord_x = h2_siftpts[id_siftdata].xpos;
-                    float cord_y = h2_siftpts[id_siftdata].ypos;
-                    float match_x = h2_siftpts[id_siftdata].match_xpos;
-                    float match_y = h2_siftpts[id_siftdata].match_ypos;
-
-                    // 对于n_img == 1,已经在cudaSift中完成了此项过滤
-                    // 右匹配点超过了规定的图像边界，那么是否应该保存其中的左图像的bg跟踪点？在右图像中快超出图像，意味着该点下一帧很可能离开相机视野？sift跟踪点的作用不是用于长跟踪，而是为当前帧跟踪提供3D-2D的PnP
-                    if (!(inBorder(cv::Point2f(match_x,match_y)))) 
-                    {
-                        // int gl_id = ids_sift[i];
-                        
-                        // if(obj_cls == 0 && prev_sift_dep[i] > 0)
-                        if(obj_cls == 0)
-                        {
-                            // sift_no_stereo_bg.push_back(i);
-                            // status_sift[i] = 2;
-                            
-                            status_sift[i] = 0;
-                        }
-                        else
-                            status_sift[i] = 0;
-                        
-                        continue;
-                    }
-                    
-                    // 在左图像的左侧的一些区域内的点要么不可能在右图像中有观测，要么其深度超过了相应的阈值;同时右图像的右侧区域也不可能在左侧有观测点
-                    if (obj_cls == 0) 
-                    {
-                        if(cord_x <= bg_left_border_left_img || match_x >= bg_right_border_right_img)
-                        {
-                            sift_no_stereo_bg.push_back(i);
-                            status_sift[i] = 2;
-                            
-                            continue;
-                        }
-                    }
-                    else if(cord_x <= obj_left_border_left_img || match_x >= obj_right_border_right_img)
-                    {
-                        // 物体点如果当前帧没有深度值，则放弃该点
-                        // 被放弃的该跟踪点可能是静态物体点，但是它仍然可以参与F矩阵的估计。只不过后续它不会被加入地图，也就无法参与优化t的尺度
-                        status_sift[i] = 0;
-                        continue;
-                    }
-
-                    // 左右图像的立体视差为 左图像点 - 右图像点
-                    float disp_x = Sift_->siftData2.valid_disp_x[index_valid_match];
-                    float disp_y = Sift_->siftData2.valid_disp_y[index_valid_match];
-                    
-                    if (disp_x <= 0) 
-                    {
-                        cout << "Weired! Get a disp_x < 0 for sift!" << endl;
-                        if (obj_cls == 0)
-                        {
-                            sift_no_stereo_bg.push_back(i);
-                            status_sift[i] = 2;
-                        
-                            continue;
-                        }
-                        else
-                        {
-                            // 物体点跟踪点没有立体匹配，但是一定要有深度值
-                            status_sift[i] = 2;
-                            id_sift_no_depth.push_back(i);
-                            continue;
-                        }
-                    }
-                    
-                    float depth = mbf/disp_x;
-
-                    if (obj_cls == 0)
-                    {
-                        // 太远的点认为立体匹配不够准确，后续该点的深度依赖于2帧三角化和运动变换更新
-                        // if (depth >= mThDepthBg || depth < 1.5) 
-                        if (depth > 21.0 || depth < 1.5) 
-                        {
-                            sift_no_stereo_bg.push_back(i);
-                            status_sift[i] = 2;
-                            
-                            continue;
-                        }
-                        // 左相机坐标系中按照估计深度得到的3D点是否在右相机的视锥体内部。如果不在，则此立体匹配是错误的
-                        // float err = (r_cam_3D_plane[0]*cur_un_sift[i].x+r_cam_3D_plane[1]*cur_un_sift[i].y+r_cam_3D_plane[2])*depth+r_cam_3D_plane[3];
-                        // if (err <= 0) continue;
-                    }
-                    // 当前帧的物体无论是否运动，都只取25m内的物体
-                    else 
-                    {
-                        // if (depth >= mThDepthObj || depth < mMinDepthPt) continue;
-                        // 对于特征点匹配，可以适当减小深度值
-                        if (depth >= mThDepthObj || depth < 1.5) 
-                        {
-                            status_sift[i] = 0;
-                            continue;
-                        }
-                        // float err = (r_cam_3D_plane[0]*cur_un_sift[i].x+r_cam_3D_plane[1]*cur_un_sift[i].y+r_cam_3D_plane[2])*depth+r_cam_3D_plane[3];
-                        // if (err <= 0) continue;
-                    }
-
-                    float y_shift = Y_shift_right_image/depth;
-
-                    // 右匹配点的v坐标超出图像下边界,则直接放弃该跟踪点
-                    if ((cord_y+y_shift) > row - 5) 
-                    {
-                        status_sift[i] = 0;
-                        continue;
-                    }
-
-                    // 从相机2和相机3的校正矩阵P_rect_xx来看,右相机的点的v坐标应该始终比左相机的对象点的v坐标要大,因此disp应该是小于0的!
-                    // if(abs(disp_y + y_shift) > 1.0)
-                    if(abs(disp_y) > 1.2)
-                    {
-                        if (obj_cls == 0)
-                        {
-                            sift_no_stereo_bg.push_back(i);
-                            status_sift[i] = 2;
-                            
-                            continue;
-                        }
-                        else
-                        {
-                            status_sift[i] = 2;
-                            id_sift_no_depth.push_back(i);
-                            continue;
-                        }
-                    }
-                    
-                    // 是否要直接使用右图像中的匹配点的v坐标?
-                    cur_right_sift[i] = cv::Point2f(match_x, match_y);
-                    // cur_right_sift[i] = cv::Point2f(match_x, cord_y+y_shift);
-                    
-                    // 之后记得给当前帧那些来自上一帧跟踪但是在当前帧却没有右图像sift的点 分配深度值（通过depth_map）
-                    if(obj_cls == 0)
-                    {
-                        if(use_tria_stereo)
-                            cur_sift_dep[i] = -1.0;
-                        else
-                            cur_sift_dep[i] = depth;
-                    }
-                    else
-                        cur_sift_dep[i] = depth;
-                    
-                    status_sift[i] = 1;
-
-                    // 记录已有的各个物体（包括背景）的平均特征点深度或视差，为后续的新点提供预测值
-                    // if(use_motion_to_pred_fea_dep)
-                    {
-                        obj_id = obj_cls_id_sift[i].second;
-                        if(obj_id > 0)
-                        {
-                            if(obj_fea_disp_num.find(obj_id) == obj_fea_disp_num.end())
-                            {
-                                obj_fea_disp_num[obj_id] = make_pair(disp_x,1);
-                            }
-                            else
-                            {
-                                obj_fea_disp_num[obj_id].first += disp_x;
-                                obj_fea_disp_num[obj_id].second += 1;
-                            }
-                        }
-                        else
-                        {
-                            ave_dep_bg_cur_frame += depth;
-                            ++num_bg_with_dep;
-                            ++num_bg_sift_with_dep;
-                        }
-                    }
-                }
-            }
-            // int num_track_sift_depth = cur_right_sift.size();
-            
-            Point2f tmp_undist_pt;
-            
-            vector<float> &valid_disp_x = sift_data->valid_disp_x;
-            vector<float> &valid_disp_y = sift_data->valid_disp_y;
-            float disp_x, disp_y;
-            float cord_x, cord_y, match_x, match_y;
-            int validpts_id;
-            
-            // cout << "start add new stereo sift!" << endl;
-            // 往当前帧添加新的sift点，需要该点具有有效的右图像匹配点（深度估计）
-            Point2f cur_un_new, cur_un_new_r;
-            int num_sift_add = num_track_sift;
-            for(int i = 0; i < num_match_stereo; ++i)
-            {
-                bool no_stereo = false;
-                bool invalid_depth = false;
-                // 跟踪的点已经算过了
-                if(status_sift_stereo_flow[i] == 1) continue;
-                
-                validpts_id = valid_match_stereo[i+1];
-
-                cord_x = h2_siftpts[validpts_id].xpos;
-                cord_y = h2_siftpts[validpts_id].ypos;
-                match_x = h2_siftpts[validpts_id].match_xpos;
-                match_y = h2_siftpts[validpts_id].match_ypos;
-
-                info_pt = seg_map_cur.at<Vec2b>(cord_y,cord_x);
-                uchar cls_label = info_pt[0];
-                
-                // 如果sift背景点新点要到下一帧再决定，则这里跳过
-                if(add_new_sift_in_next_frame && cls_label == 0) continue;
-
-                // do not consider points of person, rider or bicycle or train
-                if(cls_label == 1 || cls_label == 2 || cls_label == 4 || cls_label == 7) continue;
-
-                // 太靠近图像顶端的区域，有可能是树木之类的，也可能是建筑，去除这部分区域的点，会损失一部分点，但是可以提高运动估计的精度？
-                // 最好是使用全景分割来得到更广泛的类别区分
-                // 这里最后是只针对物体了
-                if(cord_y < (1.0/6*row) && (cord_x > 1.0/6*col && cord_x < 5.0/6*col))
-                {
-                    continue;
-                }
-                
-                if(cls_label == 0 && (cord_x <= bg_left_border_left_img || match_x >= bg_right_border_right_img)) continue;
-                if(cls_label > 0 && (cord_x <= obj_left_border_left_img || match_x >= obj_right_border_right_img)) continue;
-
-                if(!inBorder(cv::Point2f(match_x,match_y))) 
-                    continue;
-                else
-                {
-                    disp_x = valid_disp_x[i];
-                    disp_y = valid_disp_y[i];
-                    // 人为sift匹配是较为准确的立体匹配，即y方向上没有视差。disp_x<=0已经在sift后处理阶段筛除过了
-                    // disp_x is the (x_left_img - x_right_img), so disp_x should be > 0
-                    //if (disp_x <= 0) continue;
-
-                    if(disp_x <= 0)
-                    {
-                        cout << "Weired! Get disp_x < 0 for a sift!" << endl;
-                        continue;
-                    }
-
-                    float depth = mbf/disp_x;
-
-                    float y_shift = Y_shift_right_image/depth;
-
-                    if((cord_y+y_shift) > row - 5) continue;
-
-                    // 当前帧背景点
-                    if(cls_label == 0)
-                    {
-                        // 当计算出来的深度太小时，是否可信？sift的立体匹配可信度较高，但是光流匹配就不一定（因为缺少预测值，只能暴力匹配）
-                        // 对于新的背景点，如果深度为1m，则下一帧它很可能就不在相机前方了（相机的频率为100hz，如果按10m/s速度前行，那么两帧之间间隔距离为1m）
-                        // 但是也可能相机处于静止状态，所以这里也可以取1.5m为最小深度
-                        // 太远的点认为立体匹配不够准确，后续该点的深度依赖于被跟踪且2帧三角化
-                        // if(depth >= mThDepthBg || depth < 1.5 || abs(disp_y) > 1.0)
-                        if(depth > 21 || depth < 1.5 || abs(disp_y) > 1.2)
-                        {
-                            if(!add_new_sift_in_next_frame && USE_TRIANGULATE_TWO_FRAME)
-                            {
-                                no_stereo = true;
-                                sift_no_stereo_bg.push_back(num_sift_add);
-                            }
-                            else
-                                continue;
-                        }
-
-                        // cv::Point2f new_sift(cord_x, cord_y);
-                        // undistortedPts(new_sift, tmp_undist_pt, m_camera[0]);
-                        // float err = (r_cam_3D_plane[0]*tmp_undist_pt.x+r_cam_3D_plane[1]*tmp_undist_pt.y+r_cam_3D_plane[2])*depth+r_cam_3D_plane[3];
-                        // if (err <= 0) continue;
-                        
-                        // ++num_new_sift_bg;
-                    }
-                    // 新的sift点中，即使有静态物体，这里也暂时只选择那些在动态物体深度阈值（2m-25m）内的静态物体点，这样的深度估计比较精确。
-                    // 事实上用sift是可以得到较小深度的左右匹配，但是这部分点很可能不够多，但是又无法使用像素点的匹配（因为太近的点的depth_map估计结果肯定是不准确的）
-                    // 同时深度太小的点在下一帧不容易被跟踪到（因为靠得近的点光流大）。对于动态物体而言，其可能是朝着远离相机的方向运动（即同向但速度比相机快），那么下一帧它还是可能出现在视野内的
-                    // 可以保留物体上深度值较小的点，但需要当前帧该物体的特征跟踪点数较多（至少8个），否则后续无法进行运动估计
-                    // 另外分割模型不太准确，不在物体上的点应该如何排除？（物体匹配期间有外点排除机制）
-                    else
-                    {
-                        // if(depth >= mThDepthObj || depth < mMinDepthPt) continue;
-                        if(depth >= mThDepthObj || depth < 1.5) continue;
-
-                        // 是否要保留这部分物体点，后续用depth_map查看是否能获得深度估计。可以
-                        // if(abs(disp_y + y_shift) > 0.6)
-                        if(abs(disp_y) > 1.2)
-                        {
-                            // 记录没有右匹配的新sift物体点，后期尝试用depth_map来寻找其深度值
-                            id_sift_no_depth.push_back(num_sift_add);
-                            invalid_depth = true;
-                            // 在id_sift_no_depth后这里千万不能continue,否则下面就忘记添加这个点的右观测点信息了
-                            // continue
-                        }
-                        
-                        // cv::Point2f new_sift(cord_x, cord_y);
-                        // undistortedPts(new_sift, tmp_undist_pt, m_camera[0]);
-                        // float err = (r_cam_3D_plane[0]*tmp_undist_pt.x+r_cam_3D_plane[1]*tmp_undist_pt.y+r_cam_3D_plane[2])*depth+r_cam_3D_plane[3];
-                        // if (err <= 0) continue;
-                    }
-
-                    int obj_id = (int)info_pt[1];
-                    cur_sift_index.push_back(validpts_id);
-                    ids_sift.push_back(n_id++);
-                    cur_sift.emplace_back(cord_x,cord_y);
-                    track_cnt_sift.push_back(1);
-                    obj_cls_id_sift.emplace_back(cls_label,obj_id);
-                    // 记录当前帧sift点所匹配的上一帧中的sift点的全局obj id，当一个物体在两帧间的特征点匹配数足够多时，可以直接关联此两物体！
-                    // 此处为各个物体的新sift点，在进行物体关联之后，要来修改当前帧各个特征点所属物体的全局id，尤其是当前帧新添加的点！！
-                    prev_sift_global_obj_id.push_back(obj_id);
-                    // 没有立体匹配的背景新点
-                    if(cls_label == 0)
-                    {
-                        if(no_stereo)
-                        {
-                            cur_right_sift.emplace_back(0, 0);
-                            // cur_right_sift.emplace_back(match_x, cord_y+y_shift);
-                            cur_sift_dep.push_back(-1.0);
-                            // 当前帧没有深度值的bg新点的状态记为3
-                            status_sift.push_back(3);
-                        }
-                        else
-                        {
-                            cur_right_sift.emplace_back(match_x,match_y);
-                            status_sift.push_back(1);
-                            if(use_tria_stereo)
-                                cur_sift_dep.push_back(depth);
-                            else
-                                cur_sift_dep.push_back(-1.0);
-                        }
-                    }
-                    else
-                    {
-                        // cur_right_sift.emplace_back(match_x, cord_y+y_shift);
-                        // 没有立体匹配的物体新点
-                        if(invalid_depth)
-                        {
-                            cur_right_sift.emplace_back(0, 0);
-                            // 使用depth_map为物体点获取深度值，但是不会将该点作为立体匹配，该深度只是为了估计物体的3D运动。
-                            // 没有立体匹配的新物体点与背景点一样，status都标记为3
-                            // status_sift.push_back(0);
-                            status_sift.push_back(3);
-                            cur_sift_dep.push_back(-1.0);
-                        }
-                        else
-                        {
-                            cur_right_sift.emplace_back(match_x,match_y);
-                            status_sift.push_back(1);
-                            // 物体点必须在这里就给出深度值，即认为立体校正足够准确
-                            cur_sift_dep.push_back(depth);
-                        }
-                    }
-
-                    ++num_new_sift;
-                    ++num_sift_add;
-
-                    // if(use_motion_to_pred_fea_dep)
-                    {
-                        // 物体点如果有有效的深度估计,则记录
-                        if(obj_id > 0 && !invalid_depth)
-                        {
-                            if(obj_fea_disp_num.find(obj_id) == obj_fea_disp_num.end())
-                            {
-                                obj_fea_disp_num[obj_id] = make_pair(disp_x,1);
-                            }
-                            else
-                            {
-                                obj_fea_disp_num[obj_id].first += disp_x;
-                                obj_fea_disp_num[obj_id].second += 1;
-                            }
-                        }
-                        else if(obj_id == 0 && !no_stereo)
-                        {
-                            ave_dep_bg_cur_frame += depth;
-                            ++num_bg_with_dep;
-                            ++num_bg_sift_with_dep;
-                        }
-                    }
-                }   
-            }
-        }
-        
-        if(!add_new_sift_in_next_frame && !no_add_new_sift)
-            cout << "Num of detected new sift (for bg and objs) in cur frame is: " << num_new_sift << endl;
-        else
-            cout << "Num of detected new sift (only for objs) in cur frame  is: " << num_new_sift << endl;
-    }
-    
-    done_select_sift = true;
-    // 当前帧特征点"关联阶段"的最后一个sift（包含跟踪与新检测的）的全局id。注意，实际上当前帧新sift点的最大全局id不是这里的值，因为后续sift中的跟踪外点还会被转为新点！
-    // last_id_sift_cur = n_id - 1; 
-
-    // 后处理，将当前帧的部分信息保存为prev
-    Sift_->Postprocess();
-    
-    // ------------------------------------------------------------------------
-    printf("Sift select costs: %fms \n", t_o.toc());
-}
-
-// 根据已有的sift（跟踪的）和FAST（跟踪的）形成mask，并在当前左图像中检测新的FAST点。对所有左图像FAST点进行右图像点的跟踪,保存有效的立体跟踪点
-void FeatureTracker::det_new_FAST_objs(const int &frame_count, const int num_solid_obj, const cv::Mat &seg_map, const cv::Mat &cls_map, const cv::Mat & depth_map, 
-                                        bool initial_succ, const bool &marg_old_prev, bool &stereo_match_done, const cv::Mat &_img1)
-{   
-    TicToc t_det_new_and_assign;
-    
-    // 当前帧新检测的FAST点的全局id不可能小于last_fea_id这个数（排在当前帧新检测的sift之后）
-    // int last_fea_id = n_id;
-
-    // Mat rightImg = _img1;
-    if(!_img1.empty())
-    {
-        if(_img1.channels() == 3)
-            cvtColor(_img1, cur_img_r, COLOR_BGR2GRAY);
-        else
-            // cur_img_r = _img1.clone();
-            cur_img_r = _img1;
-    }
-    
-    // 下面这些对于初始帧图像也会执行（仅检测新特征点）
-    if (1)
-    {
-        // 等待sift点的跟踪和新点采集结束
-        while(!done_select_sift)
-        {
-            usleep(300);
-        }
-
-        done_select_sift = false;
-
         // 如果物体是仅前向位移（或同时仅有很小的旋转），则可以过滤flow
-        bool filter_flow_with_small_rot = true;
-        Quaterniond delta_Q(R_cam_motion);
-        float delta_angle = fabs(acos(delta_Q.w()) * 2.0 / 3.1416 * 180.0);
+        bool filter_flow_with_small_rot = false;
+        
+        // todo: 是否有必要根据运动预测值中的旋转大小来决定是否为直线运动？可以不使用，而是依据符合要求的点的比例来间接判断
 
         // if(filter_flow_with_small_rot)
         // {
+        //     Quaterniond delta_Q(R_cam_motion);
+        //     float delta_angle = fabs(acos(delta_Q.w()) * 2.0 / 3.1416 * 180.0)
         //     if(frame_count > 1)
         //     {
         //         if(delta_angle >= 0.5)
@@ -5069,7 +7192,7 @@ void FeatureTracker::det_new_FAST_objs(const int &frame_count, const int num_sol
         // }
         
         int num_valid_bg_sift = 0, num_valid_bg_FAST = 0;
-        int num_bg_sift = id_bg_track_sift.size();
+
         if(filter_flow_with_small_rot)
         {
             // 统计所有背景跟踪点的flow直线 与 图像中心点的距离， 以及各个跟踪点的flow线的方向
@@ -5081,17 +7204,24 @@ void FeatureTracker::det_new_FAST_objs(const int &frame_count, const int num_sol
             int num_dist_15 = 0, num_dist_30 = 0;
             int num_right_dir = 0;
             vector<int> outliers_15, outliers_30;
-            for(int k = 0; k < num_bg_sift; ++k)
+
+            int num_sift = cur_sift.size();
+            for(int k = 0; k < num_sift; ++k)
             {
-                int id = id_bg_track_sift[k];
-                if(status_sift[id] == 0) 
+                // 只统计纯背景跟踪点
+                if(status_sift[k] == 0) 
                 {
                     continue;
                 }
+                else if(track_cnt_sift[k] < 2 || obj_cls_id_sift[k].first > 0)
+                {
+                    continue;
+                }
+
                 ++num_valid_bg_sift;
                 // 计算图像中心点 到 该点光流直线 的距离，并且验证上一帧该点是否处于 当前帧该点与图像中心点的连线之间的区域（即要近似满足 当前点指向上一帧点的射线 再往前穿过中心点） 
-                Point2f &cur_pt = cur_sift[id];
-                Point2f &prev_pt = prev_sift[id];
+                Point2f &cur_pt = cur_sift[k];
+                Point2f &prev_pt = prev_sift[k];
                 float dist = cal_dist_img_center_to_flow_line(cur_pt,prev_pt);
                 
                 // cout << "dist: " << dist << endl;
@@ -5101,14 +7231,14 @@ void FeatureTracker::det_new_FAST_objs(const int &frame_count, const int num_sol
                 // else
                 else if(dist >= 25)
                 {
-                    outliers_15.push_back(-id);
+                    outliers_15.push_back(-k);
                 }
                 
                 if(dist < 30) 
                     ++num_dist_30;
                 // else
                 else if(dist >= 40)
-                    outliers_30.push_back(-id);
+                    outliers_30.push_back(-k);
 
                 // flow直线不满足要求的点
                 if(dist != 10000)
@@ -5124,15 +7254,20 @@ void FeatureTracker::det_new_FAST_objs(const int &frame_count, const int num_sol
                     status_sift[-pt_id] = 0;
                 }
 
-                for(auto id: id_bg_track_FAST)
+                int num_FAST = cur_FAST.size();
+                for(int k = 0; k < num_FAST; ++k)
                 {
-                    if(status_FAST[id] == 0) continue;
+                    if(status_FAST[k] == 0) 
+                        continue;
+                    else if(track_cnt_FAST[k] < 2 || obj_cls_id_FAST[k].first > 0)
+                        continue;
+                    
                     ++num_valid_bg_FAST;
-                    Point2f &cur_pt = cur_FAST[id];
-                    Point2f &prev_pt = prev_FAST[id];
+                    Point2f &cur_pt = cur_FAST[k];
+                    Point2f &prev_pt = prev_FAST[k];
                     float dist = cal_dist_img_center_to_flow_line(cur_pt,prev_pt);
                     if(dist >= 25)
-                        status_FAST[id] = 0;
+                        status_FAST[k] = 0;
                     else
                         ++num_dist_15;
                 }
@@ -5148,15 +7283,20 @@ void FeatureTracker::det_new_FAST_objs(const int &frame_count, const int num_sol
                     status_sift[-pt_id] = 0;
                 }
 
-                for(auto id: id_bg_track_FAST)
+                int num_FAST = cur_FAST.size();
+                for(int k = 0; k < num_FAST; ++k)
                 {
-                    if(status_FAST[id] == 0) continue;
+                    if(status_FAST[k] == 0) 
+                        continue;
+                    else if(track_cnt_FAST[k] < 2 || obj_cls_id_FAST[k].first > 0)
+                        continue;
+
                     ++num_valid_bg_FAST;
-                    Point2f &cur_pt = cur_FAST[id];
-                    Point2f &prev_pt = prev_FAST[id];
+                    Point2f &cur_pt = cur_FAST[k];
+                    Point2f &prev_pt = prev_FAST[k];
                     float dist = cal_dist_img_center_to_flow_line(cur_pt,prev_pt);
                     if(dist >= 40)
-                        status_FAST[id] = 0;
+                        status_FAST[k] = 0;
                     else
                         ++num_dist_30;
                 }
@@ -5167,14 +7307,17 @@ void FeatureTracker::det_new_FAST_objs(const int &frame_count, const int num_sol
             else
             {
                 // 否则，再统计FAST背景跟踪点的情况
-                int num_bg_FAST = id_bg_track_FAST.size();
-                for(int k = 0; k < num_bg_FAST; ++k)
+                int num_FAST = cur_FAST.size();
+                for(int k = 0; k < num_FAST; ++k)
                 {
-                    int id = id_bg_track_FAST[k];
-                    if(status_FAST[id] == 0) continue;
+                    if(status_FAST[k] == 0) 
+                        continue;
+                    else if(track_cnt_FAST[k] < 2 || obj_cls_id_FAST[k].first > 0)
+                        continue;
+                    
                     ++num_valid_bg_FAST;
-                    Point2f &cur_pt = cur_FAST[id];
-                    Point2f &prev_pt = prev_FAST[id];
+                    Point2f &cur_pt = cur_FAST[k];
+                    Point2f &prev_pt = prev_FAST[k];
                     float dist = cal_dist_img_center_to_flow_line(cur_pt,prev_pt);
                     // cout << "dist: " << dist << endl;
                     
@@ -5182,13 +7325,13 @@ void FeatureTracker::det_new_FAST_objs(const int &frame_count, const int num_sol
                         ++num_dist_15;
                     // else
                     else if(dist >= 25)
-                        outliers_15.push_back(id+1);
+                        outliers_15.push_back(k+1);
                     
                     if(dist < 30)
                         ++num_dist_30;
                     // else
                     else if(dist >= 40)
-                        outliers_30.push_back(id+1);
+                        outliers_30.push_back(k+1);
 
                     if(dist != 10000)
                         ++num_right_dir;
@@ -5222,388 +7365,4658 @@ void FeatureTracker::det_new_FAST_objs(const int &frame_count, const int num_sol
                     filter_succ = true;
                 }
             }
+        }
+        
+        // 异常光流长度的静态物体跟踪点
+        set<int> outlier_flow_len;
+        vector<int> total_num_need_bloc(4,0), near_pt_need_bloc(4,0);
+        map<int,int> g_l_id_3D2D_obj_fea;
+        int total_num_need, near_pt_need;
 
-            // todo:如果没有过滤成功，则只去除那些明显匹配错误的点。如果P够大，R够小，则flow应该有同一的方向？
-            if(!filter_succ)
+        float delta_ang = 0.0;
+        if(frame_cnt > 1)
+        {
+            if(has_valid_F || has_valid_H)
+                delta_ang = delta_angle_from_FH;
+            else
+                delta_ang = pred_delta_angle_cam;
+        }
+
+        ave_flow_len_sta_fea = 0;
+        
+        // 如果要对所有的sift和FAST点跟踪根据NCC值进行排序，并均匀分配到6*6的36个子区域内
+        // 每一轮依次从各个子区域取一个点放入pts_for_cal_F中，取多轮直到数量或比例达到规定值。
+        // 每个自区域不一定有点放入pts_for_cal_F中，放入其中的点需要其NCC值大于某个阈值!
+        // 最少要多少个点参与F或H矩阵的估计;
+        if(sort_all_sift_FAST)
+        {
+            // 用于排除预测运动很小时，用点光流长度的MAD来排除场景中明显异常的匹配点（如长期漏检的动态物体点）
+            // 第2帧 或者 预测位移比较小，则计算所有光流的平均长度，并删除其中的异常离群点
+            // if(small_p && use_MAD_to_fliter_flow && NCC_matching_all.size() > 2)
+            if((frame_cnt <= 1 || (delta_ang < 0.25 && P_cam_motion.norm() <= 0.10)) && use_MAD_to_fliter_flow && NCC_matching_all.size() > 2)
             {
+                float p_x, c_x, p_y, c_y;
+                float all_flow_len = 0;
+                vector<int> l_id_pt;
+                vector<float> len_of_flow_stat_fea;
+                vector<int> index_pt;
 
+                int cnt = -1;
+
+                for(auto &pair: NCC_matching_all)
+                {
+                    ++cnt;
+                    int l_id = pair.first;
+                    if(l_id <= 0)
+                    {
+                        l_id = -1 * l_id;
+                        if(status_sift[l_id] == 0) continue;
+
+                        p_x = prev_sift[l_id].x;
+                        p_y = prev_sift[l_id].y;
+
+                        c_x = cur_sift[l_id].x;
+                        c_y = cur_sift[l_id].y;
+                    }
+                    else
+                    {
+                        l_id -= 1;
+                        if(status_FAST[l_id] == 0) continue;
+
+                        p_x = prev_FAST[l_id].x;
+                        p_y = prev_FAST[l_id].y;
+
+                        c_x = cur_FAST[l_id].x;
+                        c_y = cur_FAST[l_id].y;
+                    }
+
+                    float len_flow = sqrtf((p_x - c_x)*(p_x - c_x) + (p_y - c_y)*(p_y - c_y));
+
+                    len_of_flow_stat_fea.push_back(len_flow);
+
+                    l_id_pt.push_back(pair.first);
+
+                    index_pt.push_back(cnt);
+                }
+
+                int num = len_of_flow_stat_fea.size();
+                if(num > 2)
+                {
+                    float dist_MAD, dist_median;
+                    cal_MAD_value(len_of_flow_stat_fea, dist_MAD, dist_median);
+                    // 3倍？是否可以再提高？
+                    float up_boundary = dist_median + 3 * dist_MAD;
+                    float low_boundary = dist_median - 3 * dist_MAD;
+                    int valid_len = 0;
+                    int index;
+                    for (int i = 0; i < num; ++i)
+                    {
+                        float len = len_of_flow_stat_fea[i];
+                        if (len > up_boundary || len < low_boundary)
+                        {
+                            int l_id = l_id_pt[i];
+                            int g_id;
+                            if(l_id <= 0)
+                            {
+                                l_id = -1 * l_id;
+                                // 如果是纯背景点，则认为是误匹配或误检测
+                                if(obj_cls_id_sift[l_id].first == 0)
+                                {
+                                    status_sift[l_id] = 0;
+                                }
+                                else
+                                {
+                                    index = index_pt[i];
+                                    // 如果是明显非静态的物体点
+                                    outlier_flow_len.insert(index);
+                                    l_id_outliers_sta_obj_fea.insert(-l_id);
+                                    g_id = ids_sift[l_id];
+                                    if(g_id_sta_obj_2D2D_high_NCC.find(g_id) != g_id_sta_obj_2D2D_high_NCC.end()) g_id_sta_obj_2D2D_high_NCC.erase(g_id);
+                                }
+                            }
+                            else
+                            {
+                                l_id -= 1;
+                                if(obj_cls_id_FAST[l_id].first == 0)
+                                {
+                                    status_FAST[l_id] = 0;
+                                }
+                                else
+                                {
+                                    index = index_pt[i];
+                                    outlier_flow_len.insert(index);
+                                    l_id_outliers_sta_obj_fea.insert(l_id+1);
+                                    g_id = ids_FAST[l_id];
+                                    if(g_id_sta_obj_2D2D_high_NCC.find(g_id) != g_id_sta_obj_2D2D_high_NCC.end()) g_id_sta_obj_2D2D_high_NCC.erase(g_id);
+                                }
+                            }
+
+
+                        }
+                        else
+                        {
+                            ++valid_len;
+                            all_flow_len += len;
+                        }
+                    }
+                    
+                    if(valid_len > 0) ave_flow_len_sta_fea = all_flow_len/valid_len;
+                    cout << "Camera has small motion! Average flow len of static fea: " << ave_flow_len_sta_fea << endl;
+                }
+
+                len_of_flow_stat_fea.clear();
+                l_id_pt.clear();
+                index_pt.clear();
+            }
+
+            // 为跟踪点在上一帧寻找立体匹配
+            // 设置总量的最小值，既防止总的3D-2D点不足，又避免因无必要的过量而导致的精度降低（NCC阈值太低）或计算时间太长
+            // 这些总点数不一定与min_num_near_3D2D和min_total_num_3D2D的总数像等，这是用户定义的最低点数要求
+            int total_need = Min_total_3D2D_track, near_need = Min_total_near_3D2D_track;
+            int total_low = 0, near_low = 0;
+            for(int i = 3; i >= 0; --i)
+            {
+                // 各个大bloc中近点数和总点数的最小要求，目的是使得3D-2D点的分布不会太极端
+                near_pt_need_bloc[i] = min_num_near_3D2D[i];
+                total_num_need_bloc[i] = min_total_num_3D2D[i];
+            }
+            
+            before_cal_FH = true;
+
+            int num_invalid_bg_track = find_stereo_for_tracked_fea(prev_dep_map, near_pt_need_bloc, total_num_need_bloc, num_near_3D_2D_fea, num_total_3D_2D_fea, near_need, total_need);
+            cout << "First time to find stereo match of bg fea! Total num of 3D-2D: " << num_total_3D_2D_fea << ", num of near static 3D-2D: " << num_near_3D_2D_fea << endl;
+            
+            // 减去深度超过阈值的背景跟踪点
+            num_valid_track -= num_invalid_bg_track;
+            cout << "-----------------" << endl;
+            cout << "num of 2d-2d bg fea tracking before estimating F_H: " << num_valid_track << endl;
+            cout << "-----------------" << endl;
+
+            // 针对各个全局物体，对其所有3D-2D跟踪点进行深度值的离群值筛除！
+            // 能被保留的物体3D-2D点的深度 要么来自立体匹配，要么来自上一帧的运动更新（即该点为上一帧的跟踪点）
+            if(!l_id_3D_2D_obj_fea.empty())
+            {
+                int num_obj_pts = l_id_3D_2D_obj_fea.size();
+                vector<uchar> pts_check(num_obj_pts, 0);
+                vector<float> dep_pts;
+                vector<int> l_id_pts;
+                set<int> outliers;
+                float dep, ave_dep;
+                int l_id, g_id;
+                
+                // todo: 在去除物体深度异常点 的 前后 显示图像
+
+                for(auto &iter: status_objs_prev)
+                {
+                    int prev_obj_id = iter.first;
+                    int cnt = -1;
+                    bool sta_obj = (iter.second == 1);
+                    for(auto id_pt: l_id_3D_2D_obj_fea)
+                    {
+                        ++cnt;
+                        if(pts_check[cnt] > 0) continue;
+                        if(id_pt > 0)
+                        {
+                            if(status_FAST[(id_pt-1)] == 0)
+                            {
+                                pts_check[cnt] = 1;
+                                continue;
+                            }
+                            if(prev_FAST_global_obj_id[(id_pt-1)] != prev_obj_id) continue;
+
+                            dep = prev_FAST_dep[(id_pt-1)];
+                            if(dep <= 0) 
+                            {
+                                status_FAST[(id_pt-1)] = 0;
+                                pts_check[cnt] = 1;
+                                continue;
+                            }
+
+                            dep_pts.push_back(dep);
+                            g_id = ids_FAST[(id_pt-1)];
+                        }
+                        else
+                        {
+                            if(status_sift[(-id_pt)] == 0)
+                            {
+                                pts_check[cnt] = 1;
+                                continue;
+                            }
+                            if(prev_sift_global_obj_id[(-id_pt)] != prev_obj_id) continue;
+
+                            dep = prev_sift_dep[(-id_pt)];
+                            if(dep <= 0) 
+                            {
+                                status_sift[(-id_pt)] = 0;
+                                pts_check[cnt] = 1;
+                                continue;
+                            }
+                            
+                            dep_pts.push_back(dep);
+                            g_id = ids_sift[(-id_pt)];
+                        }
+                        pts_check[cnt] = 1;
+                        l_id_pts.push_back(id_pt);
+                        if(g_id_sta_obj_2D2D_high_NCC.find(g_id) != g_id_sta_obj_2D2D_high_NCC.end()) 
+                        {
+                            g_l_id_3D2D_obj_fea[g_id] = id_pt;
+                            // 暂时不把高NCC的近处静态物体3D-2D跟踪点算入静态3D-2D跟踪点中，因为所有静态物体最早还需要经过objs-matching才能确定是否未静态！
+                            // 为了避免有些静态点后续不被提前判断为静态而导致最终的静态3D-2D点不足，这里暂不计入
+                            // if(g_id_sta_obj_3D2D_high_NCC.find(g_id) != g_id_sta_obj_3D2D_high_NCC.end())
+                            // {
+                            //     ++num_total_3D_2D_fea;
+                            //     ++num_near_3D_2D_fea;
+                            // }
+                        }
+                    }
+
+                    int num_valid = dep_pts.size();
+                    // 如果3D点数大于等于4,则排除显著外点
+                    if(num_valid >= 4)
+                    {
+                        use_MAD_to_filter_dep_outlier(dep_pts, outliers, ave_dep, false);
+                        
+                        if(!outliers.empty())
+                        {
+                            for(auto &it: outliers)
+                            {
+                                --num_valid;
+                                bool near_pt = false;
+                                l_id = l_id_pts[it];
+                                if(l_id > 0)
+                                {
+                                    status_FAST[(l_id-1)] = 0;
+                                    g_id = ids_FAST[(l_id-1)];
+                                    if(sta_obj) 
+                                    {
+                                        if(g_id_sta_obj_3D2D_high_NCC.find(g_id) != g_id_sta_obj_3D2D_high_NCC.end())
+                                        {
+                                            near_pt = true;
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    status_sift[(-l_id)] = 0;
+                                    g_id = ids_sift[(-l_id)];
+                                    if(sta_obj) 
+                                    {
+                                        if(g_id_sta_obj_3D2D_high_NCC.find(g_id) != g_id_sta_obj_3D2D_high_NCC.end())
+                                        {
+                                            near_pt = true;
+                                        }
+                                    }
+                                }
+
+                                if(near_pt)
+                                {
+                                    --num_total_3D_2D_fea;
+                                    --num_near_3D_2D_fea;
+                                    g_id_sta_obj_3D2D_high_NCC.erase(g_id);
+                                    g_l_id_3D2D_obj_fea.erase(g_id);
+                                }
+                                else if(sta_obj)
+                                {
+                                    if(cand_g_id_sta_obj_fea.find(g_id) != cand_g_id_sta_obj_fea.end())
+                                        cand_g_id_sta_obj_fea.erase(g_id);
+                                }
+                            }
+                            outliers.clear();
+                        }
+
+                        // 是否要用特征点的平均深度 替换 该全局物体在上一帧的深度?如果要，是否要求特征点数足够多？
+                        if(num_valid >= 6)
+                            ave_dep_prev_objs[prev_obj_id] = ave_dep;
+                    }
+
+                    if(!dep_pts.empty()) dep_pts.clear();
+                    if(!l_id_pts.empty()) l_id_pts.clear();
+                }
+            }
+            
+            // 将所有静态跟踪点按NCC从大到小排序
+            sort(NCC_matching_all.begin(), NCC_matching_all.end(), [](const pair<int,float> &a, const pair<int,float> &b)
+            {
+                return a.second > b.second;
+            });
+            
+            // 是否要通过估计F/H矩阵来对2D-2D跟踪点进行筛选
+            // 只在纯视觉阶段进行，且相机不能处在近乎静止的状态
+            if(need_cal_FH && !small_p)
+            {
+                bool uniformly_select_track = true;
+                if(uniformly_select_track)
+                {
+                    vector<int> num_per_bloc(36,0);
+
+                    float pt_x, pt_y;
+
+                    // 0 1 2 3
+                    int ignore_row = 0;
+                    int cnt = -1;
+                    bool not_empty_outlier = (!outlier_flow_len.empty());
+                    int g_id;
+                    
+                    if(!num_fea_2D2D_big_bloc.empty()) num_fea_2D2D_big_bloc.clear();
+                    num_fea_2D2D_big_bloc.resize(4,0);
+                    
+                    map<int,float> id_val_NCC;
+
+                    int sum_track = 0, total_track = 0;
+                    vector<float> sort_valid_track_NCC;
+
+                    cout << "Min NCC value of all tracking: " << NCC_matching_all.back().second << endl;
+                    
+                    for(auto &pair: NCC_matching_all)
+                    {
+                        ++cnt;
+                        
+                        // 被光流长度的MAD排除的物体跟踪点
+                        if(not_empty_outlier) 
+                        {
+                            if(outlier_flow_len.find(cnt) != outlier_flow_len.end())
+                                continue;
+                        }
+                        
+                        float val_NCC = pair.second;
+                        int l_id = pair.first;
+
+                        if(l_id > 0)
+                        {
+                            if(status_FAST[(l_id-1)] == 0) continue;
+
+                            g_id = ids_FAST[(l_id-1)];
+
+                            // 这样子得到的id_bg_track_X等变量中的跟踪点也是按照NCC值从大到小来排序的
+                            if(obj_cls_id_FAST[(l_id-1)].first == 0)
+                                id_bg_track_FAST.push_back((l_id-1));
+                        }
+                        else
+                        {
+                            if(status_sift[(-l_id)] == 0) continue;
+
+                            g_id = ids_sift[(-l_id)];
+
+                            if(obj_cls_id_sift[(-l_id)].first == 0)
+                                id_bg_track_sift.push_back((-l_id));
+                        }
+
+                        // 如果某个背景点被认为不太适合用来直接估计F_H（因为它的3D-2D重投影误差较大），而是只被检验，则跳过
+                        if(bg_track_not_for_cal_FH.find(g_id) != bg_track_not_for_cal_FH.end())
+                            continue;
+
+                        // ++total_track;
+                        // sort_valid_track_NCC.push_back(val_NCC);
+
+                        if(l_id > 0)
+                        {
+                            Point2f &pt = prev_FAST[(l_id-1)];
+                            pt_x = pt.x;
+                            pt_y = pt.y;
+                        }
+                        else
+                        {
+                            Point2f &pt = prev_sift[(-l_id)];
+                            pt_x = pt.x;
+                            pt_y = pt.y;
+                        }
+                        
+                        int row_bloc = pt_y/60;
+                        int col_bloc = pt_x/200;
+                        if(row_bloc > 5) row_bloc = 5;
+                        if(col_bloc > 5) col_bloc = 5;
+
+                        int id_bloc = row_bloc * 6 + col_bloc;
+                        int num_in_bloc = num_per_bloc[id_bloc];
+                        if(num_in_bloc < NUM_FEA_IN_BLOC) 
+                        {
+                            num_per_bloc[id_bloc] += 1;
+                            id_track_fea_per_bloc[id_bloc][num_in_bloc] = l_id;
+                            id_val_NCC[l_id] = val_NCC;
+                            ++sum_track;
+
+                            ++total_track;
+                            sort_valid_track_NCC.push_back(val_NCC);
+                        }
+                    }
+                    
+                    if(not_empty_outlier) outlier_flow_len.clear();
+
+                    // 选择有效跟踪点的前1/N处的NCC值
+                    int num_need_for_FH = 44;
+                    int good_track_num = total_track * 0.67;
+                    int th_num = min(max(good_track_num,num_need_for_FH),total_track);
+                    if(th_num == total_track) th_num -= 1;
+                    float Th_NCC = sort_valid_track_NCC[th_num];
+                    cout << "Threshold of value NCC of 2D-2D tracking for cal matrix F_H: " << Th_NCC << endl;
+                    sort_valid_track_NCC.clear();
+                    
+                    vector<int> num_check_per_bloc(36,0);
+                    int num_in_big_bloc = 0;
+                    // 依次从各个小bloc中选择点放入到各大bloc中，直到所有点都放入或者大bloc中的点数达到阈值
+                    while(sum_track > 0)
+                    {
+                        for(int i = 35; i >= 0; --i)
+                        {
+                            int num_check = num_check_per_bloc[i];
+                            
+                            if(num_check < num_per_bloc[i])
+                            {
+                                --sum_track;
+                                num_check_per_bloc[i] += 1;
+
+                                int row_bloc = i/6;
+                                int col_bloc = i%6;
+                                // big bloc的行和列
+                                int id_row = row_bloc/3;
+                                int id_col = col_bloc/3;
+                                int id_big_bloc = id_row * 2 + id_col;
+
+                                int num_big_bloc = num_fea_2D2D_big_bloc[id_big_bloc];
+                                if(num_big_bloc < 1.5 * NUM_FEA_IN_BIG_BLOC)
+                                {
+                                    ++num_in_big_bloc;
+                                    int l_id = id_track_fea_per_bloc[i][num_check];
+
+                                    id_fea_2D2D_big_bloc[id_big_bloc][num_big_bloc] = l_id;
+                                    num_fea_2D2D_big_bloc[id_big_bloc] += 1;
+                                }
+                            }
+                        }
+                    }
+                    
+                    vector<int> num_got_per_big_bloc(4,0), num_check_per_big_bloc(4,0);
+                    set<int> pts_low_NCC;
+                    int num_for_cal_FH = 0;
+
+                    // 一轮一轮地从各个bloc中取跟踪点用于估计F或H
+                    while(num_for_cal_FH < num_need_for_FH && num_in_big_bloc > 0)
+                    {
+                        for(int i = 0; i < 4; ++i)
+                        {
+                            if(num_for_cal_FH >= num_need_for_FH || num_in_big_bloc <= 0) break;
+                            
+                            int total_num_in_bloc = num_fea_2D2D_big_bloc[i];
+                            int num_check = num_check_per_big_bloc[i];
+
+                            if(num_check < total_num_in_bloc)
+                            {
+                                num_check_per_big_bloc[i] += 1;
+                                --num_in_big_bloc;
+                                int l_id = id_fea_2D2D_big_bloc[i][num_check];
+                                float val_ = id_val_NCC[l_id];
+                                
+                                int num_got = num_got_per_big_bloc[i];
+
+                                // 两种选取方式： 1. 尽量均匀从每个大bloc中选取12个跟踪点
+                                // 2. 选择从各个大bloc选取不同最大数量的点，且根据旋转情况改变此限制
+                                // if(val_ >= Th_NCC && num_got < max_num_track_for_FH_big_bloc[i])
+                                if(val_ >= Th_NCC)
+                                {
+                                    pts_for_cal_F.insert(l_id);
+                                    num_got_per_big_bloc[i] += 1;
+                                    ++num_for_cal_FH;
+                                }
+                                else
+                                {
+                                    // 不再从该bloc选取跟踪点，因为后面的点的val_NCC值均需小于阈值
+                                    // 由于这里大bloc中的点不是按照val_NCC从大到小排列的，所以不能直接放弃
+                                    pts_low_NCC.insert(l_id);
+                                }
+                            }
+                        }
+                    }
+                    
+                    if(num_for_cal_FH < 20 && !pts_low_NCC.empty())
+                    {
+                        for(auto &iter: NCC_matching_all)
+                        {
+                            if(num_for_cal_FH >= 20) break;
+                            int l_id = iter.first;
+                            if(pts_low_NCC.find(l_id) != pts_low_NCC.end())
+                            {
+                                if(iter.second > 0.96)
+                                {
+                                    pts_for_cal_F.insert(l_id);
+                                    ++num_for_cal_FH;
+                                }
+                                else
+                                {
+                                    // 后续点的NCC值太小了，不选择这些点来直接估计F_H
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    num_per_bloc.clear();
+                    num_check_per_bloc.clear();
+                    num_got_per_big_bloc.clear();
+                    pts_low_NCC.clear();
+                    id_val_NCC.clear();
+                }
+                else
+                {
+                    // todo: 不是均匀地从各个大bloc中选取跟踪点，而是直接选择匹配NCC最高的前n个点来估计F/H？
+                    
+                }
+                
+                // 根据F矩阵排除FAST中的跟踪外点
+                if(frame_cnt > 0)
+                // if(frame_cnt > 0 && REJECT_WITH_F)
+                {
+                    if(only_use_track_sift_for_F)
+                        rejectWithFV1(false);
+                    else
+                    {
+                        rejectWithFV2(pts_for_cal_F);
+                    }
+                }
             }
         }
         else
         {
-            for(auto id: id_bg_track_FAST)
-            {
-                if(status_FAST[id] == 0) continue;
-                ++num_valid_bg_FAST;
-            }
+            // todo: 不对所有的sift和FAST点tracking基于NCC值统一进行排序，而是优先使用sift tracking来估计F/H,当sift点不足时使用FAST tracking进行补充
+            
+        }
+
+        before_cal_FH = false;
+
+        if(USE_IMU || Use_LBA_for_puer_V)
+        {
+            cout << "num of long track bg fea: " << num_old_track_fea << endl;
         }
         
-        // 最少要18个点参与F矩阵的估计;
-        if(!temp_pts_for_F.empty())
+        // 估计F/H之后删除所有超过深度范围的点（主要是远点），因为它们无法提供3D-2D观测用于后续优化估计
+        if(!tracked_pts_above_th_dep.empty())
         {
-            // int num_bg_match = id_bg_track_FAST.size();
-            // 优先选择前n%匹配质量的背景跟踪点来估计F矩阵
-            int middle = num_valid_bg_FAST * 1.0/3;
-            int num_ori = pts_for_cal_F.size();
-            for(auto id: pts_for_cal_F)
+            for(auto id: tracked_pts_above_th_dep)
             {
-                if(status_sift[-id] == 0) --num_ori;
+                if(id > 0)
+                    status_FAST[(id-1)] = 0;
+                else
+                    status_sift[(-id)] = 0;
             }
-            
-            int all_ = num_ori + middle;
-            // 最少要40个点参与F或H矩阵的估计
-            int all = max(40,all_);
 
-            int rest = all - num_ori;
-            // int rest = 40 - num_ori;
+            tracked_pts_above_th_dep.clear();
+        }
+        
+        // 如果有F/H估计，则用估计结果对所有NCC值较高的备用静态物体3D-2D点进行筛选
+        for(int i = 0; i < 4; ++i)
+        {
+            num_3D2D_sta_obj_fea[i] = 0;
+        }
 
-            int k = 0;
-
-            bool add_up_half_img_fea = false;
-            // 注意，temp_pts_for_F中其实还可能包含了部分静态物体的跟踪点，它们并不包含在id_bg_track_FAST（纯背景跟踪点）中。因此即使num_bg_match为0，这里还是有可能会添加静态跟踪点
-            if(rest > 0)
+        if(!g_id_sta_obj_3D2D_high_NCC.empty() || !cand_g_id_sta_obj_fea.empty())
+        {
+            // 由于所有被选择的近处静态物体点都同等地接受F/H估计和重投影误差的检验，因此这里直接将cand_g_id_sta_obj_fea的元素并入g_id_sta_obj_3D2D_high_NCC即可
+            if(!cand_g_id_sta_obj_fea.empty())
             {
-                for(auto it: temp_pts_for_F)
+                for(auto &iter: cand_g_id_sta_obj_fea)
                 {
-                    float y = cur_FAST[(it-1)].y/60.0;
-                    if(rest <= 0 && k >= middle) 
+                    g_id_sta_obj_3D2D_high_NCC.insert(iter);
+                }
+                cand_g_id_sta_obj_fea.clear();
+            }
+
+            if(has_valid_F || (frame_cnt > 1 && has_valid_H))
+            {
+                float dep_p;
+                int l_id;
+                Point2f pt_2D;
+                vector<int> g_id_to_erase;
+
+                for(auto &it: g_id_sta_obj_3D2D_high_NCC)
+                {
+                    if(prevLeftFeaMap.find(it) == prevLeftFeaMap.end())
                     {
-                        if(add_up_half_img_fea && num_up_half < 5)
+                        cout << "Weired! Line 7370" << endl;
+                        exit(-1);
+                    }
+                    Vec4f &p_pt = prev_un_Fea_map[it];
+                    l_id = g_l_id_3D2D_obj_fea[it];
+                    if(l_id > 0)
+                    {
+                        dep_p = prev_FAST_dep[(l_id-1)];
+                        pt_2D = cur_FAST[(l_id-1)];
+                    }
+                    else
+                    {
+                        dep_p = prev_sift_dep[(-l_id)];
+                        pt_2D = cur_sift[(-l_id)];
+                    }
+                    
+                    Vector3d pt_3D(p_pt(0)*dep_p, p_pt(1)*dep_p, dep_p);
+                    Point2f &prev_pt = prevLeftFeaMap[it];
+                    bool succ_F = true;
+                    if(has_valid_F)
+                    {
+                        int result = check_flow_with_F(F_cam, prev_pt, pt_2D, 2.5);
+                        if(result <= 0) succ_F = false;
+                    }
+                    
+                    bool succ = succ_F;
+                    // 重投影误差阈值不能太低，因为P_cam_motion是恒速模型的预测值，F/H估计得到的R也不一定非常准确，因此这里重投影只用于排除那些明显错误的2d-2d跟踪或立体匹配深度
+                    if(succ_F && frame_cnt > 1) succ = check_3D2D_fea_by_reproj(pt_3D, pt_2D, R_from_E, P_cam_motion, 6.5);
+                    if(!succ) g_id_to_erase.push_back(it);
+                }
+
+                if(!g_id_to_erase.empty())
+                {
+                    for(auto &it: g_id_to_erase)
+                    {
+                        g_id_sta_obj_3D2D_high_NCC.erase(it);
+                    }
+                    // 同样地，在此处不将近处静态物体的NCC值较高的3D-2D点计算入静态3D-2D点中
+                    // int num_invalid = g_id_to_erase.size();
+                    // num_total_3D_2D_fea -= num_invalid;
+                    // num_near_3D_2D_fea -= num_invalid;
+                    g_id_to_erase.clear();
+                }
+
+                // for(auto &it: cand_g_id_sta_obj_fea)
+                // {
+                //     if(prevLeftFeaMap.find(it) == prevLeftFeaMap.end())
+                //     {
+                //         cout << "Weired! Line 7306" << endl;
+                //         exit(-1);
+                //     }
+                //     Vec4f &p_pt = prev_un_Fea_map[it];
+                //     l_id = g_l_id_3D2D_obj_fea[it];
+                //     if(l_id > 0)
+                //     {
+                //         dep_p = prev_FAST_dep[(l_id-1)];
+                //         pt_2D = cur_FAST[(l_id-1)];
+                //     }
+                //     else
+                //     {
+                //         dep_p = prev_sift_dep[(-l_id)];
+                //         pt_2D = cur_sift[(-l_id)];
+                //     }
+                //     Vector3d pt_3D(p_pt(0)*dep_p, p_pt(1)*dep_p, dep_p);
+                //     Point2f &prev_pt = prevLeftFeaMap[it];
+                //     bool succ_F = true;
+                //     if(has_valid_F)
+                //     {
+                //         int result = check_flow_with_F(F_cam, prev_pt, pt_2D, 2.5);
+                //         if(result <= 0) succ_F = false;
+                //     }
+
+                //     bool succ = succ_F;
+                //     if(succ_F && frame_cnt > 1)
+                //         succ = check_3D2D_fea_by_reproj(pt_3D, pt_2D, R_from_E, P_cam_motion, 6.5);
+                    
+                //     if(!succ) g_id_to_erase.push_back(it);
+                // }
+
+                // if(!g_id_to_erase.empty())
+                // {
+                //     for(auto &it: g_id_to_erase)
+                //     {
+                //         cand_g_id_sta_obj_fea.erase(it);
+                //     }
+                //     g_id_to_erase.clear();
+                // }
+            }
+
+            // 从剩下的高NCC值的近处静态物体跟踪点 补充到各个大bloc中
+            // 这里暂不执行，因为暂时不把近处静态物体的跟踪点加入静态跟踪点集中，而是等到objs-matching结束后，再将其中确认为静态物体的点加入
+            if(0)
+            {
+                int half_H = 60*3, half_W = 200*3;
+                int id_row, id_col, id_bloc;
+                vector<int> num_invalid(4,0);
+
+                if(!g_id_sta_obj_3D2D_high_NCC.empty())
+                {
+                    for(auto &it: g_id_sta_obj_3D2D_high_NCC)
+                    {
+                        Point2f &p_pt = prevLeftFeaMap[it];
+                        id_row = p_pt.y/half_H;
+                        id_col = p_pt.x/half_W;
+                        if(id_row > 1) id_row = 1;
+                        if(id_col > 1) id_col = 1;
+                        id_bloc = 2*id_row + id_col;
+                        num_invalid[id_bloc] += 1;
+                    }
+                }
+
+                int num_need_add = 0;
+                // 各个大bloc需要补充的近处静态物体3D-2D点
+                for(int i = 0; i < 4; ++i)
+                {
+                    // 各个bloc要求的点数按照 一开始寻找2D-2D静态点时的数量
+                    num_invalid[i] = num_sta_obj_track_per_bloc[i] - num_invalid[i];
+                    num_need_add += num_invalid[i];
+                }
+
+                if(num_need_add > 0)
+                {
+                    vector<int> num_need_lr(2,0);
+                    // 第一轮先将各个大bloc需要的近处静态物体点数加满；第二轮则是把左右区域需要的点数加满。总点数就不做要求了
+                    num_need_lr[0] = num_invalid[0] + num_invalid[2];
+                    num_need_lr[1] = num_invalid[1] + num_invalid[3];
+                    vector<int> pts_to_earse;
+                    for(int k = 0; k < 2; ++k)
+                    {
+                        for(auto &it: cand_g_id_sta_obj_fea)
                         {
-                            if(y >= 3) continue;
+                            Point2f &p_pt = prevLeftFeaMap[it];
+                            id_row = p_pt.y/half_H;
+                            id_col = p_pt.x/half_W;
+                            if(id_row > 1) id_row = 1;
+                            if(id_col > 1) id_col = 1;
+                            id_bloc = 2*id_row + id_col;
+                            if((k == 0 && num_invalid[id_bloc] > 0) || (k == 1 && num_need_lr[id_col] > 0))
+                            {
+                                g_id_sta_obj_3D2D_high_NCC.insert(it);
+                                num_invalid[id_bloc] -= 1;
+                                num_need_lr[id_col] -= 1;
+                                pts_to_earse.push_back(it);
+                                // ++num_total_3D_2D_fea;
+                                // ++num_near_3D_2D_fea;
+                            }
                         }
-                        else
-                            break;
+
+                        if(!pts_to_earse.empty())
+                        {
+                            for(auto &it: pts_to_earse)
+                            {
+                                cand_g_id_sta_obj_fea.erase(it);
+                            }
+                            pts_to_earse.clear();
+                        }
+                    }
+                }
+
+                for(int i = 0; i < 4; ++i)
+                {
+                    num_3D2D_sta_obj_fea[i] = num_sta_obj_track_per_bloc[i] - num_invalid[i];
+                }
+
+                cout << "First time to find stereo match of static fea (including static obj fea)! Total num of 3D-2D: " << num_total_3D_2D_fea << ", num of near static 3D-2D: " << num_near_3D_2D_fea << endl;
+            }
+
+            g_l_id_3D2D_obj_fea.clear();
+        }
+
+        if(!g_id_sta_obj_2D2D_high_NCC.empty())
+        {
+            for(int i = 0; i < 4; ++i)
+            {
+                num_sta_obj_track_per_bloc[i] = 0;
+            }
+            l_id_outliers_sta_obj_fea.clear();
+        }
+
+
+        // 在进行F/H估计之后，如果2D-2D或3D-2D点数不足，则再从各个bloc中检测新的跟踪点以达到最小数要求
+        if(add_new_fea_in_next_frame)
+        {
+            // 上面num_fea_2D2D_big_bloc中可能并未统计所有的背景跟踪点
+            if(!num_fea_2D2D_big_bloc.empty()) num_fea_2D2D_big_bloc.clear();
+            num_fea_2D2D_big_bloc.resize(4,0);
+
+            int total_num_bg = 0;
+            int g_id;
+            
+            {
+                num_near_3D_2D_fea = 0; 
+                num_total_3D_2D_fea = 0;
+
+                for(int i = 0; i < 4; ++i)
+                {
+                    num_near_fea[i] = 0;
+                    num_far_fea[i] = 0;
+                }
+
+                int half_W = 200*3, half_H = 60*3;
+                
+                // 这里不仅统计背景跟踪点，也应该计数静态物体3D-2D点！
+                for(auto l_id: id_bg_track_FAST)
+                {
+                    if(status_FAST[l_id] == 0) 
+                    {   
+                        continue;
                     }
 
-                    // 部分新添加的上一帧新背景FAST点在上面寻找立体匹配时可能被删除了
-                    if(status_FAST[(it-1)] == 0) continue;
+                    ++total_num_bg;
+                    Point2f &pt = prev_FAST[l_id];
 
-                    pts_for_cal_F.insert(it);
-                    --rest;
-                    ++k;
+                    int id_row = pt.y/half_H;
+                    int id_col = pt.x/half_W;
+                    if(id_row > 1) id_row = 1;
+                    if(id_col > 1) id_col = 1;
 
-                    if(y < 3) ++num_up_half;
+                    int id_big_bloc = id_row * 2 + id_col;
+                    num_fea_2D2D_big_bloc[id_big_bloc] += 1;
+
+                    g_id = ids_FAST[l_id];
+                    if(fea_g_id_dep.find(g_id) != fea_g_id_dep.end())
+                    {
+                        ++num_total_3D_2D_fea;
+
+                        if(fea_g_id_dep[g_id] == 0)
+                        {
+                            ++num_near_3D_2D_fea;
+                            num_near_fea[id_big_bloc] += 1;
+                        }
+                        else
+                            num_far_fea[id_big_bloc] += 1;
+                    }
+                }
+
+                for(auto l_id: id_bg_track_sift)
+                {
+                    if(status_sift[l_id] == 0) continue;
+
+                    ++total_num_bg;
+                    Point2f &pt = prev_sift[l_id];
+
+                    int id_row = pt.y/half_H;
+                    int id_col = pt.x/half_W;
+                    if(id_row > 1) id_row = 1;
+                    if(id_col > 1) id_col = 1;
+
+                    int id_big_bloc = id_row * 2 + id_col;
+                    num_fea_2D2D_big_bloc[id_big_bloc] += 1;
+                    
+                    g_id = ids_sift[l_id];
+                    if(fea_g_id_dep.find(g_id) != fea_g_id_dep.end())
+                    {
+                        ++num_total_3D_2D_fea;
+
+                        if(fea_g_id_dep[g_id] == 0)
+                        {
+                            ++num_near_3D_2D_fea;
+                            num_near_fea[id_big_bloc] += 1;
+                        }
+                        else
+                            num_far_fea[id_big_bloc] += 1;
+                    }
+                }
+
+                // 各个大bloc中的选择的近处静态物体3D-2D点
+                // 为了避免后续objs-matching阶段所有的静态物体都没有通过检查而导致最终静态3D-2D点不足，这里是否不应该把静态物体的3D-2D点计数在内？
+                // 选择不加入，等到objs-matching后再决定是否加入
+                if(0)
+                {
+                    for(int k = 0; k < 4; ++k)
+                    {
+                        int num_obj_pt = num_3D2D_sta_obj_fea[k];
+                        num_total_3D_2D_fea += num_obj_pt;
+                        num_near_3D_2D_fea += num_obj_pt;
+                        // 这些点肯定是近点（因为是根据深度值来选择的）
+                        num_near_fea[k] += num_obj_pt;
+                    }
                 }
             }
-            else
-            {
-                // 再添加8个FAST跟踪点
-                rest = 10;
+            
+            bool detect_again = false;
+
+            // 什么样的情况下必须再检测新的3D-2D跟踪点？
+            // 不应该以2D-2D点数为标准，而是以3D-2D点数为标准
+
+            // int total_num_bg = 0;
+            // for(int k = 0; k < 4; ++k)
+            // {
+            //     int num_had = num_fea_2D2D_big_bloc[k];
                 
-                // todo:是否要优先添加上半图像的点直到满足最小值？
-                // 没必要，当近点严重不足时，自然会添加远处的点！
-                if(add_up_half_img_fea)
+            //     total_num_bg += num_had;
+
+            //     // 不需要每个大bloc的点数都达到规定的最大值，但是不应该太少
+            //     // int num_th = max_num_track_big_bloc[k];
+            //     // if(num_had <= (num_th - 5))  detect_again = true;
+
+            //     // if(num_had <= 10)  detect_again = true;
+            // }
+
+            // // 如果总的2D-2D点数太少，则也要再寻找新跟踪点
+            // if(total_num_bg < 1.0 * MIN_CNT_PTS_TRACK_BG) detect_again = true;
+
+            // 查看3D-2D点数是否足够!
+            vector<int> num_new_near_3D_need(4,0), total_num_new_3D_need(4,0);
+            int near_pt_need = 0, total_pt_need = 0;
+
+            // 不应该只以总3D-2D点数来判断是否需要继续寻找3D-2D跟踪点，而是要看每个大bloc中的点数是否足够！即3D-2D点要尽量分布均匀！
+            // if(num_near_3D_2D_fea < 12 || num_total_3D_2D_fea < 20)
+            {
+                
+                // for(int k = 0; k < 4; ++k)
+                // {
+                //     // 各个大bloc中需要再检测获取的近3D-2D点
+                //     if(k < 2)
+                //         min_num_near_3D2D[k] = 0;
+                //     else
+                //         min_num_near_3D2D[k] = max(0, need_near_pt_per_bloc);
+                // }
+
+                if(num_near_3D_2D_fea < 12)
                 {
-                    if(num_up_half < 5)
+                    detect_again = true;
+                    near_pt_need = 12 - num_near_3D_2D_fea;
+                    
+                    int num_near_up_img = num_near_fea[0] + num_near_fea[1];
+                    int need_near_pt_per_bloc = (12 - num_near_up_img + 1)/2;
+                    
+                    // 各个大bloc需要补充的近处3D-2D点。近点优先从下半图像补充
+                    if(num_near_fea[2] < need_near_pt_per_bloc) num_new_near_3D_need[2] = need_near_pt_per_bloc - num_near_fea[2];
+                    if(num_near_fea[3] < need_near_pt_per_bloc) num_new_near_3D_need[3] = need_near_pt_per_bloc - num_near_fea[3];
+                }
+                
+                // if(num_total_3D_2D_fea < 20)
+                {
+                    // 这是最终的最低3D-2D点数要求，不由用户定义
+                    // if(num_total_3D_2D_fea < Min_total_3D2D_track) total_pt_need = Min_total_3D2D_track - num_total_3D_2D_fea;
+                    // int num_need_low = min_total_num_3D2D[2];
+                    // int num_need_up = min_total_num_3D2D[0];
+
+                    // 正常情况下固定最少数量是20
+                    if(num_total_3D_2D_fea < 20) total_pt_need = 20 - num_total_3D_2D_fea;
+                    int num_need_low = 7;
+                    int num_need_up = 3;
+                    
+                    // 如果有F/H估计，则重新设置各个大bloc中所需3D-2D点的最小数量
+                    // 是否要固定最小总数，然后根据旋转值分配？在分bloc检测时不需要固定总值，固定总值是最后的保障（在整幅图像中选取）
+                    if(has_valid_F || has_valid_H)
                     {
-                        for(auto &it: temp_pts_for_F)
+                        if((delta_angle_from_FH >= 0.65 && delta_angle_from_FH < 1.6) || P_cam_motion.norm() >= 0.8)
                         {
-                            if(status_FAST[(it-1)] == 0) continue;
-
-                            if(num_up_half >= 5) break;
-
-                            float y = cur_FAST[(it-1)].y/60.0;
-                            if(y < 3)
+                            // num_need_low = 6;
+                            num_need_up = 5;
+                        }
+                        else if(delta_angle_from_FH >= 1.6)
+                        {
+                            // num_need_low = 5;
+                            num_need_up = 7;
+                        }
+                    }
+                    
+                    for(int i = 0; i < 4; ++i)
+                    {
+                        int need_pt_per_bloc = 0;
+                        int total_num = num_far_fea[i] + num_near_fea[i];
+                        if(i < 2)
+                        {
+                            min_total_num_3D2D[i] = num_need_up;
+                            if(total_num < num_need_up)
                             {
-                                --rest;
-                                ++num_up_half;
-                                pts_for_cal_F.insert(it);
+                                need_pt_per_bloc = num_need_up - total_num;
+                                detect_again = true;
+                            }
+                        }
+                        else
+                        {
+                            min_total_num_3D2D[i] = num_need_low;
+                            if(total_num < num_need_low)
+                            {
+                                need_pt_per_bloc = num_need_low - total_num;
+                                detect_again = true;
+                            }
+                        }
+                        total_num_new_3D_need[i] = need_pt_per_bloc;
+                    }
+                }
+            }
+            
+            if(detect_again)
+            {
+                vector<int> min_num_need_per_bloc(4,0);
+                int total_need = 0;
+                for(int i = 0; i < 4; ++i)
+                {
+                    int num_need = 2.0 * max(total_num_new_3D_need[i], num_new_near_3D_need[i]);
+                    if(num_need > 0 && num_need < 6)
+                        num_need = 6;
 
-                                it = 0;
+                    min_num_need_per_bloc[i] = num_need + num_fea_2D2D_big_bloc[i];
+                    total_need += num_need;
+                }
+
+                int orig_total_num_bg = total_num_bg;
+                int orig_num_FAST = prev_FAST.size();
+                int orig_num_sift = prev_sift.size();
+
+                bool has_est_FH = (has_valid_F||has_valid_H);
+
+                new_FAST_detect_and_track(mask_bg_fea_prev, 0.98, 0.965, total_num_bg, seg_map_cur, flow_map, min_num_need_per_bloc, 2, total_need, has_est_FH, 0.95);
+                
+                int final_num_FAST_track = prev_FAST.size();
+                // 为新获得的跟踪点在上一帧寻找立体匹配
+                // 由于新检测和跟踪到的点不一定是纯背景点，还有极小概率全是上一帧的漏检背景点，由于只添加新FAST跟踪点，因此这里应该用FAST跟踪点是否增加来判断
+                // if(total_num_bg > orig_total_num_bg)
+                if(final_num_FAST_track > orig_num_FAST)
+                {
+                    // 被忘了将新得到的跟踪点的跟踪数+1
+                    for(int k = orig_num_FAST; k < final_num_FAST_track; ++k)
+                        track_cnt_FAST[k] += 1;
+
+                    cout << "Need to find more stereo match of bg fea!" << endl;
+                    int near_3D_got, total_3D_got;
+                    
+                    find_stereo_for_tracked_fea(prev_dep_map, num_new_near_3D_need, total_num_new_3D_need, near_3D_got, total_3D_got, near_pt_need, total_pt_need, orig_num_FAST, orig_num_sift, has_est_FH);
+                    num_near_3D_2D_fea += near_3D_got;
+                    num_total_3D_2D_fea += total_3D_got;
+                }
+            }
+            
+            cout << "Final num of 2D-2D bg tracking: " << total_num_bg << endl;
+            cout << "Final total num of 3D-2D (with stereo mtach in prev frame) bg fea: " << num_total_3D_2D_fea << ", num of near 3D-2D: " << num_near_3D_2D_fea << endl;
+        }
+        
+        // 下面开始筛选和保留背景的跟踪点
+        // 是否需要限制每一帧的视觉前端中最终的跟踪点数量，并且限制其中新跟踪点的最少数，以及旧跟踪点的最大数
+        bool limit_num_track = true;
+
+        if(limit_num_track)
+        {
+            int Max_th_num_old = 60;
+
+            // 新点的最小数量不需要太大
+            int Min_th_num_new = 8;
+            
+            // 如果车辆仍然近乎静止，则可能绝大部分点仍然是旧点，此时需要减少新点的最小阈值限制
+            if(small_p && ave_flow_len_sta_fea <= 4)
+            {
+                Min_th_num_new = 2;
+                // Max_th_num_old = MAX_CNT_PTS_TRACK_BG - Min_th_num_new;
+            }
+
+            int num_old_track;
+            int num_new_track;
+            
+            // 最终筛选保留跟踪点时，也应该尽量保持点的均匀分布，这样后续才能进一步准确优化位姿
+            if(sort_all_sift_FAST)
+            {
+                int bloc_row, bloc_col, l_id, g_id;
+                float pt_x, pt_y;
+                uchar cls_pt;
+
+                int num_cnt_track = 0;
+                float val_NCC;
+                
+                vector<int> l_id_pt_with_depth;
+                
+                int num = 0;
+                // num_old_track = 0;
+                num_old_track_fea = 0;
+                num_new_track = 0;
+
+                num_track_fea_with_dep_prev = 0;
+
+                set<int> far_prev_pt_stereo, added_far_prev_pt;
+                if(!pts_stereo_large_dep.empty())
+                {
+                    for(auto &iter: pts_stereo_large_dep)
+                    {
+                        far_prev_pt_stereo.insert(iter.second);
+                    }
+                }
+
+                bool uniformly_select_pts = true;
+
+                int w_big_bloc = 200*3;
+                int h_big_bloc = 60*3;
+                
+                int big_bloc_row, big_bloc_col;
+                // 每个小bloc中的点数
+                vector<int> num_per_bloc(36,0);
+                vector<int> num_got_per_big_bloc(4,0);
+                map<int,float> id_NCC_far_pt;
+                vector<int> Min_th_num_big_bloc(4, 8);
+                // 均匀地选择跟踪点来保留
+                if(uniformly_select_pts)
+                {
+                    map<int,float> id_NCC;
+                    int total_num_track = 0;
+                    float dep;
+
+                    set<int> pt_done, pts_with_dep_prev;
+
+                    if(!num_fea_3D2D_big_bloc.empty()) num_fea_3D2D_big_bloc.clear();
+                    num_fea_3D2D_big_bloc.resize(4,0);
+
+                    if(!num_fea_2D2D_big_bloc.empty()) num_fea_2D2D_big_bloc.clear();
+                    num_fea_2D2D_big_bloc.resize(4,0);
+
+                    int num_near_pt = 0;
+                    int cnt = -1, num_3D2D = 0;
+                    // 优先把在上一帧具有立体匹配的纯背景点放入各个bloc中，使得质量较高的3D-2D点被优先保留
+                    // 这里与上面的区别是要按照跟踪点的NCC从大到小排序
+                    for(auto &pair: NCC_matching_all)
+                    {
+                        ++cnt;
+                        l_id = pair.first;
+                        bool is_obj_fea = false;
+                        if(l_id > 0)
+                        {
+                            if(status_FAST[(l_id-1)] == 0 || obj_cls_id_FAST[(l_id-1)].first > 0)
+                            {
+                                pt_done.insert(l_id);
+                                continue;
+                            }
+
+                            g_id = ids_FAST[(l_id-1)];
+                        }
+                        else
+                        {
+                            if(status_sift[(-l_id)] == 0 || obj_cls_id_sift[(-l_id)].first > 0) 
+                            {
+                                pt_done.insert(l_id);
+                                continue;
+                            }
+
+                            g_id = ids_sift[(-l_id)];
+                        }
+
+                        // H矩阵的外点暂时不处理
+                        if(!reserve_bg_track_pt_id.empty() && reserve_bg_track_pt_id.find(g_id) != reserve_bg_track_pt_id.end())
+                        {
+                            pt_done.insert(l_id);
+                            continue;
+                        }
+
+                        // 远点的立体匹配不太可靠，不优先加入，也暂时不作为3D-2D点
+                        if(!far_prev_pt_stereo.empty() && far_prev_pt_stereo.find(g_id) != far_prev_pt_stereo.end())
+                        {
+                            pt_done.insert(l_id);
+                            id_NCC_far_pt[g_id] = pair.second;
+                            continue;
+                        }
+
+                        if(prevRightFeaMap.find(g_id) != prevRightFeaMap.end())
+                        {
+                            pt_done.insert(l_id);
+
+                            if(l_id > 0)
+                            {
+                                Point2f &pt = prev_FAST[(l_id-1)];
+                                pt_x = pt.x;
+                                pt_y = pt.y;
+                            }
+                            else
+                            {
+                                Point2f &pt = prev_sift[(-l_id)];
+                                pt_x = pt.x;
+                                pt_y = pt.y;
+                            }
+
+                            bloc_row = pt_y/60;
+                            bloc_col = pt_x/200;
+                            if(bloc_row > 5) bloc_row = 5;
+                            if(bloc_col > 5) bloc_col = 5;
+                            // 小bloc的id
+                            int id_bloc = bloc_row * 6 + bloc_col;
+
+                            int num_in_bloc = num_per_bloc[id_bloc];
+                            
+                            // 小bloc中的总点数不能超过NUM_FEA_IN_BLOC
+                            if(num_in_bloc < NUM_FEA_IN_BLOC)
+                            {
+                                big_bloc_row = bloc_row/3;
+                                big_bloc_col = bloc_col/3;
+
+                                int id_big_bloc = big_bloc_row * 2 + big_bloc_col;
+
+                                int num_in_big_bloc = num_fea_3D2D_big_bloc[id_big_bloc];
+
+                                // 大bloc中的3D-2D点数不宜太多，否则容易与其他大bloc的点数太失衡而导致旋转的估计不准确
+                                if(num_in_big_bloc < NUM_FEA_IN_BIG_BLOC)
+                                {
+                                    num_per_bloc[id_bloc] += 1;
+                                    num_fea_3D2D_big_bloc[id_big_bloc] += 1;
+                                    ++num_3D2D;
+
+                                    // 应该记录每个小bloc中的点id，还是每个大bloc中的点id？
+                                    // id_track_fea_per_bloc[id_bloc][num_in_bloc] = l_id;
+
+                                    id_fea_2D2D_big_bloc[id_big_bloc][num_in_big_bloc] = l_id;
+                                    num_fea_2D2D_big_bloc[id_big_bloc] += 1;
+                                    
+                                    ++total_num_track;
+                                    id_NCC[l_id] = pair.second;
+                                    
+                                    pts_with_dep_prev.insert(l_id);
+                                    continue;
+                                }
+                            }
+
+                            // 局部多余的3D-2D背景点直接删除
+                            if(l_id > 0)
+                            {
+                                status_FAST[(l_id-1)] = 0;
+                            }
+                            else
+                            {
+                                status_sift[(-l_id)] = 0;
+                            }
+                        }
+                    }
+
+                    // 再添加近处静态物体的3D-2D跟踪点
+                    // 之所以不在上面优先将静态物体点加入，是因为可能有些静态物体在当前帧开始运动了，而其跟踪点被错当为静态物体（尤其是当F/H失败或者精度不高时），因此优先使用纯背景的3D-2D点
+                    // 由于不知道这些点在objs-matching阶段是否会被确认为静态，因此它们在确认为静态后再将它们加入作为补充！！！
+                    // if(!g_id_sta_obj_3D2D_high_NCC.empty())
+                    // {
+                    //     int num_pt = g_id_sta_obj_3D2D_high_NCC.size();
+                    //     vector<int> sta_pt_l_id;
+                    //     for(auto &it: g_id_sta_obj_3D2D_high_NCC) sta_pt_l_id.push_back(it);
+                    //     vector<uchar> added_pt(num_pt,0);
+
+                    //     for(int k = 0; k < 2; ++k)
+                    //     {
+                    //         // 考虑到可能有些旧静态物体在后续objs_matching中不被提前归为静态，这里尽可能多添加一些物体3D-2D点
+                    //         if(k > 0 && num_3D2D >= 1.5 * Min_num_bg_track_with_dep_prev) break;
+
+                    //         for(int i = 0; i < num_pt; ++i)
+                    //         {
+                    //             if(added_pt[i] > 0) continue;
+                    //             if(k > 0 && num_3D2D >= 1.5 * Min_num_bg_track_with_dep_prev) break;
+                    //             l_id = NCC_matching_all[i].first;
+
+                    //             if(l_id > 0)
+                    //             {
+                    //                 Point2f &pt = prev_FAST[(l_id-1)];
+                    //                 pt_x = pt.x;
+                    //                 pt_y = pt.y;
+                    //                 g_id = ids_FAST[(l_id-1)];
+                    //             }
+                    //             else
+                    //             {
+                    //                 Point2f &pt = prev_sift[(-l_id)];
+                    //                 pt_x = pt.x;
+                    //                 pt_y = pt.y;
+                    //                 g_id = ids_sift[(-l_id)];
+                    //             }
+
+                    //             bloc_row = pt_y/60;
+                    //             bloc_col = pt_x/200;
+                    //             if(bloc_row > 5) bloc_row = 5;
+                    //             if(bloc_col > 5) bloc_col = 5;
+
+                    //             int id_bloc = bloc_row * 6 + bloc_col;
+                    //             big_bloc_row = bloc_row/3;
+                    //             big_bloc_col = bloc_col/3;
+                    //             int id_big_bloc = big_bloc_row * 2 + big_bloc_col;
+
+                    //             int num_in_big_bloc = num_fea_3D2D_big_bloc[id_big_bloc];
+                    //             // 如果该大bloc中的3D-2D点还达不到最小值 或者 总的3D-2D点还不足，则考虑添加静态物体的3D-2D点
+                    //             if(num_in_big_bloc < min_total_num_3D2D[id_big_bloc] || k > 0)
+                    //             {
+                    //                 int num_in_bloc = num_per_bloc[id_bloc];
+                    //                 // 单个小bloc中的点数不能太多
+                    //                 if(num_in_bloc < NUM_FEA_IN_BLOC)
+                    //                 {
+                    //                     added_pt[i] = 1;
+                    //                     // 大bloc中的3D-2D点数不宜太多，否则容易与其他大bloc的点数太失衡而导致旋转的估计不准确
+                    //                     if(num_in_big_bloc < NUM_FEA_IN_BIG_BLOC)
+                    //                     {
+                    //                         num_per_bloc[id_bloc] += 1;
+                    //                         num_fea_3D2D_big_bloc[id_big_bloc] += 1;
+
+                    //                         // 应该记录每个小bloc中的点id，还是每个大bloc中的点id？
+                    //                         // id_track_fea_per_bloc[id_bloc][num_in_bloc] = l_id;
+
+                    //                         id_fea_2D2D_big_bloc[id_big_bloc][num_in_big_bloc] = l_id;
+                    //                         num_fea_2D2D_big_bloc[id_big_bloc] += 1;
+                                            
+                    //                         ++total_num_track;
+                    //                         ++num_3D2D;
+                    //                         id_NCC[l_id] = NCC_matching_all[i].second;
+                                            
+                    //                         pts_with_dep_prev.insert(l_id);
+                    //                         g_id_sta_obj_3D2D.insert(g_id);
+                    //                         continue;
+                    //                     }
+                    //                 }
+                    //                 else
+                    //                 {
+                    //                     added_pt[i] = 1;
+                    //                 }
+                    //                 // 多余的点作为备用点
+                    //                 g_id_sta_obj_3D2D_high_NCC.erase(g_id);
+                    //                 cand_g_id_sta_obj_fea.insert(g_id);
+                    //             }
+                    //         }
+                    //     }
+                    // }
+
+                    // 再取剩下的跟踪点，即上一帧有深度值但不是来自于立体匹配（而是来自于运动更新且信任该深度值）
+                    // todo: 此处是否再优先选取在上一帧有深度值的点？
+                    for(auto &pair: NCC_matching_all)
+                    {
+                        l_id = pair.first;
+
+                        if(pt_done.find(l_id) != pt_done.end()) continue;
+
+                        if(l_id > 0)
+                        {
+                            g_id = ids_FAST[(l_id-1)];
+                            Point2f &pt = prev_FAST[(l_id-1)];
+                            pt_x = pt.x;
+                            pt_y = pt.y;
+                            
+                            dep = prev_FAST_dep[(l_id-1)];
+                        }
+                        else
+                        {
+                            g_id = ids_sift[(-l_id)];
+                            Point2f &pt = prev_sift[(-l_id)];
+                            pt_x = pt.x;
+                            pt_y = pt.y;
+
+                            dep = prev_sift_dep[(-l_id)];
+                        }
+                        
+                        bloc_row = pt_y/60;
+                        bloc_col = pt_x/200;
+                        if(bloc_row > 5) bloc_row = 5;
+                        if(bloc_col > 5) bloc_col = 5;
+
+                        big_bloc_row = bloc_row/3;
+                        big_bloc_col = bloc_col/3;
+                        int id_big_bloc = big_bloc_row * 2 + big_bloc_col;
+                        
+                        int id_bloc = bloc_row * 6 + bloc_col;
+                        int num_in_bloc = num_per_bloc[id_bloc];
+                        int num_2D2D_in_big_bloc = num_fea_2D2D_big_bloc[id_big_bloc];
+                        // 每个小bloc中的踪点数不能超过NUM_FEA_IN_BLOC（不论这些点在上一帧是否有深度值）。
+                        // 此外，每个大bloc的有深度地点数最多不超过MAX_NUM_FEA_IN_BLOC;
+                        // 这里还不是最终的保留，因此每个大bloc中3D-2D点和2D-2D点的数量分别都不能超过NUM_FEA_IN_BIG_BLOC个
+                        // todo:也可以选择先将这部分点记录下来，后续如果3D-2D点不足，再从这些点中选取来补充
+                        bool selected = false;
+                        if(num_in_bloc < NUM_FEA_IN_BLOC) 
+                        {
+                            // 该大bloc中总的跟踪点（包含2D-2D点和3D-2D点）总数不能超过阈值
+                            // 这里不超过规定值，下半图像的点（主要为近点）多一些，上半图像的点（主要为远点）少一些
+                            if(num_2D2D_in_big_bloc < max_num_track_big_bloc[id_big_bloc])
+                            {
+                                // 如果前面允许保留点来自上一帧运动更新的深度值
+                                // todo:是否要采用其中远点的深度？建议不保留，但是不保留的操作应该在寻找立体匹配时就执行，而不是在这里
+                                if(dep > 0 && dep < 21.0)
+                                // if(dep > 0)
+                                {
+                                    int num_in_big_bloc = num_fea_3D2D_big_bloc[id_big_bloc];
+                                    // 每个大bloc中的近处的3D-2D点不能大于阈值
+                                    if(num_in_big_bloc < NUM_FEA_IN_BIG_BLOC)
+                                    {
+                                        num_fea_3D2D_big_bloc[id_big_bloc] += 1;
+                                        selected = true;
+                                        pts_with_dep_prev.insert(l_id);
+                                    }
+                                }
+                                else if(dep <= 0)
+                                {
+                                    // 不保留来自运动更新的3D-2D点？
+                                    selected = true;
+                                } 
+                            }
+                        }
+
+                        if(selected)
+                        {
+                            num_per_bloc[id_bloc] += 1;
+                            // id_track_fea_per_bloc[id_bloc][num_in_bloc] = l_id;
+                            num_fea_2D2D_big_bloc[id_big_bloc] += 1;
+                            id_fea_2D2D_big_bloc[id_big_bloc][num_2D2D_in_big_bloc] = l_id;
+                            ++total_num_track;
+                            id_NCC[l_id] = pair.second;
+                        }
+                        else
+                        {
+                            if(l_id > 0)
+                                status_FAST[(l_id-1)] = 0;
+                            else
+                                status_sift[(-l_id)] = 0;
+                        }
+                    }
+                    
+                    // 四个大的bloc的近处的3D-2D点数目 中的最小值和最大值。 要注意min()和min_element()两个函数的区别！！！
+                    // min()和max()直接比较的是给定的两个参数的大小，不论参数的类型是什么！如果给定的是迭代器类型参数（本质是指针），则比较的是两个参数的地址的大小，返回的也是地址！
+                    auto iter = min_element(num_fea_3D2D_big_bloc.begin(), num_fea_3D2D_big_bloc.end());
+                    // 迭代器就像一个指针
+                    int min_num_big_bloc = *iter;
+                    auto iter_1 = max_element(num_fea_3D2D_big_bloc.begin(), num_fea_3D2D_big_bloc.end());
+                    // 迭代器就像一个指针
+                    int max_num_big_bloc = *iter_1;
+                    
+                    // cout << "max num of closer 3D-2D in big bloc: " << max_num_big_bloc << ", min num: " << min_num_big_bloc << endl;
+                    cout << "Num of near 3D-2D bg fea in every big bloc: " << endl;
+                    cout << "bloc 0: " << num_fea_3D2D_big_bloc[0] << ", bloc 1: " << num_fea_3D2D_big_bloc[1] << ", bloc 2: " << num_fea_3D2D_big_bloc[2] << ", bloc 3: " << num_fea_3D2D_big_bloc[3] << endl;
+
+                    int Max_th_num_big_bloc = 10;
+                    // 是否要限制各个大bloc中最终保留的3D-2D点的最大数量？如何限制？有2种策略：
+                    // 1. 强制限制各个大bloc中的3D-2D点数量，使得各个大bloc的3D-2D点数平衡一些，这是否会使得PnP在估计旋转（更明显）和位移时更准确？
+                    // 理想情况下是每个大bloc至少有6个3D-2D点
+                    
+                    // if(min_num_big_bloc > 8)
+                    // {
+                    //     Max_th_num_big_bloc = 0.75 * min_num_big_bloc;
+                    // }
+                    // Max_th_num_big_bloc = min(max_num_big_bloc, Max_th_num_big_bloc);
+                    // Max_th_num_big_bloc = min(Max_th_num_big_bloc, NUM_FEA_IN_BIG_BLOC);
+
+                    // 2. 无条件（除非该点NCC值小于阈值）地保留所有3D-2D点。
+                    // 其实在上面检测2D-2D点和3D-2D点时就是分bloc进行的，也有限制各个bloc中3D-2D点的最小数量，也就相当于是一种均匀化了？
+                    // 为了避免3D-2D点绝对集中在某个大bloc，限制单个bloc最大的数目？
+                    Max_th_num_big_bloc = min(12, max_num_big_bloc);
+                    
+                    // 是否要限制各个bloc中最少的3D-2D点数?
+                    for(int k = 0; k < 4; ++k)
+                    {
+                        int num_in_bloc = num_fea_3D2D_big_bloc[k];
+                        // 如果近点数不足8，则设置最小的3D-2D点数量
+                        if(num_in_bloc < 8)
+                        {
+                            // 如果近处3D-2D点数最少的大bloc中的点数小于5，则至少要有5个3D-2D点（添加远点）。这样整体的3D-2D点数至少4*5=20个
+                            if(num_in_bloc >= 5)
+                                Min_th_num_big_bloc[k] = num_in_bloc;
+                            else
+                                Min_th_num_big_bloc[k] = 5;
+                        }
+                    }
+
+                    // 保存各个大bloc中最终的3D-2D点数
+                    if(!num_fea_3D2D_big_bloc.empty()) num_fea_3D2D_big_bloc.clear();
+                    num_fea_3D2D_big_bloc.resize(4,0);
+                    
+                    vector<int> pts_low_NCC;
+                    vector<int> num_check_per_big_bloc(4,0);
+                    // vector<int> num_check_per_bloc(36,0);
+                    // vector<int> num_got_per_bloc(36,0);
+                    
+                    int num_3d2d_in_big_bloc, num_2d2d_in_big_bloc, id_big_bloc;
+                    // 首先将近处的3D-2D点 和 没有深度的2D-2D点依次加入到各个大bloc中
+                    while(num < total_num_track)
+                    {
+                        // 在图像中是 从上往下 还是 从下往上 来选取点？ 是按大bloc来选取还是按小bloc？
+                        for(int i = 0; i < 4; ++i)
+                        {
+                            if(num >= total_num_track) break;
+
+                            int total_select = (num_old_track_fea + num_new_track);
+                            
+                            // int total_num_in_bloc = num_per_bloc[i];
+                            // int num_check = num_check_per_bloc[i];
+
+                            int total_num_in_bloc = num_fea_2D2D_big_bloc[i];
+                            int num_check = num_check_per_big_bloc[i];
+
+                            if(num_check < total_num_in_bloc)
+                            {
+                                ++num;
+                                num_check_per_big_bloc[i] += 1;
+
+                                // l_id = id_track_fea_per_bloc[i][num_check];
+                                l_id = id_fea_2D2D_big_bloc[i][num_check];
+
+                                val_NCC = id_NCC[l_id];
+                                
+                                if(val_NCC < 0.985)
+                                {
+                                    // 最少40个跟踪点，意味着平均每个大bloc至少添加了10个跟踪点.
+                                    // 跟踪点数不宜太少，否则很难形成长跟踪点，而这对于LBA相当重要！！
+                                    // if(total_select >= MIN_CNT_PTS_TRACK_BG)
+                                    if(total_select >= 40)
+                                    {
+                                        pts_low_NCC.push_back(l_id);
+                                        continue;
+                                    }
+                                    else if(val_NCC < 0.975)
+                                    {
+                                        pts_low_NCC.push_back(l_id);
+                                        continue;
+                                    }
+                                }
+                                
+                                if(l_id > 0)
+                                {
+                                    int id = l_id - 1;
+                                    num_cnt_track = track_cnt_FAST[id];
+                                    g_id = ids_FAST[id];
+                                    pt_y = prev_FAST[id].y;
+                                    pt_x = prev_FAST[id].x;
+                                    cls_pt = obj_cls_id_FAST[id].first;
+                                    // bloc_row = pt_y/60;
+                                }
+                                else
+                                {
+                                    int id =  -1 * l_id;
+                                    num_cnt_track = track_cnt_sift[id];
+                                    g_id = ids_sift[id];
+                                    pt_y = prev_sift[id].y;
+                                    pt_x = prev_sift[id].x;
+                                    cls_pt = obj_cls_id_sift[id].first;
+                                    // bloc_row = pt_y/60;
+                                }
+
+                                // big_bloc_row = pt_y/h_big_bloc;
+                                // big_bloc_col = pt_x/w_big_bloc;
+                                // if(big_bloc_row > 1) big_bloc_row = 1;
+                                // if(big_bloc_col > 1) big_bloc_col = 1;
+                                
+                                // id_big_bloc = big_bloc_row * 2 + big_bloc_col;
+                                id_big_bloc = i;
+
+                                bool valid_track = true;
+                                bool has_dep_prev = false;
+                                bool is_old_track = false;
+
+                                // int num_got = num_got_per_bloc[i];
+                                int num_got = num_got_per_big_bloc[i];
+                                // 每个大bloc中总的能保留的点数不超过阈值
+                                if(num_got < NUM_FEA_IN_BIG_BLOC)
+                                {
+                                    num_3d2d_in_big_bloc = num_fea_3D2D_big_bloc[id_big_bloc];
+                                    // 如果该点是上一帧有深度的点
+                                    if(pts_with_dep_prev.find(l_id) != pts_with_dep_prev.end())
+                                    {
+                                        has_dep_prev = true;
+                                        // 3D-2D点的数量也要限制？可以不用了，只需要限制总数
+                                        // if(num_3d2d_in_big_bloc >= NUM_FEA_IN_BIG_BLOC) valid_track = false;
+                                    }
+
+                                    if(frame_cnt > 1)
+                                        if(fea_with_more_frames_in_map.find(g_id) != fea_with_more_frames_in_map.end()) 
+                                            is_old_track = true;
+                                }
+                                else
+                                {
+                                    valid_track = false;
+                                }
+
+                                if(valid_track)
+                                {
+                                    // 旧点在上一帧不一定有深度值
+                                    // 其实对于纯背景点而言，cnt_track等于2不代表该点就一定是上一帧的新点，而是指该点在地图中的观察帧数只有1帧
+                                    // 此外，cnt_track大于2的点不一定在当前帧加入地图后其在地图中的观测帧数就大于2，因为上一帧可能marg了次新帧，因此需要看该点是否在fea_with_more_frames_in_map中
+                                    // if(num_cnt_track > 2) 
+                                    if(is_old_track)
+                                    {
+                                        // if(num_old_track_fea < Max_th_num_old || (num_3d2d_in_big_bloc < Min_th_num_big_bloc[i] && has_dep_prev))
+                                        if(num_old_track_fea < Max_th_num_old || (num_3d2d_in_big_bloc < min_total_num_3D2D[i] && has_dep_prev))
+                                        {
+                                            ++num_old_track_fea;
+                                            // num_got_per_bloc[i] += 1;
+                                            num_got_per_big_bloc[i] += 1;
+
+                                            if(has_dep_prev)
+                                            {
+                                                ++num_track_fea_with_dep_prev;
+                                                num_fea_3D2D_big_bloc[id_big_bloc] += 1;
+                                                id_fea_3D2D_big_bloc[id_big_bloc][num_3d2d_in_big_bloc] = g_id;
+                                                // if(cls_pt == 0) ++num_3D_2D_bg_track;
+                                            }
+                                            continue;
+                                        }
+
+                                        if(cls_pt == 0)
+                                        {
+                                            if(l_id > 0)
+                                                status_FAST[(l_id-1)] = 0;
+                                            else
+                                                status_sift[(-l_id)] = 0;
+                                        }
+                                        else
+                                        {
+                                            // 此时不会有静态物体跟踪点
+                                            // g_id_sta_obj_3D2D.erase(g_id);
+                                            // // 记录备用的静态物体3D-2D点
+                                            // cand_g_id_sta_obj_fea.insert(g_id);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        // 新跟踪点
+                                        ++num_new_track;
+                                        // num_got_per_bloc[i] += 1;
+                                        num_got_per_big_bloc[i] += 1;
+
+                                        if(has_dep_prev)
+                                        {
+                                            ++num_track_fea_with_dep_prev;
+                                            num_fea_3D2D_big_bloc[id_big_bloc] += 1;
+                                            id_fea_3D2D_big_bloc[id_big_bloc][num_3d2d_in_big_bloc] = g_id;
+                                            // if(cls_pt == 0) ++num_3D_2D_bg_track;
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    // 是否在这里就把这些某个大bloc中超出数量阈值的纯背景跟踪点删除？纯背景点删除，静态物体点作为备用
+                                    if(1)
+                                    {
+                                        if(cls_pt == 0)
+                                        {
+                                            if(l_id > 0)
+                                                status_FAST[(l_id-1)] = 0;
+                                            else
+                                                status_sift[(-l_id)] = 0;
+                                        }
+                                        else
+                                        {
+                                            // g_id_sta_obj_3D2D.erase(g_id);
+                                            // // 记录备用的静态物体3D-2D点
+                                            // cand_g_id_sta_obj_fea.insert(g_id);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        pts_low_NCC.push_back(l_id);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    num_check_per_big_bloc.clear();
+
+                    if(!pts_low_NCC.empty())
+                    {
+                        vector<uchar> pts_saved(pts_low_NCC.size(),0);
+                        int cnt = -1;
+                        // 两次遍历。第一次遍历是使得各个大bloc中的3D-2D点达到最小规定值；第二次是使总3D-2D点数达到最小规定值
+                        for(int i = 0; i < 2; ++i)
+                        {
+                            cnt = -1;
+                            for(auto iter: pts_low_NCC)
+                            {
+                                ++cnt;
+                                if(pts_saved[cnt] == 1) continue;
+                                l_id = iter;
+                                val_NCC = id_NCC[l_id];
+
+                                // todo: 跟踪点的NCC值太低，即使有足够3D-2D匹配，能否提高最终估计精度呢？
+                                if(val_NCC >= 0.965)
+                                {
+                                    // 考虑要保存某些3D-2D近点
+                                    if(i == 0 || (num_track_fea_with_dep_prev < 1.2 * Min_num_bg_track_with_dep_prev))
+                                    {
+                                        if(pts_with_dep_prev.find(l_id) != pts_with_dep_prev.end())
+                                        {
+                                            if(l_id > 0)
+                                            {
+                                                int id = l_id-1;
+                                                g_id = ids_FAST[id];
+                                                // num_cnt_track = track_cnt_FAST[id];
+                                                pt_y = prev_FAST[id].y;
+                                                pt_x = prev_FAST[id].x;
+                                                cls_pt = obj_cls_id_FAST[id].first;
+                                                // bloc_row = pt_y/60;
+                                            }
+                                            else
+                                            {
+                                                int id = -l_id;
+                                                g_id = ids_sift[id];
+                                                // num_cnt_track = track_cnt_sift[id];
+                                                pt_y = prev_sift[id].y;
+                                                pt_x = prev_sift[id].x;
+                                                cls_pt = obj_cls_id_sift[id].first;
+                                                // bloc_row = pt_y/60;
+                                            }
+                                            
+                                            bloc_row = pt_y/60;
+                                            bloc_col = pt_x/200;
+                                            if(bloc_row > 5) bloc_row = 5;
+                                            if(bloc_col > 5) bloc_col = 5;
+                                            // 小bloc的id
+                                            // int id_bloc = bloc_row * 6 + bloc_col;
+                                            // int num_in_bloc = num_per_bloc[id_bloc];
+
+                                            big_bloc_row = bloc_row/3;
+                                            big_bloc_col = bloc_col/3;
+                                            id_big_bloc = big_bloc_row * 2 + big_bloc_col;
+
+                                            int num_got = num_got_per_big_bloc[id_big_bloc];
+                                            
+                                            if(i == 0)
+                                            {
+                                                // 大bloc中总的跟踪点数不超过阈值
+                                                if(num_got < 1.2*NUM_FEA_IN_BIG_BLOC)
+                                                {
+                                                    int num_in_big_bloc = num_fea_3D2D_big_bloc[id_big_bloc];
+                                                    // 如果大bloc中的3D-2D点数还不满足要求
+                                                    // if(num_in_big_bloc < Min_th_num_big_bloc[id_big_bloc])
+                                                    if(num_in_big_bloc < min_total_num_3D2D[id_big_bloc])
+                                                    {
+                                                        ++num_track_fea_with_dep_prev;
+                                                        // num_per_bloc[id_bloc] += 1;
+                                                        num_got_per_big_bloc[id_big_bloc] += 1;
+
+                                                        num_fea_3D2D_big_bloc[id_big_bloc] += 1;
+                                                        id_fea_3D2D_big_bloc[id_big_bloc][num_in_big_bloc] = g_id;
+
+                                                        pts_saved[cnt] = 1;
+                                                        // if(cls_pt == 0) ++num_3D_2D_bg_track;
+                                                    }
+                                                }
+                                                continue;
+                                            }
+                                            else
+                                            {
+                                                // 如果总的3D-2D点数过少则不再考虑分区，只要某个大bloc的点数还未达到最大值，则添加
+                                                if(num_got < 1.3*NUM_FEA_IN_BIG_BLOC)
+                                                {
+                                                    int num_in_big_bloc = num_fea_3D2D_big_bloc[id_big_bloc];
+
+                                                    // 同时如果该大bloc中的3D-2D点数没有超过最大阈值
+                                                    if(num_in_big_bloc < Max_th_num_big_bloc)
+                                                    {
+                                                        ++num_track_fea_with_dep_prev;
+                                                        // num_per_bloc[id_bloc] += 1;
+                                                        num_got_per_big_bloc[id_big_bloc] += 1;
+
+                                                        num_fea_3D2D_big_bloc[id_big_bloc] += 1;
+                                                        id_fea_3D2D_big_bloc[id_big_bloc][num_in_big_bloc] = g_id;
+                                                        // if(cls_pt == 0) ++num_3D_2D_bg_track;
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                // 最终不满足要求或不需要的纯背景跟踪点就删除
+                                if(i == 1)
+                                {
+                                    if(cls_pt == 0)
+                                    {
+                                        if(l_id > 0)
+                                        {
+                                            status_FAST[(l_id-1)] = 0;
+                                        }
+                                        else
+                                        {
+                                            status_sift[(-l_id)] = 0;
+                                        }
+                                    }
+                                    else
+                                    {
+
+                                        // g_id_sta_obj_3D2D.erase(g_id);
+                                        // // 记录备用的静态物体3D-2D点
+                                        // cand_g_id_sta_obj_fea.insert(g_id);
+                                    }
+                                }
                             }
                         }
                     }
                 }
-
-                for(auto &it: temp_pts_for_F)
-                {
-                    if(rest <= 0) break;
-                    if(it == 0) continue;
-                    if(status_FAST[(it-1)] == 0) continue;
-                    
-                    --rest;
-                    pts_for_cal_F.insert(it);
-                }
-            }
-        }
-
-        // 根据F矩阵排除FAST中的跟踪外点
-        if(frame_count > 0 && reject_with_F)
-        {
-            if(only_use_track_sift_for_F)
-                rejectWithFV1(false);
-            else
-                rejectWithFV2(initial_succ, pts_for_cal_F);
-        }
-
-        int Max_th_num_old = 65;
-        int Min_th_num_new = 15;
-
-        // 限制背景跟踪点的数量，以便限制LBA的数量（太多跟踪点也很难保证估计精度）。总数不能超过70.
-        // 如果自车运动较大，则增加新点的数量
-        // if(cal_Mat_F_H || frame_count > 1)
-        // {
-        //     float delta_ang = delta_angle;
-        //     if(cal_Mat_F_H)
-        //     {
-        //         Quaterniond delta_q(R_from_E);
-        //         delta_ang = fabs(acos(delta_q.w()) * 2.0 / 3.1416 * 180.0);
-        //     }
-            
-        //     if(P_cam_motion.norm() >= 0.7 || delta_ang > 0.8)
-        //     {
-        //         Max_th_num_old = 35;
-        //         Min_th_num_new = 35;
-        //     }
-        //     else if(P_cam_motion.norm() <= 0.25 && delta_ang < 0.4)
-        //     {
-        //         Max_th_num_old = 60;
-        //         Min_th_num_new = 10;
-        //     }
-        // }
-        
-        int num_old_track = Max_th_num_old;
-        int num_new_track = Min_th_num_new;
-
-        vector<int> new_track_sift, new_track_FAST;
-        vector<int> del_sift;
-        int num_sift = 0;
-        for(int k = 0; k < num_bg_sift; ++k)
-        {
-            int id = id_bg_track_sift[k];
-            if(status_sift[id] == 0) 
-            {
-                continue;
-            }
-
-            // 如果是静态物体点，则不算入
-            if(obj_cls_id_sift[id].first > 0) continue;
-
-            // todo:是否要保留一定的FAST跟踪点？
-            // 因为FAST点较容易形成多帧跟踪，所以还是要保留一定FAST点以便可以形成LBA
-            if(0 && num_sift > 50)
-            {
-                // status_sift[id] = 0;
-                del_sift.push_back(id);
-                continue;
-            }
-            
-            int g_id = ids_sift[id];
-            if(!reserve_bg_track_pt_id.empty())
-                if(find(reserve_bg_track_pt_id.begin(),reserve_bg_track_pt_id.end(),g_id) != reserve_bg_track_pt_id.end())
-                    continue;
-
-            // 包含旧跟踪点和新跟踪点
-            ++num_sift;
-            
-            if(track_cnt_sift[id] > 2) 
-            {
-                if(num_old_track > 0)
-                {
-                    --num_old_track;
-                }
                 else
-                    status_sift[id] = 0;
-            }
-            else
-            {
-                new_track_sift.push_back(id);
-            }
-        }
-
-        int num_FAST = 0;
-        for(int k = 0; k < id_bg_track_FAST.size(); ++k)
-        {
-            int id = id_bg_track_FAST[k];
-            if(status_FAST[id] == 0)
-            {
-                continue;
-            }
-
-            if(obj_cls_id_FAST[id].first > 0) continue;
-
-            int g_id = ids_FAST[id];
-            if(!reserve_bg_track_pt_id.empty())
-                if(find(reserve_bg_track_pt_id.begin(),reserve_bg_track_pt_id.end(),g_id) != reserve_bg_track_pt_id.end())
-                    continue;
-            
-            if(track_cnt_FAST[id] > 2) 
-            {
-                if(num_old_track > 0)
                 {
-                    --num_old_track;
-                    
-                    ++num_FAST;
-                }
-                else
-                    status_FAST[id] = 0;
-            }
-            else
-            {
-                new_track_FAST.push_back(id);
-            }
-        }
+                    int num_track_upper_img = 5;
+                    // 当汽车在旋转时，多添加一些远处的点，且要求它们在上一帧有深度值(目的是PnP时有更多的上一帧点)
+                    if(pred_delta_angle_cam >= 0.35) num_track_upper_img = 16;
 
-        // 已添加的长跟踪点数，这些点将参与LBA
-        num_old_track_fea = Max_th_num_old - num_old_track;
-
-        // 如果原本旧跟踪点充足，则应该保证至少保留12个（可以参与LBA）
-        if(frame_count > 1 && num_old_track_fea < 12)
-        {
-            for(auto &it: del_sift)
-            {
-                if(num_old_track_fea >= 12)
-                {
-                    if(track_cnt_sift[it] > 2)
+                    for(auto &pair: NCC_matching_all)
                     {
-                        ++num_old_track_fea;
-                        --num_old_track;
-                        // 已处理的点
-                        it = -1;
+                        ++num;
+                        val_NCC = pair.first;
+
+                        int total_select = (num_old_track_fea + num_new_track);
+                        // 总的背景跟踪点数尽量不超过最大规定值，同时新的跟踪点数尽量不小于阈值，图像上部分（远点）的点数不少于规定值
+                        if(total_select < MAX_CNT_PTS_TRACK_BG || num_new_track < Min_th_num_new || num_track_upper_img > 0)
+                        {
+                            if(val_NCC < 0.94)
+                            {
+                                // 如果NCC值已经比较低，且跟踪点数已经大于最小规定值，则先放弃剩下的点；
+                                // 否则，可以降低NCC的最小阈值，但是跟踪点的NCC最终必须大于0.91，因为较差的匹配点加多了反而会使得估计结果变差
+                                if(total_select >= MIN_CNT_PTS_TRACK_BG && num_track_upper_img <= 0)
+                                    break;
+                                else if(val_NCC < 0.90)
+                                {
+                                    // todo:NCC小于0.91的跟踪点是否在这里直接删除？
+                                    // 保留用于提供最小数量的3D-2D跟踪点
+                                    break;
+                                }
+                            }
+
+                            l_id = pair.second;
+
+                            if(l_id > 0)
+                            {
+                                int id = l_id - 1;
+                                if(status_FAST[id] == 0) continue;
+
+                                if(obj_cls_id_FAST[id].first > 0)
+                                    continue;
+
+                                num_cnt_track = track_cnt_FAST[id];
+                                g_id = ids_FAST[id];
+
+                                bloc_row = prev_FAST[id].y/60;
+                            }
+                            else
+                            {
+                                int id =  -1 * l_id;
+                                if(status_sift[id] == 0) continue;
+
+                                if(obj_cls_id_sift[id].first > 0)
+                                    continue;
+                                
+                                num_cnt_track = track_cnt_sift[id];
+                                g_id = ids_sift[id];
+                                
+                                bloc_row = prev_sift[id].y/60;
+                            }
+                            
+                            if(!reserve_bg_track_pt_id.empty())
+                            {
+                                // 上一帧有立体匹配的远点中，如果是H的外点，如何处理其立体匹配点？在这里没有什么好办法，只能认为其立体匹配NCC较高，可以保留
+                                if(reserve_bg_track_pt_id.find(g_id) != reserve_bg_track_pt_id.end())
+                                {
+                                    continue;
+                                }
+                            }
+                            
+                            // 旧跟踪点
+                            if(num_cnt_track > 2) 
+                            {
+                                if(num_track_fea_with_dep_prev < Max_th_num_old)
+                                {
+                                    ++num_old_track_fea;
+                                    ++num_track_fea_with_dep_prev;
+
+                                    if(bloc_row < 2) --num_track_upper_img;
+                                }
+                                else
+                                {
+                                    // 如果远点数量还未达到要求
+                                    if(num_track_upper_img > 0 && bloc_row < 2)
+                                    {
+                                        ++num_old_track_fea;
+                                        ++num_track_fea_with_dep_prev;
+
+                                        --num_track_upper_img;
+                                    }
+                                    else
+                                    {
+                                        // if(l_id > 0)
+                                        //     status_FAST[(1+l_id)] = 0;
+                                        // else
+                                        //     status_sift[(-l_id)] = 0;
+                                        
+                                        l_id_pt_with_depth.push_back((num-1));
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                // 新跟踪点
+                                ++num_new_track;
+                                // 只统计上一帧的近点
+                                if(!far_prev_pt_stereo.empty() && far_prev_pt_stereo.find(g_id) != far_prev_pt_stereo.end())
+                                    added_far_prev_pt.insert(g_id);
+                                else if(prevRightFeaMap.find(g_id) != prevRightFeaMap.end())
+                                {
+                                    ++num_track_fea_with_dep_prev;
+
+                                    if(num_track_upper_img > 0 && bloc_row < 2)
+                                    {
+                                        --num_track_upper_img;
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            break;
+                        }
+                    }
+                    
+                    // 3D-2D匹配点数尽量不小于规定值
+                    // todo:是否应该优先保留上一帧有立体匹配的跟踪点？因为它们的深度值较为可信？
+                    if(!l_id_pt_with_depth.empty())
+                    {
+                        bool little_fea_with_dep = false;
+                        if(num_track_fea_with_dep_prev < 1.5 * Min_num_bg_track_with_dep_prev) little_fea_with_dep = true;
+
+                        // int row_bloc;
+
+                        for(auto pt_id: l_id_pt_with_depth)
+                        {
+                            val_NCC = NCC_matching_all[pt_id].first;
+                            l_id = NCC_matching_all[pt_id].second;
+
+                            if(val_NCC > 0.94)
+                            {
+                                // 如果3D-2D点原本较少，则将所有NCC值较大的长跟踪点都保留
+                                if(little_fea_with_dep)
+                                {
+                                    ++num_track_fea_with_dep_prev;
+                                    // 这些点中一定不包含上部分图像的点 或者 上半部的点数已经足够了
+                                    continue;
+                                }
+                            }
+                            else if(num_track_fea_with_dep_prev < Min_num_bg_track_with_dep_prev)
+                            {
+                                ++num_track_fea_with_dep_prev;
+                                continue;
+                            }
+
+                            if(l_id > 0)
+                            {
+                                status_FAST[(l_id-1)] = 0;
+                            }
+                            else
+                            {
+                                status_sift[(-l_id)] = 0;
+                            }
+                        }
+
+                        l_id_pt_with_depth.clear();
+                    }
+                    
+                    // 剩下的点要么其跟踪的NCC值较小（这对于远处点的点是不应该的)，要么其深度较大而导致立体匹配不太可靠，因此减小远点跟踪的数量要求
+                    num_track_upper_img -= 3;
+
+                    int all_track = NCC_matching_all.size();
+
+                    // 如果还有多余的跟踪点
+                    if(num < all_track)
+                    {
+                        int row_bloc;
+
+                        for(int i = num; i < all_track; ++i)
+                        {
+                            l_id = NCC_matching_all[i].second;
+
+                            if(l_id > 0)
+                            {
+                                if(status_FAST[(l_id-1)] == 0)
+                                    continue;
+
+                                if(obj_cls_id_FAST[(l_id-1)].first > 0)
+                                    continue;
+
+                                g_id = ids_FAST[(l_id-1)];
+                                num_cnt_track = track_cnt_FAST[(l_id-1)];
+                                row_bloc = prev_FAST[(l_id-1)].y/60;
+                            }
+                            else
+                            {
+                                if(status_sift[(-l_id)] == 0)
+                                    continue;
+
+                                if(obj_cls_id_sift[(-l_id)].first > 0)
+                                    continue;
+                                
+                                g_id = ids_sift[(-l_id)];
+                                num_cnt_track = track_cnt_sift[(-l_id)];
+
+                                row_bloc = prev_sift[(-l_id)].y/60;
+                            }
+
+                            if(!reserve_bg_track_pt_id.empty())
+                            {
+                                if(reserve_bg_track_pt_id.find(g_id) != reserve_bg_track_pt_id.end())
+                                {
+                                    continue;
+                                }
+                            }
+                            
+                            val_NCC = NCC_matching_all[i].first;
+                            // todo: 跟踪点的NCC值太低，即使有足够3D-2D匹配，能否提高最终估计精度呢？？？
+                            if(val_NCC > 0.88)
+                            {
+                                // 如果3D-2D点数仍不足
+                                if(num_track_fea_with_dep_prev < Min_num_bg_track_with_dep_prev || (num_track_upper_img > 0 && row_bloc < 2))
+                                {
+                                    // 记录符合NCC要求的上一帧的较远的新跟踪点
+                                    if(!far_prev_pt_stereo.empty() && far_prev_pt_stereo.find(g_id) != far_prev_pt_stereo.end())
+                                    {
+                                        added_far_prev_pt.insert(g_id);
+                                        continue;
+                                    }
+                                    else if(num_cnt_track > 2 || prevRightFeaMap.find(g_id) != prevRightFeaMap.end())
+                                    {
+                                        if(num_track_fea_with_dep_prev < Min_num_bg_track_with_dep_prev)
+                                        {
+                                            ++num_track_fea_with_dep_prev;
+                                            if(row_bloc < 2) --num_track_upper_img;
+
+                                            continue;
+                                        }
+                                        else
+                                        {
+                                            --num_track_upper_img;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 不满足要求或不需要的跟踪点就删除
+                            if(l_id > 0)
+                            {
+                                status_FAST[(l_id-1)] = 0;
+                            }
+                            else
+                            {
+                                status_sift[(-l_id)] = 0;
+                            }
+                        }
+                    }   
+                }
+
+                // 最后处理临时保留的上一帧的远点的立体匹配
+                // 这里同样需要先保证各个大bloc中的3D-2D点数要满足最小数量！！因为分布完整的3D-2D点才能考虑到各种可能的运动！
+
+                int num_cand = pts_stereo_large_dep.size();
+                // 此时如果3D-2D点数量仍然不满足最小数，则按照深度值从小到大遍历pts_stereo_large_dep中的点作为补充！并将多余的点的右观测和深度值删除!
+                // if(num_track_fea_with_dep_prev < Min_num_bg_track_with_dep_prev)
+                {
+                    if(num_cand > 1)
+                    {
+                        // 按照深度值从小到大排序
+                        sort(pts_stereo_large_dep.begin(),pts_stereo_large_dep.end(), [](const pair<float, int> &a, const pair<float, int> &b)
+                        {
+                            return a.first < b.first;
+                        });
+                    }
+                }
+
+                if(num_cand > 0)
+                {
+                    int num_in_big_bloc, id_big_bloc;
+                    vector<uchar> pts_saved(num_cand,0);
+                    int cnt = -1;
+                    int num_try = 3;
+                    for(int i = 0; i < num_try; ++i)
+                    {
+                        cnt = -1;
+                        float Th_NCC = 0.99 - i * 0.015;
+                        if(i > 0) Th_NCC += 0.015;
+
+                        bool invalid_track = true;
+                        for(auto &pair: pts_stereo_large_dep)
+                        {
+                            ++cnt;
+                            if(pts_saved[cnt] == 1) continue;
+                            int g_id = pair.second;
+                            if(prevLeftFeaMap.find(g_id) == prevLeftFeaMap.end())
+                            {
+                                cout << "Weired! Line 8744" << endl;
+                                exit(-1);
+                            }
+                            
+                            float val_NCC = id_NCC_far_pt[g_id];
+                            // 当3D-2D点不足时，按照深度值排序保留那些track的NCC值符合要求（即被保留了下来）的上一帧点
+                            // todo:除了把这些点的深度按照从小到大排序，是否还要某个trakcing的NCC进一步大于阈值？
+                            if(i == 0 || (num_track_fea_with_dep_prev < 1.2 * Min_num_bg_track_with_dep_prev))
+                            {
+                                // 只选择那些flow track的NCC值满足要求的远点
+                                if(val_NCC >= Th_NCC) 
+                                {
+                                    Point2f &pt_prev = prevLeftFeaMap[g_id];
+                                    pt_y = pt_prev.y;
+                                    pt_x = pt_prev.x;
+
+                                    big_bloc_row = pt_y/h_big_bloc;
+                                    big_bloc_col = pt_x/w_big_bloc;
+
+                                    if(big_bloc_row > 1) big_bloc_row = 1;
+                                    if(big_bloc_col > 1) big_bloc_col = 1;
+
+                                    id_big_bloc = big_bloc_row * 2 + big_bloc_col;
+
+                                    int num_got = num_got_per_big_bloc[id_big_bloc];
+
+                                    if(num_got < 1.2 * NUM_FEA_IN_BIG_BLOC)
+                                    {
+                                        int num_in_big_bloc = num_fea_3D2D_big_bloc[id_big_bloc];
+
+                                        if(i == 0)
+                                        {
+                                            // 如果大bloc中的3D-2D点数还不满足最低要求
+                                            // if(num_in_big_bloc < Min_th_num_big_bloc[id_big_bloc])
+                                            if(num_in_big_bloc < min_total_num_3D2D[id_big_bloc])
+                                            {
+                                                // num_per_bloc[id_bloc] += 1;
+                                                num_got_per_big_bloc[id_big_bloc] += 1;
+
+                                                ++num_track_fea_with_dep_prev;
+                                                num_in_big_bloc = num_fea_3D2D_big_bloc[id_big_bloc];
+                                                num_fea_3D2D_big_bloc[id_big_bloc] += 1;
+                                                id_fea_3D2D_big_bloc[id_big_bloc][num_in_big_bloc] = g_id;
+
+                                                pts_saved[cnt] = 1;
+                                                // ++num_3D_2D_bg_track;
+                                                continue;
+                                            }
+                                        }
+                                        else
+                                        {
+                                            // 即使最后不分bloc地添加3D-2D点，也要防止所有的点都集中在一个bloc中
+                                            // if(num_in_big_bloc < NUM_FEA_IN_BIG_BLOC)
+                                            if(num_in_big_bloc < 10)
+                                            {
+                                                // num_per_bloc[id_bloc] += 1;
+                                                num_got_per_big_bloc[id_big_bloc] += 1;
+
+                                                ++num_track_fea_with_dep_prev;
+                                                num_in_big_bloc = num_fea_3D2D_big_bloc[id_big_bloc];
+                                                num_fea_3D2D_big_bloc[id_big_bloc] += 1;
+                                                id_fea_3D2D_big_bloc[id_big_bloc][num_in_big_bloc] = g_id;
+
+                                                pts_saved[cnt] = 1;
+                                                // ++num_3D_2D_bg_track;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 最后一轮时处理无效的3D-2D点
+                            if(i == (num_try-1))
+                            {
+                                // 如果该点的flow NCC值比较高，则保留其为2D-2D点
+                                if(val_NCC > 0.985)
+                                {
+                                    invalid_track = false;
+                                }
+                                
+                                // 如果不是有效的3D-2D点，则删除该跟踪点；如果有效，但是该区域的3D-2D点已近足够，则删除剩下的上一帧远点的立体匹配（即保留其为2D-2D点）
+                                auto iter = find(ids_sift.begin(),ids_sift.end(),g_id);
+                                if(iter != ids_sift.end())
+                                {
+                                    int index = std::distance(ids_sift.begin(),iter);
+
+                                    // 是否保留为2D-2D？如果跟踪的NCC值满足要求，则保留，否则删除该点
+                                    if(!invalid_track)
+                                    {
+                                        if(status_sift[index] != 0)
+                                        {
+                                            prev_sift_dep[index] = -1;
+                                            prevRightFeaMap.erase(g_id);
+                                            prev_un_r_Fea_map.erase(g_id);
+                                        }
+                                    }
+                                    else
+                                        status_sift[index] = 0;
+                                }
+                                else
+                                {
+                                    auto iter_1 = find(ids_FAST.begin(),ids_FAST.end(),g_id);
+                                    if(iter_1 != ids_FAST.end())
+                                    {
+                                        int index = std::distance(ids_FAST.begin(),iter_1);
+
+                                        if(!invalid_track)
+                                        {
+                                            if(status_FAST[index] != 0)
+                                            {
+                                                prev_FAST_dep[index] = -1;
+                                                prevRightFeaMap.erase(g_id);
+                                                prev_un_r_Fea_map.erase(g_id);
+                                            }
+                                        }
+                                        else
+                                            status_FAST[index] = 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // 如果最终3D-2D点仍然不够，则发出警告！！
+                if(num_track_fea_with_dep_prev < Min_num_bg_track_with_dep_prev)
+                {
+                    printf("\n\n\nWarning! Has only %d 3D-2D bg feature in current frame!!\n\n\n", num_track_fea_with_dep_prev);
+                }
+                else
+                {
+                    printf("Has %d 3D-2D bg feature in current frame!\n", num_track_fea_with_dep_prev);
+                }
+
+                cout << "Final num of 3D-2D track (near and far) in every big bloc: " << endl;
+                cout << "bloc 0: " << num_fea_3D2D_big_bloc[0] << ", bloc 1: " << num_fea_3D2D_big_bloc[1] << ", bloc 2: " << num_fea_3D2D_big_bloc[2] << ", bloc 3: " << num_fea_3D2D_big_bloc[3] << endl;
+            }
+            else
+            {
+                vector<int> new_track_sift, new_track_FAST;
+                vector<int> del_sift;
+                int num_sift = 0;
+                
+                int num_bg_sift = id_bg_track_sift.size();
+
+                num_old_track = Max_th_num_old;
+                num_new_track = Min_th_num_new;
+
+                for(int k = 0; k < num_bg_sift; ++k)
+                {
+                    int id = id_bg_track_sift[k];
+                    if(status_sift[id] == 0) 
+                    {
+                        continue;
+                    }
+
+                    // 如果是静态物体点，则不算入
+                    if(obj_cls_id_sift[id].first > 0) continue;
+
+                    // todo:是否要保留一定的FAST跟踪点？
+                    // 因为FAST点较容易形成多帧跟踪，所以还是要保留一定FAST点以便可以形成LBA
+                    if(num_sift > 40)
+                    {
+                        // status_sift[id] = 0;
+                        del_sift.push_back(id);
+                        continue;
+                    }
+                    
+                    int g_id = ids_sift[id];
+                    if(!reserve_bg_track_pt_id.empty())
+                            if(reserve_bg_track_pt_id.find(g_id) != reserve_bg_track_pt_id.end())
+                                continue;
+
+                    // 包含旧跟踪点和新跟踪点
+                    ++num_sift;
+                    
+                    if(track_cnt_sift[id] > 2) 
+                    {
+                        if(num_old_track > 0)
+                        {
+                            --num_old_track;
+                        }
+                        else
+                            status_sift[id] = 0;
+                    }
+                    else
+                    {
+                        new_track_sift.push_back(id);
+                    }
+                }
+
+                int num_FAST = 0;
+                for(int k = 0; k < id_bg_track_FAST.size(); ++k)
+                {
+                    int id = id_bg_track_FAST[k];
+                    if(status_FAST[id] == 0)
+                    {
+                        continue;
+                    }
+
+                    if(obj_cls_id_FAST[id].first > 0) continue;
+
+                    int g_id = ids_FAST[id];
+                    if(!reserve_bg_track_pt_id.empty())
+                            if(reserve_bg_track_pt_id.find(g_id) != reserve_bg_track_pt_id.end())
+                                continue;
+                    
+                    if(track_cnt_FAST[id] > 2) 
+                    {
+                        if(num_old_track > 0)
+                        {
+                            --num_old_track;
+                            
+                            ++num_FAST;
+                        }
+                        else
+                            status_FAST[id] = 0;
+                    }
+                    else
+                    {
+                        new_track_FAST.push_back(id);
+                    }
+                }
+
+                // 已添加的长跟踪点数，这些点将参与LBA
+                num_old_track_fea = Max_th_num_old - num_old_track;
+
+                // 如果原本旧跟踪点充足，则应该保证至少保留12个（可以参与LBA）
+                if(frame_cnt > 1 && num_old_track_fea < 12)
+                {
+                    for(auto &it: del_sift)
+                    {
+                        if(num_old_track_fea >= 12)
+                        {
+                            if(track_cnt_sift[it] > 2)
+                            {
+                                ++num_old_track_fea;
+                                --num_old_track;
+                                // 已处理的点
+                                it = -1;
+                            }
+                        }
+                        else
+                        {
+                            // sift的点已经足够多了
+                            break;
+                        }
+                    }
+                }
+
+                // 保证上一帧有深度值的点的最低数量（为了后续尺度的恢复和PnP)，包括旧跟踪点和部分新跟踪点
+                num_track_fea_with_dep_prev = num_old_track_fea;
+
+                // 保持总的跟踪点数不超过80
+                if(num_old_track > 0)
+                    num_new_track += num_old_track;
+                
+                // 如果FAST点数达不到最低要求，则先添加FAST点以达到最低要求
+                // if(num_FAST < 20)
+                if(num_FAST < 12)
+                {
+                    for(auto &it: new_track_FAST)
+                    {
+                        if(num_new_track > 0 && num_FAST < 12)
+                        {
+                            // 表示该点已处理
+                            it = -1;
+                            --num_new_track;
+                            ++num_FAST;
+                            int g_id = ids_FAST[it];
+                            if(prevRightFeaMap.find(g_id) != prevRightFeaMap.end())
+                            {
+                                ++num_track_fea_with_dep_prev;
+                            }
+                        }
+                        // else if(num_new_track <= 0)
+                        // {
+                        //     it = -1;
+                        //     // 如果已经达到最大跟踪点数，则删除剩余的点
+                        //     status_FAST[it] = 0;
+                        // }
+                        else
+                        {
+                            break;
+                        }
+                    }
+                }
+                
+                // 剩下的sift中，在new_track_sift中的点质量更高，优先
+                for(auto &it: new_track_sift)
+                {
+                    // 如果此时还未达到最大跟踪点数
+                    if(num_new_track > 0)
+                    {
+                        --num_new_track;
+                        int g_id = ids_sift[it];
+                        // 上一帧有深度值的新跟踪点
+                        if(prevRightFeaMap.find(g_id) != prevRightFeaMap.end())
+                        {
+                            ++num_track_fea_with_dep_prev;
+                        }
+                    }
+                    else
+                    {
+                        int g_id = ids_sift[it];
+                        float dep_prev = prev_sift_dep[it];
+                        // 上一帧有深度值的新跟踪点
+                        if(num_track_fea_with_dep_prev < Min_num_bg_track_with_dep_prev && (dep_prev > 0 || prevRightFeaMap.find(g_id) != prevRightFeaMap.end()))
+                        {
+                            ++num_track_fea_with_dep_prev;
+                        }
+                        else
+                            status_sift[it] = 0;
+                    }
+                }
+                
+                // 之后的不管是old还是new，按照质量排序先后保留
+                for(auto &it: del_sift)
+                {
+                    if(it == -1) continue;
+                    if(num_new_track > 0)
+                    {
+                        int cnt = track_cnt_sift[it];
+                        // 如果长跟踪点数已经达到了最大值，则放弃该点
+                        if(cnt > 2 && num_old_track <= 0)
+                        {
+                            status_sift[it] = 0;
+                            continue;
+                        }
+
+                        --num_new_track;
+
+                        if(cnt > 2) 
+                        {
+                            --num_old_track;
+                            ++num_old_track_fea;
+                        }
+
+                        int g_id = ids_sift[it];
+                        // 上一帧有深度值的跟踪点，可能是旧点或新点
+                        if(cnt > 2 || prevRightFeaMap.find(g_id) != prevRightFeaMap.end())
+                        {
+                            ++num_track_fea_with_dep_prev;
+                        }
+                    }
+                    else
+                    {
+                        int g_id = ids_sift[it];
+                        float dep_prev = prev_sift_dep[it];
+                        // 上一帧有深度值的新跟踪点数还没达到最小阈值
+                        if(num_track_fea_with_dep_prev < Min_num_bg_track_with_dep_prev && (dep_prev || prevRightFeaMap.find(g_id) != prevRightFeaMap.end()))
+                        {
+                            ++num_track_fea_with_dep_prev;
+                        }
+                        else
+                            status_sift[it] = 0;
+                    }
+                }
+
+                for(auto &it: new_track_FAST)
+                {
+                    if(it == -1) continue;
+                    if(num_new_track > 0)
+                    {
+                        --num_new_track;
+                        int g_id = ids_FAST[it];
+                        if(prevRightFeaMap.find(g_id) != prevRightFeaMap.end())
+                        {
+                            ++num_track_fea_with_dep_prev;
+                        }
+                    }
+                    else
+                    {
+                        int g_id = ids_FAST[it];
+                        float dep_prev = prev_FAST_dep[it];
+                        if(num_track_fea_with_dep_prev < Min_num_bg_track_with_dep_prev && (dep_prev > 0 || prevRightFeaMap.find(g_id) != prevRightFeaMap.end()))
+                        {
+                            ++num_track_fea_with_dep_prev;
+                        }
+                        else
+                            status_FAST[it] = 0;
+                    }
+                }
+            }
+        }
+        else
+        {
+            // todo
+        }
+    }
+    
+    end_FAST_track = true;
+}
+
+// 根据GPU上sift的检测和匹配初始结果进行筛选，保留其中有效的匹配
+void FeatureTracker::select_SIFT(bool has_r_img, const cv::Mat &seg_map_prev, const cv::Mat &seg_map_cur, const cv::Mat &map_depth_prev,
+                                    const cv::Mat &flow_map, bool &end_flow_post, bool &done_cam_motion_pred, bool use_mask_img)
+{
+    cout << "Start selcct sift!" << endl;
+    TicToc t_o;
+
+    // add_new_FAST_from_sift = false;
+    
+    // 去除GPU线程中的postprocess()!将sift的后处理（选择有效的match）放在此处，减少GPU中其他任务的等待时间。
+    // 对于sift点，其允许检测的最小深度值改为1.5m，因为暴力匹配允许更大的视差估计（1.5m对应的视差值为256）
+    // float max_shift_y = Y_shift_right_image/mMinDepthPt;
+    // float max_shift_y = Y_shift_right_image/1.5;
+    vector<int> temp_flow_pt_id;
+
+    // 是否将将在上一帧有立体匹配但是在当前帧没有匹配的 sift点 转化为上一帧的新FAST点
+    bool add_new_bg_FAST_from_sift = false;
+    // 只在纯视觉阶段通过估计F/H来筛除2d跟踪点中的外点
+    need_cal_FH = reject_with_F && (!USE_IMU || (!IMU_init_succ || Cal_FH_after_IMU_init_succ));
+    bool need_LBA = USE_IMU || (Use_LBA_for_puer_V);
+    
+    num_old_track_fea = 0;
+
+    // 选择sift跟踪点 和 潜在跟踪点
+    if(frame_cnt > 0)
+    {
+        mask_bg_fea_prev = mask_bg_prev.clone();
+        Sift_->select_flow_matching(Y_shift_right_image/mMinDepthPt, seg_map_prev, seg_map_cur, mask_bg_prev, num_flow_pt_in_bloc, num_temp_flow_pt_in_bloc, 
+                                    num_long_track_FAST_in_bloc, prev_FAST, obj_cls_id_FAST, track_cnt_FAST, temp_flow_pt_id, add_new_bg_FAST_from_sift, prev_color_img_l, use_mask_img);
+    }
+    
+    // 挑选当前帧中的有效立体匹配点
+    Sift_->select_stereo_matching(Y_shift_right_image/mMinDepthPt);
+    
+    num_track_sift_bg = 0;
+    num_track_sift_static = 0;
+    num_sta_sift_long_track = 0;
+    
+    int* valid_match_flow_ptr = Sift_->img1.h_matching_pts_flow;
+    int num_match_flow = valid_match_flow_ptr[0];
+    
+    set<int> pt_stereo_with_flow;
+    int prev_pts_with_stereo = 0;
+    
+    vector<int> gl_id_stat_obj_fea;
+    
+    vector<pair<float,int>> temp_NCC_id_pt;
+
+    // 从第2帧开始有跟踪点
+    if(frame_cnt > 0)
+    {
+        small_p = false;
+        // 从第3帧开始有相机的运动模型。默认计算了相机的运动预测
+        if(frame_cnt > 1)
+        {
+            // 等待主线程中的运动预测完成
+            while(!done_cam_motion_pred)
+            {
+                usleep(300);
+            }
+            
+            Quaterniond delta_Q(R_cam_motion);
+            pred_trans_cam = P_cam_motion.norm();
+            pred_delta_angle_cam = fabs(acos(delta_Q.w()) * 2.0 / 3.1416 * 180.0);
+	        cout << "norm of predicted R_cam_motion: " << pred_delta_angle_cam << ", norm of predicted P_cam_motion: " << pred_trans_cam << endl;
+            
+            // 构建有效的F矩阵需要非0位移，这里以0.1m为界限
+            // 此外，当上一帧的运动很小时，当前帧可能开始加速运动，因此这种情况下的运动预测可能很不准确。
+            // 且起步阶段光流不会很大，误匹配的概率较小，可以不需要此预先过滤
+            if(pred_trans_cam <= 0.08)
+                small_p = true;
+        }
+        
+        // int num_3D2D_need_low = 5, num_3D2D_need_up = 5;
+
+        // 是否要设定一个最小总数（20或24），然后按不同旋转值对不同bloc分配最小需求值？
+        int num_3D2D_need_low = min_total_num_3D2D[2], num_3D2D_need_up = min_total_num_3D2D[0];
+
+        // 根据预测的旋转大小来设置图像上部分中间区域各个小bloc中允许的点数
+        if(frame_cnt > 1)
+        {
+            vector<int> id_set = {1, 2, 3, 4, 8, 9};
+            vector<int> total_num_limit_small_bloc = {8, 6, 6, 8, 8, 8};
+
+            int i = 0;
+            
+            for(auto &iter: id_set)
+            {
+                if(pred_delta_angle_cam > 0.3)
+                {
+                    limit_num_track_per_bloc[iter] = total_num_limit_small_bloc[i++];
+                }
+                else
+                {
+                    limit_num_track_per_bloc[iter] = (total_num_limit_small_bloc[i++] - 2);
+                }
+            }
+
+            if(pred_delta_angle_cam >= 0.65)
+            {
+                max_num_track_for_FH_big_bloc[0] = 8;
+                max_num_track_for_FH_big_bloc[1] = 8;
+                max_num_track_for_FH_big_bloc[2] = 12;
+                max_num_track_for_FH_big_bloc[3] = 12;
+            }
+            else
+            {
+                max_num_track_for_FH_big_bloc[0] = 5;
+                max_num_track_for_FH_big_bloc[1] = 5;
+                max_num_track_for_FH_big_bloc[2] = 15;
+                max_num_track_for_FH_big_bloc[3] = 15;
+            }
+            
+            if((pred_delta_angle_cam >= 0.65 && pred_delta_angle_cam < 1.5) || pred_trans_cam >= 0.8)
+            {
+                // num_3D2D_need_low = 7;
+                num_3D2D_need_up += 2;
+            }
+            else if(pred_delta_angle_cam >= 1.5)
+            {
+                // num_3D2D_need_low = 6;
+                num_3D2D_need_up += 4;
+            }
+        }
+
+        // 设置3D-2D在各个大bloc的最少点数。
+        // 初次检测时的最低点数要求由用户定义，这里只根据预测旋转的大小调整上半副图像的总点数要求
+        for(int k = 0; k < 4; ++k)
+        {
+            if(k < 2)
+            {
+                // min_num_near_3D2D[k] = 0;
+                min_total_num_3D2D[k] = num_3D2D_need_up;
+            }
+            else
+            {
+                // 近处（21m)的3D-2D点最少要10个，优先在下半图像的两个bloc中寻找。近点的设置不需要随着旋转的大小而修改
+                // min_num_near_3D2D[k] = 5;
+                min_total_num_3D2D[k] = num_3D2D_need_low;
+            }
+        }
+        
+        // prev_img_for_show_fea = prev_color_img_l.clone();
+
+        // 上一帧就已经被跟踪了的点，其中的纯背景点皆为long_tracked sift，部分物体点不是long_tracked sift（上一帧的新物体）
+        num_old_track_sift = prev_sift.size();
+        // assert(num_old_track_sift == prev_sift_index.size());
+        
+        cur_sift.resize(num_old_track_sift, cv::Point2f(0, 0));
+        cur_sift_index.resize(num_old_track_sift, 0);
+        status_sift.resize(num_old_track_sift,0);
+
+        int id_in_pts = num_old_track_sift;
+
+        SiftData *sift_data = &(Sift_->siftData1);
+        SiftPoint *h1_siftpts = Sift_->siftData1.h_data;
+        
+        const vector<float> &valid_disp_x = sift_data->valid_disp_x;
+        const vector<float> &valid_disp_y = sift_data->valid_disp_y;
+        Point2f prev_pt, prev_pt_r, cur_pt, prev_un_pt, prev_un_pt_r;
+
+        float dep_prev, match_xpos_r, match_ypos_r, disp_match_x_r, disp_match_y_r;
+
+        Vec2b info_pt_cur;
+
+        // 让特征点尽可能均匀地分布在图像中
+        // 此外，每个bloc中选取一定数量的跟踪点用于估计F或H矩阵并分解得到R和t
+        for(int i = 0; i < 6; ++i)
+            for(int j = 0; j < 6; ++j)
+                id_best_track_bloc[i][j] = 0;
+
+        vector<int> id_pts_flow_for_F;
+        int l_pt_id, match_id, cnt_track;
+        bool old_track = false;
+        bool is_stat_obj_fea_track = false;
+        // 小bloc和大bloc的行和列id
+        int col_in_bloc, row_in_bloc, id_small_bloc, row_big_bloc, col_big_bloc, id_big_bloc;
+
+        // 基于极线约束，使用预测的相机运动构建F矩阵来过滤静态点的匹配（注意，这对动态物体点无效，因为动态点仍可能满足相机的极线约束，参考rigidmask）
+        bool check_flow_with_epi = false;
+        
+        // 是否用运动预测来构建极线约束并初步过滤跟踪点
+        if(Check_flow_with_pred_motion)
+        {
+            // 如果先前是使用运动预测值来设置跟踪点的位置预测，则这里就不再使用极线约束！
+            // sift不需要设置匹配点的预测，因此是否使用预测的运动的极线约束完全由用户定义
+            // if(use_motion_to_pred_fea_pos) 
+            //     check_flow_with_epi = false;
+            // else
+            {
+                if(frame_cnt > 1)
+                {
+                    // 构建有效的F矩阵需要非0位移
+                    if(!small_p)
+                    {
+                        // todo:是否需要预测的旋转较小？是否认为汽车在大旋转时的运动预测精度较低？
+                        // if(pred_delta_angle_cam < 1.0)
+                        {
+                            Matrix3d t_up;
+                            t_up << 0.0, -P_cam_motion(2), P_cam_motion(1), P_cam_motion(2), 0.0, -P_cam_motion(0), -P_cam_motion(1), P_cam_motion(0), 0.0;
+                            // 本质矩阵到关键矩阵
+                            F_cam = K_trans_inv * t_up * R_cam_motion * K_inv;
+
+                            // todo: 是否必须使用IMU且初始化成功后才用运动预测来过滤跟踪点？
+                            // 修改为纯视觉阶段预测的运动只用于过滤上一帧的静态物体点，只有使用IMU且初始化成功后采用预测运动来过滤背景跟踪点！
+                            // if(USE_IMU && init_succ_IMU)
+                                check_flow_with_epi = true;
+                        }
+                        // else
+                        // {
+                        //     check_flow_with_epi = false;
+                        // }
+                    }
+                    else
+                    {
+                        check_flow_with_epi = false;
+                    }
+                }
+                else
+                    check_flow_with_epi = false;
+            }
+        }
+
+        if(!num_fea_2D2D_big_bloc.empty()) num_fea_2D2D_big_bloc.clear();
+        num_fea_2D2D_big_bloc.resize(4,0);
+
+        if(!pt_2d_2d_small_bloc.empty()) pt_2d_2d_small_bloc.clear();
+        pt_2d_2d_small_bloc.resize(36,0);
+        
+        // 跟踪点的信息记录
+        // 注意，这些sift的flow match已经按照score_ambi从小到大排序了，越靠前的点其匹配质量一般较好
+        for(int k = 0; k < num_match_flow; ++k)
+        {
+            old_track = false;
+            is_stat_obj_fea_track = false;
+            dep_prev = -1.0;
+            int validpts_id = valid_match_flow_ptr[(k+1)];
+
+            float prev_x = h1_siftpts[validpts_id].xpos;
+            float prev_y = h1_siftpts[validpts_id].ypos;
+            float cur_x = h1_siftpts[validpts_id].match_xpos;
+            float cur_y = h1_siftpts[validpts_id].match_ypos;
+
+            // 注意，valid_disp_的索引是用k，不是用validpts_id！！
+            float disp_x = valid_disp_x[k];
+            float disp_y = valid_disp_y[k];
+            
+            info_pt_cur = seg_map_cur.at<Vec2b>(cur_y,cur_x);
+            uchar cls_cur = info_pt_cur[0];
+
+            if (cls_cur == 1 || cls_cur == 2 || cls_cur == 4 || cls_cur == 7) continue;
+            
+            prev_pt.x = prev_x;
+            prev_pt.y = prev_y;
+            cur_pt.x = cur_x;
+            cur_pt.y = cur_y;
+
+            uchar det_cls_prev = seg_map_prev.at<Vec2b>(prev_y,prev_x)(0);
+
+            col_in_bloc = prev_x/200;
+            row_in_bloc = prev_y/60;
+
+            if(col_in_bloc == 6) col_in_bloc = 5;
+            if(row_in_bloc == 6) row_in_bloc = 5;
+
+            row_big_bloc = row_in_bloc/3;
+            col_big_bloc = col_in_bloc/3;
+
+            if(!inBorder(cur_pt)) 
+            {
+                if(det_cls_prev == 0 && cls_cur == 0) num_flow_pt_in_bloc[row_in_bloc][col_in_bloc] -= 1;
+                continue;
+            }
+
+            uchar cls_prev;
+            int gl_id_pt;
+            int obj_status_prev = -1;
+            bool is_old_track = false, is_bg_track = false, is_sta_obj_track = false, is_long_track = false;
+            bool bloc_is_full = false;
+
+            auto iter = find(prev_sift_index.begin(),prev_sift_index.end(),validpts_id);
+            int id_index = -1;
+            cnt_track = 1;
+            // if it is a long-tracked sift
+            if(iter != prev_sift_index.end())
+            {
+                is_old_track = true;
+                id_index = std::distance(prev_sift_index.begin(),iter);
+                // 注意，如果是上一帧的保留点，则判断其在上一帧的cls应该要用cls_prev而不是det_cls_prev，因为保留点的cls可能与其检测的cls不一致
+                cls_prev = obj_cls_id_sift[id_index].first;
+                obj_status_prev = obj_cls_id_sift[id_index].second;
+                cnt_track = track_cnt_sift[id_index];
+                gl_id_pt = ids_sift[id_index];
+                // 被先前挑选过程中被误认为是纯背景的跟踪点，减去该计数
+                if(cls_prev != 0 && det_cls_prev == 0 && cls_cur == 0)
+                {
+                    num_flow_pt_in_bloc[row_in_bloc][col_in_bloc] -= 1;
+                }
+
+                if(frame_cnt > 1)
+                    is_long_track = (fea_with_more_frames_in_map.find(gl_id_pt) != fea_with_more_frames_in_map.end());
+            }
+            else
+            {
+                cls_prev = det_cls_prev;
+                // 上一帧被检测的物体的点，无论是被跟踪点还是新点，都已经在上一帧添加了，所以不会出现在当前帧的新跟踪点中。
+                if(cls_prev != 0) 
+                {
+                    continue;
+                }
+            }
+            
+            if(cls_prev == 0 && cls_cur == 0) 
+                is_bg_track = true;
+            else if(cls_cur == cls_prev && cls_prev > 0 && obj_status_prev == 0) 
+                is_sta_obj_track = true;
+            
+            // 大bloc中的静态（纯背景点或静态物体点）跟踪点数(3D-2D或2D-2D）不应该超过规定值！即整张图像全部跟踪点不应该超过规定值。这里sift点最多保留规定值的3/4，剩下部分留给FAST点
+            if(is_bg_track || is_sta_obj_track)
+            {
+                id_small_bloc = 6 * row_in_bloc + col_in_bloc;
+                id_big_bloc = row_big_bloc * 2 + col_big_bloc;
+                // 每个小bloc中的静态跟踪点数也不能大于阈值
+                if(pt_2d_2d_small_bloc[id_small_bloc] >= limit_num_track_per_bloc[id_small_bloc])
+                {
+                    bloc_is_full = true;
+                    if(cls_prev == 0)
+                    {
+                        // 如果长跟踪点数还没达到最小值，则不放弃该背景跟踪点
+                        if(!(is_long_track && need_LBA && num_old_track_fea < (Min_num_old_track_per_frame + 5)))
+                            continue;
                     }
                 }
                 else
                 {
-                    // sift的点已经足够多了
-                    break;
+                    int num_pts = num_fea_2D2D_big_bloc[id_big_bloc];
+                    int th_num_big_bloc = max_num_track_big_bloc[id_big_bloc] * 0.75;
+                    
+                    if(num_pts >= th_num_big_bloc)
+                    // if(num_pts >= 30) 
+                    {
+                        bloc_is_full = true;
+                        if(cls_prev == 0)
+                        {
+                            // 如果长跟踪点数还没达到最小值，则不放弃该背景跟踪点
+                            if(!(is_long_track && need_LBA && num_old_track_fea < (Min_num_old_track_per_frame + 5)))
+                                continue;
+                        }
+                    }
+                    else
+                    {
+                        if(num_sta_obj_track_per_bloc[id_big_bloc] >= NUM_FEA_IN_BLOC)
+                        {
+                            bloc_is_full = true;
+                        }
+                    }
+                }
+            }
+
+            // 排除明显错误的背景匹配点
+            // 即正常情况下点的光流方向（从上一帧点指向当前帧点）应该是从中心向四周辐射。当道路有坡度时，这种方向可能会相反，但是幅度不应该太大！否则就认为是匹配错误
+            // 在有IMU且初始化时，使用预测运动（精度较高）的极线约束可以有效地排除这样的错误匹配。因此是否仅在纯视觉阶段使用此方法？
+            // 这里计算量很小，如果及时排除这样的点（数量很少）可以省去后面较大的计算
+            // if(!USE_IMU || !init_succ_IMU)
+            {
+                if(is_bg_track)
+                {
+                    bool invalid_flow = false;
+                    if(prev_y/60.0 > 3)
+                    {
+                        if((prev_y - cur_y) > 15)
+                        {
+                            invalid_flow = true;
+                        }
+                    }
+                    else
+                    {
+                        if((prev_y - cur_y) < -15)
+                        {
+                            invalid_flow = true;
+                        }
+                    }
+
+                    if(invalid_flow)
+                    {
+                        num_flow_pt_in_bloc[row_in_bloc][col_in_bloc] -= 1;
+                        continue; 
+                    }
+                }
+            }
+
+            // 首先用NCC值来筛选SIFT点的flow匹配
+            float value_NCC = 0, ambi_NCC = 1.0;
+            if(sort_by_NCC)
+            {
+                // 是否根据匹配点的NCC ambi来过滤其匹配点
+                if(!check_match_by_ambi_NCC)
+                {
+                    // todo: 是否要在当前匹配点的基础上搜寻最佳匹配？这样的话，得到的匹配点就不再是GPU上获得的sift点，下一帧无法再使用CUDAsift对其进行跟踪。只能转化为FAST点！
+                    // if(refine_matching_flow)
+                    // {
+                    //     float shift_x, shift_y;
+                    //     value_NCC = cal_best_NCC(prev_img, cur_img, prev_pt, cur_pt, Len_edge_win, shift_x, shift_y);
+                    // }
+                    // else
+                    {
+                        // 注意，要确保此时cur_img已经成功赋值了
+                        value_NCC = cal_NCC(prev_img, cur_img, prev_pt, cur_pt, Len_edge_win);
+                    }
+                }
+                else
+                {
+                    // if(refine_matching_flow)
+                    // {
+                    //     float shift_x, shift_y;
+                    //     value_NCC = cal_best_NCC(prev_img, cur_img, prev_pt, cur_pt, Len_edge_win, shift_x, shift_y, check_match_by_ambi_NCC);
+                    // }
+                    // else
+                    {
+                        value_NCC = cal_check_by_ambi_NCC(prev_img, cur_img, prev_pt, cur_pt, Len_edge_win, ambi_NCC);
+                    }
+                }
+
+                // 由于sift没有进行局部搜寻最佳匹配点，因此提高NCC的值
+                float thres_NCC = 0.975;
+                // 纯背景点跟踪
+                if(is_bg_track) 
+                {
+                    // 0.92?
+                    thres_NCC = 0.97;
+                }
+                
+                if(value_NCC < thres_NCC)
+                {
+                    // 无效的纯背景跟踪点。cls_prev != 0 && det_cls_prev == 0 && cls_cur == 0的点在上面已经减去计数了
+                    if(cls_prev == 0 && cls_cur == 0)
+                    {
+                        num_flow_pt_in_bloc[row_in_bloc][col_in_bloc] -= 1;
+                    }
+                    continue;
+                }
+                
+                // cout << "NCC of sift matching: " << value_NCC << endl;
+            }
+
+            // 静态跟踪点还需要通过预测运动的极线约束的检验
+            bool invalid_sta_obj_fea = true;
+            // 系统第3帧开始才会有相机运动的预测，才能构建F矩阵
+            if(frame_cnt > 1 && Check_flow_with_pred_motion)
+            {
+                // 无论后续需不需要估计F/H矩阵，这里都可以使用预测运动的F矩阵来初步筛选背景跟踪点;而上一帧的静态物体在当前帧的跟踪点，只在系统要估计F/H矩阵时才需要在此处进行初步筛选
+                // 如果大bloc中的静态物体跟踪点数已经达到相应的最大值，则不再对静态物体点进行检验，节省计算
+                // if(is_bg_track || (reject_with_F && is_sta_obj_track))
+                if(is_bg_track || is_sta_obj_track)
+                {
+                    if(check_flow_with_epi)
+                    {
+                        // 纯背景跟踪点是否也需要通过极线约束的检验？如果使用了IMU或者认为纯视觉的运动估计足够准确，则可以使用
+                        // 纯视觉时只对上一帧的静态物体点进行检验，因为相机运动预测值不一定准确,一旦不准确，则最多只忽略掉静态物体跟踪点
+                        int succ = 0;
+                        // 如果当前帧还是纯视觉阶段，则放宽背景点的极线按约束的误差阈值（这主要是为了尽可能排除极端异常的匹配点，如漏检的动态物体点）
+                        if(!USE_IMU || !IMU_init_succ)
+                        {
+                            succ = check_flow_with_F(F_cam, prev_pt, cur_pt, 16.0);
+                            // succ = 1;
+                        }
+                        else
+                            succ = check_flow_with_F(F_cam, prev_pt, cur_pt, 6.0);
+                        
+                        // 静态点需要离预测的极线不能太远
+                        // 对于不成立的点，只删除纯背景点
+                        // 静态物体点可能变为了动态点
+                        if(succ <= 0)
+                        {
+                            if(is_bg_track)
+                            {
+                                num_flow_pt_in_bloc[row_in_bloc][col_in_bloc] -= 1;
+                                // 如果是旧跟踪点
+                                if(id_index >= 0)
+                                    status_sift[id_index] = 0;
+                                
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            if(is_sta_obj_track)
+                                invalid_sta_obj_fea = false;
+                        }
+                    }
+                    else if(small_p)
+                    {
+                        // 当预测的p太小而无法通过极线约束来排除背景点匹配时，如何排除异常匹配点？尤其是连续多帧漏检的动态物体（例如白色的厢式货车）
+                        // 可以使用简单的固定阈值来排除过长的光流。但是如果前后2帧刚好处于汽车刚启动的时刻，那么是否会错误排除掉过多的正确匹配？
+                        // 更好的办法是统计所有的背景点光流长度并用MAD来排除异常点
+                        if(!use_MAD_to_fliter_flow)
+                        {
+                            float len_flow = disp_x * disp_x + disp_y * disp_y;
+                            if(len_flow >= 12* 12)
+                            {
+                                if(is_bg_track)
+                                {
+                                    if(id_index >= 0)
+                                        status_sift[id_index] = 0;
+
+                                    num_flow_pt_in_bloc[row_in_bloc][col_in_bloc] -= 1;
+                                    continue;
+                                }
+                            }
+                            else
+                            {
+                                if(is_sta_obj_track)
+                                    invalid_sta_obj_fea = false;
+                            }
+                        }
+                        else
+                        {
+                            // 当预测的相机运动较小时，就不要考虑使用上一帧的静态物体跟踪点来估计F或H了，因为没法确认其是否变为动态的？
+                            // 这里还是将其中val_NCC值较高的点用来估计F/H，此外后续还可以用重投影误差来检验该静态物体跟踪点
+                            if(is_sta_obj_track) invalid_sta_obj_fea = false;
+                        }
+                    }
+                }
+            }
+
+            // if it is a long-tracked sift
+            if(iter != prev_sift_index.end())
+            {
+                uchar obj_id = info_pt_cur[1];
+                old_track = true;
+                
+                // 下面遍历的这些条件，很可能不能覆盖所有的条件，为了避免某些遗漏条件下的上一帧点被保留下来，在每一条件下单独修改status，即status_sift[id_index] = 1;
+                if (cls_cur == cls_prev && cls_cur == 0 && abs(disp_x) < 1280/8.0 && abs(disp_y) < 384/6.0)
+                {
+                    // 后续根据物体的运动状态的判定结果和这里的局部obj_id来更改sift点的全局id！obj_cls_id_sift这个量由上一帧的量修改为表示当前帧的，然后用reduceVector来去除多余
+                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(0, obj_id);
+                    // 记录跟踪的静态sift点数
+                    ++num_track_sift_static;
+                    // 记录长跟踪静态点的个数
+                    if(track_cnt_sift[id_index] > 1) ++num_sta_sift_long_track;
+
+                    // 上一帧的被跟踪的背景点如果没有深度值，则要么是是因为它有立体匹配，暂时还没被立体三角化;要么本系统不使用运动估计值来更新跟踪点在最新帧下的深度值
+                    {
+                        dep_prev = prev_sift_dep[id_index];
+                        if(dep_prev <= 0)
+                        {
+                            // 上一帧的新背景点如果被保留，则一定是有立体匹配；上一帧的旧点则可以选择在上一帧就保留立体匹配
+                            if(cnt_track < 2 || add_stereo_for_bg_fea_cur_frame)
+                            {
+                                int gl_id = ids_sift[id_index];
+                                if(prevRightFeaMap.find(gl_id) == prevRightFeaMap.end())
+                                {
+                                    // 即使允许每一帧更新跟踪点的深度值，也不一定能进行（例如当前帧没有有效的PnP或者LBA），因此跟踪点在上一帧不一定有深度值
+                                    // if(Cal_cur_dep_by_motion && Use_pred_dep_to_find_stereo_mtach)
+                                    // {
+                                    //     cout << "Weired! Line 9207" << endl;
+                                    //     exit(-1);
+                                    // }
+                                }
+                                else
+                                {
+                                    Point2f &prev_r = prevRightFeaMap[gl_id];
+                                    dep_prev = mbf/(prev_sift[id_index].x - prev_r.x);
+                                }
+                            }
+                        }
+                    }
+                }
+                // 上一帧的静态物体sift点（即上一帧的全局obj id为0，但cls不为0），即使其（所在物体）在当前两帧之间变为动态的，其光流值也不会太大（物体刚启动运动）。
+                // 这些sift点暂时不归为背景sift点，等到确定该物体是否运动后再归类！
+                else if (cls_cur == cls_prev && cls_cur > 0 && obj_status_prev == 0 && abs(disp_x) < 1280/8.0 && abs(disp_y) < 384/6.0)
+                {
+                    // 物体id按当前帧的局部编号来，等物体关联之后再等其进行更新。
+                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(cls_prev, obj_id);
+                    ++num_track_sift_static;
+
+                    // id_bg_track_sift.push_back(id_in_pts);
+
+                    if(track_cnt_sift[id_index] > 1) ++num_sta_sift_long_track;
+                }
+                // 上上帧与上一帧之间是动态或新的物体，其在上一帧到当前帧之间也可能变成静态的。这种情况在这里可以也按动态物体的标准来衡量（虽然可能会造成一定的误匹配，但概率会比较小）。
+                // 后续根据物体运动状态的判定来更改其对应sift点的全局id。
+                else if (cls_cur == cls_prev && obj_status_prev > 0 && abs(disp_x) < 1280/6.5 && abs(disp_y) < 384/4.5)
+                //else if (cls_label == obj_cls_id_sift[id_index].first && obj_id > 0 && abs(disp_x) < 1280/4.0 && abs(disp_y) < 384/2.0)
+                {
+                    // 物体id按当前帧的局部编号来，等物体关联之后再等其进行更新。
+                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(cls_prev, obj_id);
+                    // 对于上一帧的新物体的跟踪点，这里暂时不加入
+                }
+                // 漏检或者错检的物体的配对，在系统前两帧暂时不考虑，因为首帧无法得知各物体的运动状态！！对于首帧的误检物体的特征点匹配，依赖于flow_map提供FAST点的预测和匹配。
+                // 上一帧点为运动或新的物体，且与当前帧匹配点类别不同（当前帧可能为背景，也可能为物体），则可能是当前帧漏检该运动物体（为背景点）或者错分类该物体，则按照动态光流来约束
+                else if (cls_cur != cls_prev && obj_status_prev > 0 && abs(disp_x) < 1280/6.5 && abs(disp_y) < 384/4.5)
+                {
+                    // 物体id按当前帧的局部编号来，等物体关联之后再对其进行更新。
+                    // 物体类别则与上一帧的匹配物体点对齐，当前帧匹配点的检测分类可以从seg_map中查询
+                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(cls_prev, obj_id);
+                }
+                // 上一帧点为静态物体(明确不是背景），且与当前帧匹配点类别不同（当前帧可能为背景或其他物体），则可能是当前帧漏检该静态物体（为背景点）或者错分类该物体，则按照静态光流来约束
+                else if (cls_cur != cls_prev && cls_prev >0 && obj_status_prev == 0 && abs(disp_x) < 1280/8.0 && abs(disp_y) < 384/6.0)
+                {
+                    // 物体类别则与上一帧的匹配物体点对齐，当前帧匹配点的检测分类可以从seg_map中查询
+                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(cls_prev, obj_id);
+                    ++num_track_sift_static;
+                    if(track_cnt_sift[id_index] > 1) ++num_sta_sift_long_track;
+                }
+                // 上一帧点为背景点，当前帧点为物体点，则可能是上一帧漏检了该物体且该点没有与上上帧的物体SIFT点相关联（因为没有被校正cls），则此时无法确定该物体是否为动态的。还是采用动态光流的阈值
+                else if (cls_cur != cls_prev && cls_prev == 0 && abs(disp_x) < 1280/6.5 && abs(disp_y) < 384/4.5)
+                {
+                    // 如果该背景点被多帧观测（多帧观测的情况下则确定该点原本为背景点），则不太可能当前帧突然变为物体点
+                    // 如果该点在上一帧中没有深度值，则不采用该跟踪点，因为这样无法参与估计该漏检物体的运动！
+                    if (add_new_fea_in_next_frame || track_cnt_sift[id_index] > 1) 
+                    {
+                        continue;
+                    }
+                    
+                    // 对于上一帧的漏检物体点，要求其有深度值。
+                    if(prev_sift_dep[id_index] <= 0)
+                    {
+                        int gl_id = ids_sift[id_index];
+                        if(prevRightFeaMap.find(gl_id) == prevRightFeaMap.end())
+                        {
+                            // 暂时不放弃该跟踪点，后续可以再尝试为该点在上一帧寻找立体匹配
+                            // continue;
+                        }
+                        else
+                        {
+                            float dep;
+                            float prev_x_r = prevRightFeaMap[gl_id].x;
+                            dep = mbf/(prev_x - prev_x_r);
+                            if(dep > 1.5 && dep < mThDepthObj)
+                                prev_sift_dep[id_index] = dep;
+                            else
+                                continue;
+                        }
+                    }
+                    
+                    // 上一帧的背景点对齐到当前帧的物体点时，使用当前帧的物体类别，后续则可以根据上一帧的点的全局id来判断该点是否为背景点
+                    obj_cls_id_sift[id_index] = std::pair<uchar, int>(cls_cur, obj_id);
+                }
+                else
+                {
+                    // 无效的纯背景跟踪点减去计数
+                    if(cls_prev == 0 && cls_cur == 0) 
+                    {
+                        num_flow_pt_in_bloc[row_in_bloc][col_in_bloc] -= 1;
+                    }
+                    
+                    continue;
+                }
+                
+                gl_id_pt = ids_sift[id_index];
+                status_sift[id_index] = 1;
+                l_pt_id = id_index;
+                ++num_track_sift;
+                cur_sift[id_index] = cur_pt;
+                // 当前点的匹配点在其siftdata检测点集中的index,这里是siftdata2
+                match_id = h1_siftpts[validpts_id].match;
+                cur_sift_index[id_index] = match_id;
+
+                if(add_new_fea_in_next_frame)
+                {
+                    // 如果关联的两个点有一个不是背景点，则认为是物体跟踪点
+                    // 其实只需要标注那些在上一帧被检测出来的物体区域
+                    // if(cls_prev != 0 || cls_cur != 0)
+                    if(det_cls_prev != 0)
+                    {
+                        // 此mask是标注上一帧中所有被当前帧跟踪到的点，为了后续物体关联时采样用于运动估计的像素点关联而用
+                        circle(mask_prev_fea_objs, prev_sift[id_index], 3, 0, -1);
+                    }
+                    // tracked_objs_long_bg.insert(validpts_id);
+                }
+            }
+            // 如果被跟踪点是上一帧的背景区域临时添加的新点
+            else
+            {
+                prev_sift.emplace_back(prev_x, prev_y);
+                prev_sift_dep.push_back(-1.0);
+                cur_sift.emplace_back(cur_x,cur_y);
+                prevLeftFeaMap[n_id] = prev_pt;
+
+                undistortedPts(prev_pt, prev_un_pt, m_camera[0]);
+                prev_un_Fea_map[n_id] = Vec4f(prev_un_pt.x, prev_un_pt.y, 0.0, 0.0);
+
+                gl_id_pt = n_id;
+                ids_sift.push_back(n_id);
+
+                // 记录当前帧该跟踪点在当前帧的检测sift点集中的序号
+                match_id = h1_siftpts[validpts_id].match;
+                cur_sift_index.push_back(match_id);
+                prev_sift_global_obj_id.push_back(0);
+                // 因为上一帧该点是背景点，因此按照当前帧匹配点的检测cls 和 local obj_id
+                obj_cls_id_sift.emplace_back(cls_cur,info_pt_cur(1));
+                track_cnt_sift.push_back(1);
+                status_sift.push_back(1);
+                ++n_id;
+
+                l_pt_id = id_in_pts;
+                // ++num_sift_bg_cur;
+                ++num_track_sift;
+                ++id_in_pts;
+            }
+            
+            ++cnt_track;
+
+            // 记录被跟踪点中在上一帧有立体匹配的点
+            if(find(temp_flow_pt_id.begin(),temp_flow_pt_id.end(),validpts_id) != temp_flow_pt_id.end())
+            {
+                // set不会有重复元素
+                pt_stereo_with_flow.insert(validpts_id);
+                
+                bool valid_prev_stereo = false;
+
+                // 如果该点的立体匹配还未获取（旧纯背景跟踪点可以选择在上一帧被跟踪时就寻找立体匹配并保留）
+                if((!old_track || (cls_prev == 0 && !add_stereo_for_bg_fea_cur_frame)) && prevRightFeaMap.find(gl_id_pt) == prevRightFeaMap.end())
+                {
+                    pt_stereo_with_flow.insert(validpts_id);
+
+                    float *prev_info_ptr = Sift_->prev_stereo_match_info + 5 * validpts_id;
+                    match_xpos_r = prev_info_ptr[3];
+                    match_ypos_r = prev_info_ptr[4];
+                    
+                    disp_match_x_r = prev_x - match_xpos_r;
+                    disp_match_y_r = prev_y - match_ypos_r;
+                    
+                    // assert(disp_match_x_r > 0);
+                    if(disp_match_x_r <= 0)
+                    {
+                        cout << "Weired! Line 10018" << endl;
+                        exit(-1);
+                    }
+
+                    uchar cls_track = obj_cls_id_sift[l_pt_id].first;
+                    float val_NCC;
+
+                    if(abs(disp_match_y_r) > 3.0) 
+                        dep_prev = -1.0;
+                    else
+                    {
+                        float shift_x, shift_y;
+                        prev_pt_r.x = match_xpos_r;
+                        prev_pt_r.y = match_ypos_r;
+                        if(refine_matching_stereo)
+                        {
+                            val_NCC = cal_best_NCC(prev_img, prev_img_r, prev_pt, prev_pt_r, Len_edge_win, shift_x, shift_y);
+                            // NCC = cal_best_NCC(prev_img, prev_img_r, prev_pt, prev_pt_r, Len_edge_win, shift_x, shift_y, check_match_by_ambi_NCC);
+
+                            // int row_fea = prev_pt.y/60;
+                            // if(row_fea == 6) row_fea = 5;
+                            // cout << "NCC of sift stereo matching in prev img: " << val_NCC << ", row of fea: " << row_fea << endl;
+                        }
+                        else
+                        {
+                            val_NCC = cal_NCC(prev_img, prev_img_r, prev_pt, prev_pt_r, Len_edge_win);
+                            
+                        }
+
+                        float Th_NCC = 0.98;
+                        // 下1/3区域的背景点绝大多数都是近点（小于15m)，其中可能大部分是地面点，其前后2帧的成像区域（大小）可能变化较大，对其NCC值适当放宽
+                        if(cls_track == 0)
+                        {
+                            if(prev_y/60.0 > 4.0)
+                            {
+                                Th_NCC = 0.97;
+                            }
+
+                            // 如果需要足够的长跟踪点来进行LBA，则降低点的NCC阈值。是否只对近点降低阈值？
+                            if(need_LBA && is_long_track && prev_y/60.0 > 3.0) Th_NCC -= 0.005;
+                        }
+                        
+                        if(val_NCC > Th_NCC)
+                        {
+                            if(refine_matching_stereo && (shift_x != 0 || shift_y != 0))
+                            {
+                                match_xpos_r += shift_x;
+                                match_ypos_r += shift_y;
+                                disp_match_x_r -= shift_x;
+                                disp_match_y_r -= shift_y;
+                                if(disp_match_x_r <= 0)
+                                {
+                                    cout << "Weired! Line 9998" << endl;
+                                    exit(-1);
+                                }
+                            }
+
+                            if(abs(disp_match_y_r) >= 2.0) 
+                                dep_prev = -1.0;
+                            else
+                                dep_prev = mbf/disp_match_x_r;
+                        }
+                        else
+                        {
+                            // 无效的立体匹配
+                            dep_prev = -1.0;
+                        }
+                    }
+                    
+                    // 根据ORB-SLAM2的设置，大于40倍基线的深度的背景点为远点，这些远点的立体匹配一般比较不准确（会影响估计F和H以及PnP和LBA），因此放弃它们的立体匹配，而是用前后2帧三角化来计算它们的深度
+                    // 这里取得比40倍基线(KITTI基线长度为0.54m，40倍为21m)
+                    if(cls_track == 0) 
+                    {
+                        if(dep_prev > 1.5 && dep_prev < 21)
+                            valid_prev_stereo = true;
+                        else if(dep_prev >= 21 && dep_prev < mThDepthBg)
+                        {
+                            // 较远的背景点的立体匹配，如果NCC值较大，则暂时保留它，以防当前帧的3D-2D匹配点不足
+                            if(val_NCC >= 0.985)
+                            {
+                                valid_prev_stereo = true;
+                                pts_stereo_large_dep.emplace_back(dep_prev, gl_id_pt);
+                            }
+                            else
+                            {
+                                valid_prev_stereo = false;
+                            }
+                        }
+                        else
+                        {
+                            // 正的深度值但是超过阈值
+                            if(dep_prev > 0)
+                            {
+                                status_sift[l_pt_id] = 0;
+                                -num_track_sift_static;
+                                continue;
+                            }
+                            else
+                            {
+                                // 无效的深度值，则保留该2D-2D点，后续会再次尝试寻找立体匹配
+                                valid_prev_stereo = false;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // 如果漏检的物体点在上一帧有正确的深度，但超过阈值，则放弃该物体点跟踪；如果无正确立体匹配，则暂时不放弃该点，等待后续再次尝试寻找
+                        if(dep_prev > 1.5 && dep_prev <= mThDepthObj)
+                            valid_prev_stereo = true;
+                        else
+                        {
+                            // 有效的深度值但是超过阈值
+                            if(dep_prev > 0)
+                            {
+                                status_sift[l_pt_id] = 0;
+                                if(obj_status_prev == 0) --num_track_sift_static;
+                                continue;
+                            }
+                            else
+                            {
+                                // 无效的深度值，则保留该2D-2D物体点，后续会再次尝试寻找立体匹配
+                                valid_prev_stereo = false;
+                            }
+                        }
+                    }
+
+                    // 添加上一帧的右匹配点
+                    if(valid_prev_stereo)
+                    {
+                        prev_pt_r.x = match_xpos_r;
+                        prev_pt_r.y = match_ypos_r;
+                        undistortedPts(prev_pt_r, prev_un_pt_r, m_camera[1]);
+                        prevRightFeaMap[gl_id_pt] = prev_pt_r;
+                        // todo: 注意，如果是旧跟踪点，则该点在上一帧右图像中的速度可能不为0！
+                        // 这在添加该点为地图点时再计算！
+                        prev_un_r_Fea_map[gl_id_pt] = Vec4f(prev_un_pt_r.x, prev_un_pt_r.y, 0.0 ,0.0);
+                    }
+                    
+                    // 这部分点寻求使用2帧的三角化来获得在上一帧中的深度值，包括首帧左右2帧或者前后2帧
+                    if(cls_track == 0)
+                    {
+                        if(!use_tria_stereo && valid_prev_stereo)
+                        {
+                            prev_sift_dep[l_pt_id] = dep_prev;
+                        }
+                    }
+                    else
+                    {
+                        // 如果为物体点
+                        if(valid_prev_stereo)
+                        {
+                            prev_sift_dep[l_pt_id] = dep_prev;
+                        }
+                        else
+                        {
+                            // 等待后续完成深度预测和再次寻找立体匹配
+                            // prev_sift_dep[l_pt_id] = -1.0;
+                        }
+                    }
+                }
+            }
+
+            // 对于静态跟踪点，是否进一步通过重投影误差来判断其是否有效？
+            // 最后除了静态物体点在这里进行检验之外（因为它们每一帧的深度均来自于立体匹配），对于背景跟踪点将这一步放到为上一帧的新跟踪点寻找立体匹配点之后再进行！
+            if(frame_cnt > 1)
+            {
+                // todo:纯背景跟踪点是否也需要通过极线约束的检验？如果使用了IMU或者认为纯视觉的运动估计足够准确，则可以使用
+                // todo:是否暂时只对上一帧的静态物体点进行检验，因为相机运动预测值不一定准确,一旦不准确，则最多只浪费掉静态物体点？
+                if(is_bg_track || (!invalid_sta_obj_fea))
+                // if((cls_cur == cls_prev && cls_cur > 0 && !invalid_sta_obj_fea))
+                {
+                    // 注意，对于物体点，其满足相机运动的极线约束不一定意味着其不运动，参见rigidmask！只能通过场景流或者重投影的误差才能确定！
+                    // 该静态物体点需要在上面先通过极线约束的检验
+                    if(Check_dep_with_reproj_err)
+                    {
+                        bool valid_dep = false;
+                        // 静态物体的跟踪点，如果其跟踪的NCC值够高，且基于预测的相机运动的重投影误差小于阈值，
+                        // 则可以参与当前帧相机运动的F矩阵的估计（因为有些情景除了路边停的车，近处几乎没有任何可靠的点，甚至没有车道线）
+                        if(cls_prev > 0)
+                        {
+                            // 如果物体点的NCC值够高，则可以直接参与F/H的估计
+                            if(value_NCC > 0.98)
+                            {
+                                dep_prev = prev_sift_dep[l_pt_id];
+                                // 上一帧15m以内的静态物体点，需要通过F/H的检验（如果当前帧需要估计）
+                                if(dep_prev > 0 && dep_prev <= Th_dep_sta_obj_fea_to_add)
+                                {
+                                    // 如果该点上一帧的深度值来自立体匹配（或者运动更新），则信任该深度值，可以进行重投影检测
+                                    // if(prevRightFeaMap.find(gl_id_pt) != prevRightFeaMap.end())
+                                    if(cnt_track > 2 || prevRightFeaMap.find(gl_id_pt) != prevRightFeaMap.end())
+                                        valid_dep = true;
+                                    else
+                                    {
+                                        // 即使没有可靠的深度，只要NCC够高且深度较小，也可以参与FH的估计
+                                        if(dep_prev < 15.0)
+                                            is_stat_obj_fea_track = true;
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // 对于纯背景点，只有使用IMU且初始化后才使用预测运动进行过滤
+                            // todo: 尝试之后发现即使使用IMU作为相机运动预测，这种滤除还是比较危险的，如果阈值设置不当，可能到时某些帧完全没有3D-2D跟踪点！！
+                            if(false && USE_IMU && IMU_init_succ)
+                            // if(USE_IMU && init_succ_IMU)
+                            {
+                                if(dep_prev > 0 && (prevRightFeaMap.find(gl_id_pt) != prevRightFeaMap.end()))
+                                    valid_dep = true;
+                            }
+                        }
+
+                        if(valid_dep)
+                        {
+                            Vec4f &prev_fea = prev_un_Fea_map[gl_id_pt];
+                            float prev_x = prev_fea(0) * dep_prev;
+                            float prev_y = prev_fea(1) * dep_prev;
+                            Vector3d prev_pt(prev_x,prev_y,dep_prev);
+                            
+                            Vector3d pred_cur = (R_cam_motion * prev_pt + P_cam_motion);
+                            if(pred_cur(2) > 0)
+                            {
+                                float pred_x = pred_cur(0)/pred_cur(2);
+                                float pred_y = pred_cur(1)/pred_cur(2);
+
+                                Point2f cur_un_fea;
+                                undistortedPts(cur_pt,cur_un_fea,m_camera[0]);
+
+                                float err = (pred_x - cur_un_fea.x)*(pred_x - cur_un_fea.x) + (pred_y - cur_un_fea.y)*(pred_y - cur_un_fea.y);
+                                float Th_err = 11.0;
+                                if(USE_IMU && IMU_init_succ) Th_err = 5.0;
+                                // 重投影误差小于阈值
+                                if(err <= (Th_err/FOCAL_LENGTH_X)*(Th_err/FOCAL_LENGTH_X))
+                                {
+                                    if(cls_prev > 0)
+                                    {
+                                        is_stat_obj_fea_track = true;
+                                    }
+                                }
+                                else
+                                {
+                                    // 如果点的重投影误差较大，则可能是其深度值误差较大，其实也有可能是相机运动预测的误差较大？
+                                    if(cls_prev > 0)
+                                    {
+                                        // 如果是物体点，也可能是该物体变为动态了？
+                                        // status_sift[l_pt_id] = 0;
+                                        // continue;
+                                    }
+                                    else
+                                    {
+                                        // todo: 保留该背景跟踪点但是删除其在上一帧的深度值？？
+                                        // prev_sift_dep[i] = -1.0;
+                                        // if(prevRightFeaMap.find(gl_id_pt) != prevRightFeaMap.end())
+                                        // {
+                                        //     prevRightFeaMap.erase(gl_id_pt);
+                                        //     prev_un_r_Fea_map.erase(gl_id_pt);
+                                        // }
+
+                                        // 对于静态点，不满足重投影误差限制不一定是因为匹配误差，很可能是因为运动预测误差！这里暂不删除该点，而是不将其直接用作估计F_H矩阵
+                                        bg_track_not_for_cal_FH.insert(gl_id_pt);
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                if(cls_prev == 0) bg_track_not_for_cal_FH.insert(gl_id_pt);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // 如果不进行重投影校验，是否直接使用较近的静态物体跟踪点来估计F或H？
+                        if(cls_prev > 0 && value_NCC > 0.98)
+                        {
+                            // 是否要求该点在上一帧要有立体匹配？
+                            // if(prev_un_r_Fea_map.find(gl_id_pt) != prev_un_r_Fea_map.end())
+                            {
+                                int prev_dep = prev_sift_dep[l_pt_id];
+                                if(prev_dep > 0 && prev_dep <= 15.0)
+                                    is_stat_obj_fea_track = true;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // 记录有效的纯背景跟踪点，或者静态物体的跟踪点（只在需要估计F/H矩阵时）
+            // if(is_bg_track || (reject_with_F && is_stat_obj_fea_track))
+            if(is_bg_track || is_stat_obj_fea_track)
+            {   
+                if(cls_prev == 0) ++num_track_sift_bg;
+
+                // 如果是需要使用NCC值统一对所有的sift和FAST跟踪点进行排序
+                if(sort_all_sift_FAST)
+                {
+                    // if(check_by_ambi_NCC)
+                    // {
+                    //     cout << "NCC of static tracked sift: " << value_NCC;
+                    //     cout << ", ambi NCC: " << ambi_NCC << endl;
+                    // }
+                    
+                    // 蓝色实线圈
+                    // circle(prev_img_for_show_fea, prev_pt, 4, Scalar(0,0,255), 1, 16);
+
+                    // while(true)
+                    // {
+                    //     cv::imshow("tracked fea in prev left image", prev_img_for_show_fea);
+                    //     // 一直等待用户按下ESC键（ASCI码为27）
+                    //     if(waitKey(0) == 27)
+                    //     {
+                    //         break;
+                    //     }
+                    // }
+                    
+                    // 如果当前帧对应的大和小bloc的静态2D-2D点还未达到最大数
+                    if(is_bg_track || !bloc_is_full)
+                    {
+                        temp_NCC_id_pt.emplace_back(value_NCC, gl_id_pt);
+                        num_fea_2D2D_big_bloc[id_big_bloc] += 1;
+                        pt_2d_2d_small_bloc[id_small_bloc] += 1;
+
+                        // 记录纯背景跟踪点的ambi_NCC
+                        if(is_bg_track) id_ambi_NCC_new_sift[gl_id_pt] = ambi_NCC;
+
+                        if(is_stat_obj_fea_track)
+                        {
+                            num_sta_obj_track_per_bloc[id_big_bloc] += 1;
+                        }
+                    }
+
+                    // 记录所有track NCC较高的静态物体点，后续为所有这些点都尽可能寻找上一帧的立体匹配（即形成3D-2D点），多余的点将作为备份的静态3D-2D点
+                    g_id_sta_obj_2D2D_high_NCC.insert(gl_id_pt);
+
+                    if(reject_with_F && only_use_track_sift_for_F && cls_prev == 0)
+                    {
+                        id_bg_track_sift.push_back(l_pt_id);
+                    }
+                }
+                else
+                {
+                    // 上半部分的跟踪点要求深度较小（一般都是路杆、路牌之类的），这类点一般较少
+                    if(row_in_bloc < 3)
+                    {
+                        // 上半部分的跟踪点是否要参与F矩阵的估计？对估计R的影响大吗？
+                        // continue;
+                        
+                        // 近处的物体点不允许出现在图像上半部分
+                        if(is_stat_obj_fea_track) continue;
+
+                        // 上半部分每个bloc只添加5个点。由于CudaSift中对上半图像中没有深度或者深度较大的点 有数量限制，因此这里可以适当增大bloc允许的点数
+                        int num_total = 5;
+                        // 上半部分中如果有近点，则一般不会是只有一个点，可以多添加这部分点非地面点，有利于F矩阵的估计
+                        // todo:但是深度误估计（即sift立体匹配错误点）的点较多怎么办？
+                        if(dep_prev > 0)
+                        {
+                            // if(dep_prev < 4.5)
+                            //     num_total = 10;
+                            // else if(dep_prev < 16)
+                            //     num_total = 9;
+
+                            if(dep_prev < 7)
+                                num_total = 9;
+                        }
+                        
+                        if(id_best_track_bloc[row_in_bloc][col_in_bloc] < num_total)
+                        {
+                            id_best_track_bloc[row_in_bloc][col_in_bloc] += 1;
+                            
+                            if(only_use_track_sift_for_F) 
+                                pts_for_cal_F.insert(-l_pt_id);
+                            else
+                                id_pts_flow_for_F.push_back(match_id);
+                        }
+                    }
+                    else
+                    {
+                        int num_total = 7;
+
+                        // 如果是静态物体点，则要求NCC值比一般物体点要更高
+                        if(is_stat_obj_fea_track)
+                        {
+                            if(sort_by_NCC && value_NCC < 0.95) continue;
+                        }
+
+                        // 近处的点多添加一些
+                        // 最下面2行的每个框增加多一些点
+                        if(row_in_bloc > 3)
+                        {
+                            num_total = NUM_FEA_IN_BLOC;
+                            // 如果该框中出现了静态物体，则一般而言物体会占据比较大的区域，则适当减少一下点
+                            if(is_stat_obj_fea_track)
+                                num_total = 6;
+                        }
+                        
+                        if(id_best_track_bloc[row_in_bloc][col_in_bloc] < num_total)
+                        {
+                            id_best_track_bloc[row_in_bloc][col_in_bloc] += 1;
+
+                            if(only_use_track_sift_for_F) 
+                                pts_for_cal_F.insert(-l_pt_id);
+                            else
+                                id_pts_flow_for_F.push_back(match_id);
+                        }
+                    }
+                }
+            }
+            
+            if(need_LBA && is_bg_track && is_long_track) ++num_old_track_fea;
+
+            // 这里应该使用det_cls_prev而不是cls_prev，因为上一帧的某些背景区域可能被一些漏检物体的跟踪点所占据
+            if(det_cls_prev == 0)
+            {
+                if(mask_bg_fea_prev.at<uchar>(prev_y,prev_x) != 0)
+                {
+                    int radi = MIN_DIST_BG;
+                    // 如果是上一帧的漏检物体点
+                    if(cls_prev != 0) radi = MIN_DIST_OBJ;
+                    cv::circle(mask_bg_fea_prev, prev_pt, radi, 0, -1);
+                }
+            }
+        }
+        
+        valid_match_flow_ptr[0] = 0;
+        
+        // 是否将上一帧新检测的具有立体匹配的sift点保存为上一帧的新FAST点？
+        // 这些点后续将采用与FAST一样的跟踪方式，因此就相当于是上一帧的新FAST点了！
+        // 因此，FAST的跟踪要在这里完成之后才进行。注意，这部分有立体匹配的sift点可以出现在图像的上半部分，此时其深度值比较小
+        
+        // 这里先记录上一帧保留的FAST点的数量，因为下面可能要添加上一帧新的FAST点
+        num_old_track_FAST = prev_FAST.size();
+
+        if(add_new_bg_FAST_from_sift)
+        {
+            bool use_LK_for_stereo_match = false;
+
+            if(!temp_flow_pt_id.empty())
+            {
+                SiftPoint *all_pt_ptr = Sift_->siftData1.h_data;
+                float prev_x, prev_y, prev_x_r, prev_y_r;
+
+                for(auto iter: temp_flow_pt_id)
+                {
+                    // 注意，temp_flow_pt_id中前面部分点是跟踪点，即在pt_stereo_with_flow中，应该略去！
+                    if(pt_stereo_with_flow.find(iter) != pt_stereo_with_flow.end()) continue;
+
+                    float *prev_info_ptr = Sift_->prev_stereo_match_info + 5 * iter;
+                    prev_x = all_pt_ptr[iter].xpos;
+                    prev_y = all_pt_ptr[iter].ypos;
+                    
+                    prev_x_r = prev_info_ptr[3];
+                    prev_y_r = prev_info_ptr[4];
+
+                    prev_pt.x = prev_x;
+                    prev_pt.y = prev_y;
+
+                    prev_pt_r.x = prev_x_r;
+                    prev_pt_r.y = prev_y_r;
+                    
+                    assert(prev_x - prev_x_r > 0);
+
+                    // todo:这里还要看该点所处的小bloc中的跟踪点数是否已达到阈值，以及大bloc中的3D-2D点是否已达到阈值。
+                    // 如果已达到，则放弃该点！
+
+                    float shift_x, shift_y;
+                    float val_NCC;
+
+                    if(!use_LK_for_stereo_match && refine_matching_stereo)
+                    {
+                        val_NCC = cal_best_NCC(prev_img, prev_img_r, prev_pt, prev_pt_r, Len_edge_win, shift_x, shift_y);
+                        // val_NCC = cal_best_NCC(prev_img, prev_img_r, prev_pt, prev_pt_r, Len_edge_win, shift_x, shift_y, check_match_by_ambi_NCC);
+
+                        // int row_fea = prev_pt.y/60;
+                        // if(row_fea == 6) row_fea = 5;
+                        // cout << "NCC of sift stereo matching in prev img: " << val_NCC << ", row of fea: " << row_fea << endl;
+                    }
+                    else
+                    {
+                        // 对于立体匹配就不计算匹配点周围的NCC并用ambi来过滤了，因为点的质量用跟踪点的NCC来衡量，这里没必要重复
+                        // if(check_match_by_ambi_NCC)
+                        //     val_NCC = cal_check_by_ambi_NCC(prev_img, prev_img_r, prev_pt, prev_pt_r, Len_edge_win);
+                        // else
+                        {
+                            val_NCC = cal_NCC(prev_img, prev_img_r, prev_pt, prev_pt_r, Len_edge_win);
+                        }
+                    }
+                    
+                    bool invalid = false;
+                    // 都是上一帧的背景点，要求NCC较高
+                    float Th = 0.98;
+                    // 下1/3图像区域的点适当放宽立体匹配的NCC要求
+                    if(prev_y/60.0 >= 4) Th = 0.965;
+                    if(val_NCC > Th)
+                    {
+                        if(!use_LK_for_stereo_match && refine_matching_stereo)
+                        {
+                            if(shift_x != 0 || shift_y != 0)
+                            {
+                                prev_pt_r.x += shift_x;
+                                prev_pt_r.y += shift_y;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        invalid = true;
+                    }
+
+                    if(abs(prev_y - prev_pt_r.y) >= 2.0) invalid = true;
+
+                    float disp_x = (prev_x-prev_pt_r.x);
+                    if(disp_x <= 0)
+                    {
+                        cout << "Weired!" << endl;
+                        exit(-1);
+                    }
+
+                    float dep = mbf/(disp_x);
+
+                    // 太近的跟踪点直接放弃
+                    if(dep < 1.5 || dep > mThDepthBg) 
+                    {
+                        invalid = true;
+                    }
+                    else if(dep > 21)
+                    {
+                        // 远的3D点如果NCC值较高，则暂时保存，以防近的3D-2D点不足
+                        if(val_NCC >= 0.98)
+                            pts_stereo_large_dep.emplace_back(dep,n_id);
+                        else
+                            invalid = true;
+                    }
+
+                    if(invalid)
+                    {
+                        int row_in_bloc = prev_y/60;
+                        int col_in_bloc = prev_x/200;
+                        if(row_in_bloc > 5) row_in_bloc = 5;
+                        if(col_in_bloc > 5) col_in_bloc = 5;
+                        num_temp_flow_pt_in_bloc[row_in_bloc][col_in_bloc] -= 1;
+                        continue;
+                    }
+
+                    prev_FAST.emplace_back(prev_x,prev_y);
+                    prev_FAST_global_obj_id.push_back(0);
+                    track_cnt_FAST.push_back(1);
+                    ids_FAST.push_back(n_id);
+                    // status_FAST.push_back(1);
+                    obj_cls_id_FAST.emplace_back(0,0);
+
+                    prevLeftFeaMap[n_id] = prev_pt;
+                    
+                    undistortedPts(prev_pt, prev_un_pt, m_camera[0]);
+                    prev_un_Fea_map[n_id] = Vec4f(prev_un_pt.x, prev_un_pt.y, 0.0, 0.0);
+
+                    prevRightFeaMap[n_id] = prev_pt_r;
+
+                    undistortedPts(prev_pt_r, prev_un_pt_r, m_camera[1]);
+                    prev_un_r_Fea_map[n_id] = Vec4f(prev_un_pt_r.x, prev_un_pt_r.y, 0.0, 0.0);
+
+                    if(use_tria_stereo)
+                        prev_FAST_dep.push_back(-1.0);
+                    else
+                    {
+                        float dep = mbf/(prev_x-prev_pt_r.x);
+                        prev_FAST_dep.push_back(dep);
+                    }
+
+                    ++n_id;
                 }
             }
         }
 
-        // 保证上一帧有深度值的点的最低数量（为了后续尺度的恢复和PnP)，包括旧跟踪点和部分新跟踪点
-        num_track_fea_with_dep_prev = num_old_track_fea;
+        // cout << "Num of tracked prev sift fea with stereo match: " << prev_pts_with_stereo << endl;
 
-        // 保持总的跟踪点数不超过80
-        if(num_old_track > 0)
-            num_new_track += num_old_track;
-        
-        // 如果FAST点数达不到最低要求，则先添加FAST点以达到最低要求
-        // if(num_FAST < 20)
-        if(num_FAST < 12)
+        // 通知FAST track线程已经完成了来自sift的新FAST的添加(实际上不一定执行该模块)，可以开始FAST点的跟踪了
+        // 之后再在FAST的跟踪函数中查看各个bloc中特征点数是否足够，如果不够，添加上一帧图像中检测的FAST新点
+        // 其实如果下面选择只用sift点来估计F_H，则还需要去除某些外点sift的数额占用！但是由于通常sift点较少，所以本系统不会使用此方案！
+        if(add_new_fea_in_next_frame)
+            add_new_FAST_from_sift = true;
+
+        // 是否需要根据极线约束去除异常匹配点
+        // 如果需要，是否只使用sift跟踪来估计F矩阵？
+        if(reject_with_F && only_use_track_sift_for_F)
         {
-            for(auto &it: new_track_FAST)
+            if(pts_for_cal_F.size() > 8)
+                rejectWithFV1(true, pts_for_cal_F);
+            else
+                rejectWithFV1(true);
+        }
+        else
+        {
+            // 删除无有效跟踪的prev_sift点
+            reduce_invalid_fea(true);
+        }
+        
+        if(!track_cnt_sift.empty())
+        {
+            for(auto &n : track_cnt_sift)
+                ++n;
+        }
+        // assert(num_track_sift == ids_sift.size() && "Something wrong with num_track_sift!");
+
+        num_track_sift = cur_sift.size();
+        // cout << "num of tracked sift in cur frame: " << num_track_sift << endl;
+        
+        if(!cur_right_sift.empty()) cur_right_sift.clear();
+        if(!cur_sift_dep.empty()) cur_sift_dep.clear();
+        if(!status_sift.empty()) status_sift.clear();
+
+        if(num_track_sift > 0)
+        {
+            cv::Point2f temp_pt(0.0,0.0);
+            cur_right_sift.resize(num_track_sift,temp_pt);
+            cur_sift_dep.resize(num_track_sift,-1.0);
+
+            // 如果上面删减了失败的prev_sift点，则剩下的点都是有效跟踪点了，因此这里可以把所有点的status赋为0，下面根据立体匹配结果来最后决定是否保留该跟踪点。
+            // 也可以换种思路，不重置，下面根据跟踪点是否有立体匹配来决定是否删除该点
+            status_sift.resize(num_track_sift,0);
+
+            // 使用背景跟踪点中的部分点来估计F矩阵
+            // 如果还需要将sift点与FAST点基于NCC进行排序
+            if(sort_all_sift_FAST)
             {
-                if(num_new_track > 0 && num_FAST < 12)
+                int num_track_static = temp_NCC_id_pt.size();
+                int id_row, id_col, id_big_bloc, half_H = 3*60, half_W = 200*3;
+
+                for(int k = 0; k < 4; ++k)
                 {
-                    // 表示该点已处理
-                    it = -1;
-                    --num_new_track;
-                    ++num_FAST;
-                    int g_id = ids_FAST[it];
-                    if(prevRightFeaMap.find(g_id) != prevRightFeaMap.end())
+                    num_sta_obj_track_per_bloc[k] = 0;
+                }
+
+                // 根据保存的sift点的gl_id来查找背景跟踪点的局部id，并放入NCC_matching_all中
+                for(int k = 0; k < num_track_static; ++k)
+                {
+                    int gl_id = temp_NCC_id_pt[k].second;
+                    auto it_index = find(ids_sift.begin(),ids_sift.end(),gl_id);
+                    if(it_index == ids_sift.end()) continue;
+                    int dist = std::distance(ids_sift.begin(),it_index);
+                    
+                    NCC_matching_all.emplace_back(-1*dist, temp_NCC_id_pt[k].first);
+
+                    if(obj_cls_id_sift[dist].first != 0)
                     {
-                        ++num_track_fea_with_dep_prev;
+                        Point2f &pt_p = prev_sift[dist];
+                        id_row = pt_p.y/half_H;
+                        id_col = pt_p.x/half_W;
+                        if(id_row > 1) id_row = 1;
+                        if(id_col > 1) id_col = 1;
+                        id_big_bloc = 2*id_row + id_col;
+                        int num_stat = num_sta_obj_track_per_bloc[id_big_bloc];
+                        id_sta_obj_track_per_bloc[id_big_bloc][num_stat] = (-1*dist);
+                        num_sta_obj_track_per_bloc[id_big_bloc] += 1;
+                    }
+                    else if(!need_cal_FH || small_p)
+                    {
+                        id_bg_track_sift.push_back(dist);
                     }
                 }
-                // else if(num_new_track <= 0)
+                
+            }
+            else
+            {
+                if(reject_with_F && !only_use_track_sift_for_F)
+                {
+                    vector<int> valid_track;
+                    // id_pts_flow_for_F保存的是按照ambi score从小到大排序的有效跟踪点（包含纯背景点，和近处的静态物体点）的sift match的index
+                    // 为每个bloc选取最大固定数量的最佳跟踪点来估计F矩阵
+                    for(int k = 0; k < id_pts_flow_for_F.size(); ++k)
+                    {
+                        int index_in_flow_match = id_pts_flow_for_F[k];
+                        auto it_index = find(cur_sift_index.begin(),cur_sift_index.end(),index_in_flow_match);
+
+                        // 有些跟踪点在寻找上一帧立体匹配时可能被删除了
+                        // assert(it_index != cur_sift_index.end());
+                        if(it_index == cur_sift_index.end()) continue;
+
+                        int l_index = std::distance(cur_sift_index.begin(),it_index);
+                        
+                        valid_track.push_back(l_index);
+
+                        // id_bg_track_sift中只添加纯背景跟踪点，而不添加静态物体跟踪点（它们只用来估计F或H矩阵），因为即使物体点是F或H估计的外点，也不删除该物体跟踪点（因为该物体可能变为动态的
+                        if(obj_cls_id_sift[k].first == 0)
+                        {
+                            id_bg_track_sift.push_back(k);
+                            ++num_sift_bg_cur;
+                        }
+                    }
+
+                    // 优先取前 n% 的点参与F或H矩阵的估计
+                    int num_valid = valid_track.size();
+                    int num_ada = num_valid * 1/2.0;
+                    // todo:是否要专门添加上半图像中的点？不需要，如果近点实在不足，自然会添加远点
+                    bool add_up_half_img_fea = false;
+                    num_up_half = 0;
+                    int total_add = 0;
+                    for(int i = 0; i < num_valid; ++i)
+                    {
+                        int id = valid_track[i];
+                        float y = cur_sift[id].y;
+                        // 如果前n%已经遍历过，但此时添加的sift点数仍较少，则将剩下的也添加直到满足最少数
+                        // 如果数量和比例均已经满足，则是否需要再添加一定数量的远点
+                        if(i > num_ada && total_add >= 15)
+                        {
+                            // 选取一定的远点用以估计R
+                            if(add_up_half_img_fea && num_up_half < 5)
+                            {
+                                if(y >= 3)
+                                    continue;
+                            }
+                            else
+                            {
+                                break;
+                            }
+                        }
+
+                        pts_for_cal_F.insert(-id);
+                        ++total_add;
+
+                        if(y/60 < 3) ++num_up_half;
+                    }
+                }
+            }
+        }
+
+        if(add_new_fea_in_next_frame)
+            done_select_sift_bg = true;
+    }
+    
+    // 当前帧跟踪到的点中的最大全局id。其中有些跟踪点是无效的（已经被确认无效，或者之后setMask时会跟FAST过近而无效），但因为每个点的id都是独一无二的，因此后面的新点的id肯定不会比这里的跟踪点大
+    if(!ids_sift.empty())
+        last_id_track_fea_cur = *(std::max_element(ids_sift.begin(),ids_sift.end()));
+    
+    // 记录各个检测物体上的特征点的平均深度和点数，当没有使用depth_map时可以提供各个物体上的点的近似深度值预测
+    if(use_motion_to_pred_fea_dep)
+    {
+        if(!obj_fea_disp_num.empty()) 
+            obj_fea_disp_num.clear();
+    }
+
+    num_bg_sift_with_dep = 0;
+
+    // 寻找跟踪sift点在当前帧的右图像匹配点。并添加新的sift点（有立体匹配或者深度值的物体点）
+    if(STEREO && has_r_img)
+    {
+        int* valid_match_stereo = Sift_->img2.h_matching_pts_stereo;
+        SiftData* sift_data = &(Sift_->siftData2);
+        
+        SiftPoint *h2_siftpts = Sift_->siftData2.h_data;
+        int init_track = 0, num_track = num_track_sift;
+        int num_sift_bg_cur_ = num_sift_bg_cur;
+        
+        num_new_sift_bg = 0;
+        int num_new_sift = 0;   
+
+        int num_match_stereo = valid_match_stereo[0];
+        // todo： 暂不添加当前帧中有立体匹配的背景sift新点，改为下一帧根据flow匹配结果添加
+        // add_new_fea_in_next_frame = true;
+
+        if(num_match_stereo > 0)
+        {
+            vector<uchar> status_sift_stereo_flow(num_match_stereo, 0);
+            Vec2b info_pt;
+
+            bool use_LK_for_stereo_match = false;
+            if(num_track > 0)
+            {
+                // 也可以像上面一样使用reserve和assign函数来转化为vector，只是下面这种方式更简洁
+                // 同样的，vetcor vec(ptr_begin, ptr_end)，其中ptr_end位置处的元素是不算的
+                vector<int> match_stereo(valid_match_stereo + 1, valid_match_stereo + 1 + num_match_stereo);
+
+                assert(match_stereo.size() == num_match_stereo && "Something wrong with stereo-matching number!");
+
+                uchar obj_cls;
+                int obj_id;
+                
+                //printf("stereo image; track feature on right image\n");
+                // cur left ---- cur right
+                for(int i = init_track; i < num_track; ++i)
+                {
+                    // 这里是否要滤除，取决于上面是否将status_sift所有值进行重置
+                    // if(status_sift[i] == 0) continue;
+
+                    // 使用跟踪点的cls而不是obj_id来判断,是因为当前帧有些背景点可能关联的是上一帧的物体(当前帧漏检)，这样可以表示该跟踪点是否为纯背景跟踪点
+                    uchar obj_cls = obj_cls_id_sift[i].first;
+
+                    // todo:是否要在当前帧就为其寻找立体匹配，这样该点参与LBA时可以提供更多约束（关于当前帧的位姿）？
+                    if(!add_stereo_for_bg_fea_cur_frame && obj_cls == 0) 
+                    {
+                        // 当前帧没有深度值的bg跟踪点的状态记为2
+                        status_sift[i] = 2;
+                        sift_no_stereo_bg.push_back(i);
+                        continue;
+                    }
+                    
+                    int id_pt = cur_sift_index[i];
+                    vector<int>::iterator iter = std::find(match_stereo.begin(),match_stereo.end(),id_pt);
+
+                    // 该点在当前帧没有立体匹配
+                    if(iter == match_stereo.end()) 
+                    {
+                        // 对于当前帧没有在右图像找到匹配的sift跟踪点，后续是否要尝试用depth_map来获取其深度估计？
+                        // 对于物体点可以，但对于背景点则没必要，精度没法保证
+                        if (obj_cls > 0)
+                        {
+                            // 后续还要使用LK来为这些sift点在当前帧寻找立体匹配
+                            // if(!add_new_fea_in_next_frame) id_sift_no_depth.push_back(i);
+                            status_sift[i] = 2;
+                            continue;
+                        }
+                        else
+                        {
+                            // 是否保留该跟踪点是在上面已经决定了，这里无需再判断。这里只记录该跟踪点在当前帧是否有立体匹配
+
+                            // 此处不能只用prev_sift_dep或use_tria_stereo判断该点在上一帧是否有立体匹配（因为有些点跟踪点是当前帧才临时添加的，还没通过左右2帧的三角化得到深度值），应该查看该点是否在Map_prev_r中
+                            // int obj_id = ids_sift[i];
+                            // bool has_stereo_prev = (prevRightFeaMap.find(obj_id) != prevRightFeaMap.end());
+                            // if(USE_TRIANGULATE_TWO_FRAME || has_stereo_prev)
+                            {
+                                // 当前帧没有深度值的bg跟踪点的状态记为2
+                                status_sift[i] = 2;
+                                // 如果之后不再通过别的方式寻找背景点在当前帧的立体匹配，则记录没有右匹配的背景跟踪点在cur_sift中的序号 
+                                if(!sort_all_sift_FAST)
+                                    sift_no_stereo_bg.push_back(i);
+                            }
+                            continue;
+                        }
+                    }
+
+                    int index_valid_match = std::distance(match_stereo.begin(), iter);
+                    status_sift_stereo_flow[index_valid_match] = 1;
+                    int id_siftdata = match_stereo[index_valid_match];
+                    float cord_x = h2_siftpts[id_siftdata].xpos;
+                    float cord_y = h2_siftpts[id_siftdata].ypos;
+                    float match_x = h2_siftpts[id_siftdata].match_xpos;
+                    float match_y = h2_siftpts[id_siftdata].match_ypos;
+
+                    Point2f r_pt(match_x, match_y);
+                    // 对于n_img == 1,已经在cudaSift中完成了此项过滤
+                    // 右匹配点超过了规定的图像边界，那么是否应该保存其中的左图像的bg跟踪点？在右图像中快超出图像，意味着该点下一帧很可能离开相机视野？sift跟踪点的作用不是用于长跟踪，而是为当前帧跟踪提供3D-2D的PnP
+                    if (!(inBorder(r_pt))) 
+                    {
+                        // int gl_id = ids_sift[i];
+                        
+                        // if(obj_cls == 0 && prev_sift_dep[i] > 0)
+                        if(obj_cls == 0)
+                        {
+                            status_sift[i] = 0;
+
+                            // status_sift[i] = 2;
+                            // if(!sort_all_sift_FAST)
+                            //     sift_no_stereo_bg.push_back(i);
+                        }
+                        else
+                            status_sift[i] = 0;
+                        
+                        continue;
+                    }
+                    
+                    // 在左图像的左侧的一些区域内的点要么不可能在右图像中有观测，要么其深度超过了相应的阈值;同时右图像的右侧区域也不可能在左侧有观测点
+                    if (obj_cls == 0) 
+                    {
+                        if(cord_x <= bg_left_border_left_img || match_x >= bg_right_border_right_img)
+                        {
+                            status_sift[i] = 2;
+                            // if(!sort_all_sift_FAST)
+                                sift_no_stereo_bg.push_back(i);
+                            
+                            continue;
+                        }
+                    }
+                    else if(cord_x <= obj_left_border_left_img || match_x >= obj_right_border_right_img)
+                    {
+                        // 物体点如果当前帧没有深度值，则放弃该点
+                        // 被放弃的该跟踪点可能是静态物体点，但是它仍然可以参与F矩阵的估计。只不过后续它不会被加入地图，也就无法参与优化t的尺度
+                        status_sift[i] = 0;
+                        continue;
+                    }
+
+                    // 左右图像的立体视差为 左图像点 - 右图像点
+                    float disp_x = Sift_->siftData2.valid_disp_x[index_valid_match];
+                    float disp_y = Sift_->siftData2.valid_disp_y[index_valid_match];
+                    
+                    if (disp_x <= 0) 
+                    {
+                        cout << "Weired! Got a disp_x < 0 for sift!" << endl;
+                        if (obj_cls == 0)
+                        {
+                            status_sift[i] = 2;
+                            if(!sort_all_sift_FAST)
+                                sift_no_stereo_bg.push_back(i);
+                        }
+                        else
+                        {
+                            // 物体点跟踪点没有立体匹配，但是一定要有深度值
+                            status_sift[i] = 2;
+                            // if(!add_new_fea_in_next_frame) id_sift_no_depth.push_back(i);
+                        }
+                        continue;
+                    }
+                    
+                    float depth = mbf/disp_x;
+
+                    if (obj_cls == 0)
+                    {
+                        // 太远的点认为立体匹配不够准确，后续该点的深度依赖于2帧三角化和运动变换更新
+                        // if (depth >= mThDepthBg || depth < 1.5) 
+                        if (depth > 21.0 || depth < 1.5) 
+                        {
+                            status_sift[i] = 2;
+                            // 这种情况下即使后续可以有别的方式寻找立体匹配，则不再进行
+                            // if(!sort_all_sift_FAST)
+                                sift_no_stereo_bg.push_back(i);
+                            continue;
+                        }
+                        // 左相机坐标系中按照估计深度得到的3D点是否在右相机的视锥体内部。如果不在，则此立体匹配是错误的
+                        // float err = (r_cam_3D_plane[0]*cur_un_sift[i].x+r_cam_3D_plane[1]*cur_un_sift[i].y+r_cam_3D_plane[2])*depth+r_cam_3D_plane[3];
+                        // if (err <= 0) continue;
+                    }
+                    // 当前帧的物体无论是否运动，都只取25m内的物体
+                    else 
+                    {
+                        // if (depth >= mThDepthObj || depth < mMinDepthPt) continue;
+                        // 对于特征点匹配，可以适当减小深度值
+                        if (depth >= mThDepthObj || depth < 1.5) 
+                        {
+                            status_sift[i] = 0;
+                            continue;
+                        }
+                        // float err = (r_cam_3D_plane[0]*cur_un_sift[i].x+r_cam_3D_plane[1]*cur_un_sift[i].y+r_cam_3D_plane[2])*depth+r_cam_3D_plane[3];
+                        // if (err <= 0) continue;
+                    }
+
+                    float y_shift = Y_shift_right_image/depth;
+
+                    // 右匹配点的v坐标超出图像下边界,则直接放弃该跟踪点
+                    if ((cord_y+y_shift) > row - 5) 
+                    {
+                        status_sift[i] = 0;
+                        continue;
+                    }
+
+                    // 从相机2和相机3的校正矩阵P_rect_xx来看,右相机的点的v坐标应该始终比左相机的对象点的v坐标要大,因此disp应该是小于0的!
+                    // if(abs(disp_y + y_shift) > 1.0)
+                    if(abs(disp_y) >= 3.0)
+                    {
+                        if (obj_cls == 0)
+                        {
+                            status_sift[i] = 2;
+                            if(!sort_all_sift_FAST)
+                                sift_no_stereo_bg.push_back(i);
+                            
+                            continue;
+                        }
+                        else
+                        {
+                            status_sift[i] = 2;
+                            // if(!add_new_fea_in_next_frame) id_sift_no_depth.push_back(i);
+                            continue;
+                        }
+                    }
+                    
+                    // 寻找局部最佳的立体匹配
+                    float shift_x, shift_y;
+
+                    float value_NCC_stereo;
+                    if(!use_LK_for_stereo_match && refine_matching_stereo)
+                    {
+                        value_NCC_stereo = cal_best_NCC(cur_img, cur_img_r, cur_sift[i], r_pt, Len_edge_win, shift_x, shift_y);
+                        // value_NCC_stereo = cal_best_NCC(cur_img, cur_img_r, cur_sift[i], r_pt, Len_edge_win, shift_x, shift_y, check_match_by_ambi_NCC);
+
+                        // int row_fea = cur_sift[i].y/60;
+                        // if(row_fea == 6) row_fea = 5;
+                        // cout << "NCC of sift stereo matching in cur img: " << value_NCC_stereo << ", row of fea: " << row_fea << endl;
+                    }
+                    else
+                    {
+                        // if(check_match_by_ambi_NCC)
+                        //     value_NCC_stereo = cal_check_by_ambi_NCC(cur_img, cur_img_r, cur_sift[i], r_pt, Len_edge_win);
+                        // else
+                        {
+                            value_NCC_stereo = cal_NCC(cur_img, cur_img_r, cur_sift[i], r_pt, Len_edge_win);
+                        }
+                    }
+                    // cout << "NCC of cur stereo sift matching: " << best_NCC << endl;
+                    
+                    // 之后记得给当前帧那些来自上一帧跟踪但是在当前帧却没有右图像sift的点 寻找立体匹配
+                    if(obj_cls == 0)
+                    {
+                        float Th_ = 0.98;
+                        if(cord_y > 60*4) Th_ = 0.97;
+                        
+                        if(value_NCC_stereo <= Th_)
+                        {
+                            status_sift[i] = 2;
+                            if(!sort_all_sift_FAST)
+                                sift_no_stereo_bg.push_back(i);
+                            continue;
+                        }
+                        else
+                        {
+                            if(!use_LK_for_stereo_match && refine_matching_stereo)
+                            {
+                                if(shift_x != 0 || shift_y != 0)
+                                {
+                                    r_pt.x += shift_x;
+                                    r_pt.y += shift_y;
+
+                                    disp_x -= shift_x;
+                                    disp_y -= shift_y;
+                                    if(disp_x <= 0)
+                                    {
+                                        cout << "Weired! Line 10718";
+                                        exit(-1);
+                                    }
+                        
+                                    depth = mbf/disp_x;
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if(value_NCC_stereo < 0.975)
+                        {
+                            status_sift[i] = 2;
+                            // if(!add_new_fea_in_next_frame) id_sift_no_depth.push_back(i);
+                            continue;
+                        }
+                        else
+                        {
+                            if(!use_LK_for_stereo_match && refine_matching_stereo)
+                            {
+                                if(shift_x != 0 || shift_y != 0)
+                                {
+                                    r_pt.x += shift_x;
+                                    r_pt.y += shift_y;
+
+                                    disp_x -= shift_x;
+                                    disp_y -= shift_y;
+                                    if(disp_x <= 0)
+                                    {
+                                        cout << "Weired! Line 10748";
+                                        exit(-1);
+                                    }
+                                    depth = mbf/disp_x;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // 优化之后要求disp_y不能大于2
+                    if(abs(disp_y) >= 2.0)
+                    {
+                        if (obj_cls == 0)
+                        {
+                            status_sift[i] = 2;
+                            if(!sort_all_sift_FAST)
+                                sift_no_stereo_bg.push_back(i);
+                        }
+                        else
+                        {
+                            status_sift[i] = 2;
+                            // if(!add_new_fea_in_next_frame) id_sift_no_depth.push_back(i);
+                        }
+                        continue;
+                    }
+
+                    if(obj_cls == 0)
+                    {
+                        if(use_tria_stereo)
+                            cur_sift_dep[i] = -1.0;
+                        else
+                            cur_sift_dep[i] = depth;
+                    }
+                    else
+                    {
+                        cur_sift_dep[i] = depth;
+                    }
+
+                    // 是否要直接使用右图像中的匹配点的v坐标?
+                    cur_right_sift[i] = r_pt;
+                    // cur_right_sift[i] = cv::Point2f(match_x, cord_y+y_shift);
+
+                    status_sift[i] = 1;
+
+                    // 记录已有的各个物体（包括背景）的平均特征点深度或视差，为后续的新点提供预测值
+                    if(use_motion_to_pred_fea_dep)
+                    {
+                        obj_id = obj_cls_id_sift[i].second;
+                        if(obj_id > 0)
+                        {
+                            if(obj_fea_disp_num.find(obj_id) == obj_fea_disp_num.end())
+                            {
+                                obj_fea_disp_num[obj_id] = make_pair(disp_x,1);
+                            }
+                            else
+                            {
+                                obj_fea_disp_num[obj_id].first += disp_x;
+                                obj_fea_disp_num[obj_id].second += 1;
+                            }
+                        }
+                        else
+                        {
+                            ave_dep_bg_cur_frame += depth;
+                            ++num_bg_with_dep;
+                            ++num_bg_sift_with_dep;
+                        }
+                    }
+                }
+            }
+            
+            vector<float> &valid_disp_x = sift_data->valid_disp_x;
+            vector<float> &valid_disp_y = sift_data->valid_disp_y;
+            float disp_x, disp_y;
+            float cord_x, cord_y, match_x, match_y;
+            int validpts_id;
+            
+            // cout << "start add new stereo sift!" << endl;
+            // 往当前帧添加新的sift点，需要该点具有有效的右图像匹配点（深度估计）
+            Point2f cur_un_new, cur_un_new_r;
+            int num_sift_add = num_track_sift;
+            for(int i = 0; i < num_match_stereo; ++i)
+            {
+                bool no_stereo = false;
+                bool invalid_depth = false;
+                // 跟踪的点已经算过了
+                if(status_sift_stereo_flow[i] == 1) continue;
+                
+                validpts_id = valid_match_stereo[i+1];
+
+                cord_x = h2_siftpts[validpts_id].xpos;
+                cord_y = h2_siftpts[validpts_id].ypos;
+                match_x = h2_siftpts[validpts_id].match_xpos;
+                match_y = h2_siftpts[validpts_id].match_ypos;
+
+                info_pt = seg_map_cur.at<Vec2b>(cord_y,cord_x);
+                uchar cls_label = info_pt[0];
+                
+                // 如果sift背景点新点要到下一帧再决定，则这里跳过
+                if((add_new_fea_in_next_frame || !add_stereo_for_bg_fea_cur_frame) && cls_label == 0) continue;
+                
+                // do not consider points of person, rider or bicycle or train
+                if(cls_label == 1 || cls_label == 2 || cls_label == 4 || cls_label == 7) continue;
+
+                // 太靠近图像顶端的区域，有可能是树木之类的，也可能是建筑，去除这部分区域的点，会损失一部分点，但是可以提高运动估计的精度？
+                // 最好是使用全景分割来得到更广泛的类别区分
+                // 这里最后是只针对物体了
+                // if(cord_y < (1.0/6*row) && (cord_x > 1.0/6*col && cord_x < 5.0/6*col))
                 // {
-                //     it = -1;
-                //     // 如果已经达到最大跟踪点数，则删除剩余的点
-                //     status_FAST[it] = 0;
+                //     continue;
                 // }
-                else
-                {
-                    break;
-                }
-            }
-        }
+                
+                if(cls_label == 0 && (cord_x <= bg_left_border_left_img || match_x >= bg_right_border_right_img)) continue;
+                if(cls_label > 0 && (cord_x <= obj_left_border_left_img || match_x >= obj_right_border_right_img)) continue;
 
-        // 剩下的sift中，在new_track_sift中的点质量更高，优先
-        for(auto &it: new_track_sift)
-        {
-            // 如果此时还未达到最大跟踪点数
-            if(num_new_track > 0)
-            {
-                --num_new_track;
-                int g_id = ids_sift[it];
-                // 上一帧有深度值的新跟踪点
-                if(prevRightFeaMap.find(g_id) != prevRightFeaMap.end())
-                {
-                    ++num_track_fea_with_dep_prev;
-                }
-            }
-            else
-            {
-                int g_id = ids_sift[it];
-                float dep_prev = prev_sift_dep[it];
-                // 上一帧有深度值的新跟踪点
-                if(num_track_fea_with_dep_prev < Min_num_bg_track_with_dep_prev && (dep_prev > 0 || prevRightFeaMap.find(g_id) != prevRightFeaMap.end()))
-                {
-                    ++num_track_fea_with_dep_prev;
-                }
+                Point2f l_p(cord_x, cord_y);
+                Point2f r_p(match_x,match_y);
+
+                if(!inBorder(r_p)) 
+                    continue;
                 else
-                    status_sift[it] = 0;
+                {
+                    disp_x = valid_disp_x[i];
+                    disp_y = valid_disp_y[i];
+                    // 人为sift匹配是较为准确的立体匹配，即y方向上没有视差。disp_x<=0已经在sift后处理阶段筛除过了
+                    // disp_x is the (x_left_img - x_right_img), so disp_x should be > 0
+                    //if (disp_x <= 0) continue;
+                    
+                    if(disp_x <= 0)
+                    {
+                        cout << "Weired! Got disp_x < 0 for a sift! Line 10971" << endl;
+                        continue;
+                    }
+
+                    // float y_shift = Y_shift_right_image/depth;
+                    // if((cord_y+y_shift) > row - 5) continue;
+
+                    float depth;
+                    // 寻找局部最佳的立体匹配
+                    float shift_x, shift_y;
+                    float val_NCC;
+
+                    if(!use_LK_for_stereo_match && refine_matching_stereo)
+                    {
+                        val_NCC = cal_best_NCC(cur_img, cur_img_r, l_p, r_p, Len_edge_win, shift_x, shift_y);
+                        // val_NCC = cal_best_NCC(cur_img, cur_img_r, l_p, r_p, Len_edge_win, shift_x, shift_y, check_match_by_ambi_NCC);
+
+                        // int row_fea = l_p.y/60;
+                        // if(row_fea == 6) row_fea = 5;
+                        // cout << "NCC of sift stereo matching in cur img: " << val_NCC << ", row of fea: " << row_fea << endl;
+                    }
+                    else
+                    {
+                        // if(check_match_by_ambi_NCC)
+                        //     val_NCC = cal_check_by_ambi_NCC(cur_img, cur_img_r, cur_sift[i], r_pt, Len_edge_win);
+                        // else
+                        {
+                            val_NCC = cal_NCC(cur_img, cur_img_r, l_p, r_p, Len_edge_win);
+                        }
+                    }
+
+                    // cout << "NCC of cur new stereo sift matching: " << best_NCC << endl;
+
+                    {
+                        // 当前帧背景点
+                        if(cls_label == 0)
+                        {
+                            float Th = 0.985;
+                            if(cord_y/60 > 4) Th = 0.97;
+                            
+                            if(val_NCC < Th)
+                            {
+                                if(USE_TRIANGULATE_TWO_FRAME)
+                                {
+                                    no_stereo = true;
+                                    if(!sort_all_sift_FAST)
+                                        sift_no_stereo_bg.push_back(num_sift_add);
+                                }
+                                else
+                                    continue;
+                            }
+                            else
+                            {
+                                if(!use_LK_for_stereo_match && refine_matching_stereo)
+                                {
+                                    if(shift_x != 0 || shift_y != 0)
+                                    {
+                                        r_p.x += shift_x;
+                                        r_p.y += shift_y;
+
+                                        disp_x -= shift_x;
+                                        disp_y -= shift_y;
+                                    }
+                                }
+                                
+                                depth = mbf/disp_x;
+                                // 当计算出来的深度太小时，是否可信？sift的立体匹配可信度较高，但是光流匹配就不一定（因为缺少预测值，只能暴力匹配）
+                                // 对于新的背景点，如果深度为1m，则下一帧它很可能就不在相机前方了（相机的频率为100hz，如果按10m/s速度前行，那么两帧之间间隔距离为1m）
+                                // 但是也可能相机处于静止状态，所以这里也可以取1.5m为最小深度
+                                // 太远的点认为立体匹配不够准确，后续该点的深度依赖于被跟踪且2帧三角化
+                                // if(depth >= mThDepthBg || depth < 1.5 || abs(disp_y) > 1.0)
+                                if(depth > 21 || depth < 1.5)
+                                {
+                                    if(USE_TRIANGULATE_TWO_FRAME)
+                                    {
+                                        no_stereo = true;
+                                        // if(!sort_all_sift_FAST)
+                                            sift_no_stereo_bg.push_back(num_sift_add);
+                                    }
+                                    else
+                                        continue;
+                                }
+
+                                // cv::Point2f new_sift(cord_x, cord_y);
+                                // undistortedPts(new_sift, tmp_undist_pt, m_camera[0]);
+                                // float err = (r_cam_3D_plane[0]*tmp_undist_pt.x+r_cam_3D_plane[1]*tmp_undist_pt.y+r_cam_3D_plane[2])*depth+r_cam_3D_plane[3];
+                                // if (err <= 0) continue;
+                                
+                                // ++num_new_sift_bg;
+                            }
+                        }
+                        // 新的sift点中，即使有静态物体，这里也暂时只选择那些在动态物体深度阈值内的静态物体点，这样的深度估计比较精确。
+                        // 事实上用sift是可以得到较小深度的左右匹配，但是这部分点很可能不够多，但是又无法使用像素点的匹配（因为太近的点的depth_map估计结果肯定是不准确的）
+                        // 同时深度太小的点在下一帧不容易被跟踪到（因为靠得近的点光流大）。对于动态物体而言，其可能是朝着远离相机的方向运动（即同向但速度比相机快），那么下一帧它还是可能出现在视野内的
+                        // 可以保留物体上深度值较小的点，但需要当前帧该物体的特征跟踪点数较多（至少8个），否则后续无法进行运动估计
+                        // 另外分割模型不太准确，不在物体上的点应该如何排除？（后续会有深度的外点排除机制）
+                        else
+                        {
+                            // 如果NCC值太小
+                            if(val_NCC < 0.975)
+                            {
+                                // 等待后续对该物体点进行立体匹配
+                                // if(!add_new_fea_in_next_frame) id_sift_no_depth.push_back(i);
+                                invalid_depth = true;
+                            }
+                            else
+                            {
+                                if(!use_LK_for_stereo_match && refine_matching_stereo)
+                                {
+                                    if(shift_x != 0 || shift_y != 0)
+                                    {
+                                        r_p.x += shift_x;
+                                        r_p.y += shift_y;
+
+                                        disp_x -= shift_x;
+                                        disp_y -= shift_y;
+                                        if(disp_x <= 0)
+                                        {
+                                            cout << "Weired! Line 10296";
+                                            exit(-1);
+                                        }
+                                    }
+                                }
+
+                                depth = mbf/disp_x;
+                                // if(depth >= mThDepthObj || depth < mMinDepthPt) continue;
+                                if(depth >= mThDepthObj || depth < 1.5) continue;
+
+                                // cv::Point2f new_sift(cord_x, cord_y);
+                                // undistortedPts(new_sift, tmp_undist_pt, m_camera[0]);
+                                // float err = (r_cam_3D_plane[0]*tmp_undist_pt.x+r_cam_3D_plane[1]*tmp_undist_pt.y+r_cam_3D_plane[2])*depth+r_cam_3D_plane[3];
+                                // if (err <= 0) continue;
+                            }
+                        }
+                    }
+
+                    if(!invalid_depth)
+                    {
+                        if(abs(disp_y) >= 2.0)
+                        {
+                            if(cls_label == 0)
+                            {
+                                if(USE_TRIANGULATE_TWO_FRAME)
+                                {
+                                    no_stereo = true;
+                                    if(!sort_all_sift_FAST)
+                                        sift_no_stereo_bg.push_back(num_sift_add);
+                                }
+                                else
+                                    continue;
+                            }
+                            else
+                            {
+                                // 记录没有右匹配的新sift物体点，后期尝试用depth_map来寻找其深度值
+                                // if(!add_new_fea_in_next_frame) id_sift_no_depth.push_back(i);
+                                invalid_depth = true;
+                                // 在id_sift_no_depth后这里千万不能continue,否则下面就忘记添加这个点的右观测点信息了
+                                // continue
+                            }
+                        }
+                    }
+
+                    int obj_id = (int)info_pt[1];
+                    cur_sift_index.push_back(validpts_id);
+                    ids_sift.push_back(n_id++);
+                    cur_sift.emplace_back(cord_x,cord_y);
+                    track_cnt_sift.push_back(1);
+                    obj_cls_id_sift.emplace_back(cls_label, obj_id);
+                    // 记录当前帧sift点所匹配的上一帧中的sift点的全局obj id，当一个物体在两帧间的特征点匹配数足够多时，可以直接关联此两物体！
+                    // 此处为各个物体的新sift点，在进行物体关联之后，要来修改当前帧各个特征点所属物体的全局id，尤其是当前帧新添加的点！！
+                    prev_sift_global_obj_id.push_back(obj_id);
+
+                    if(cls_label == 0)
+                    {
+                        // 没有立体匹配的背景新点
+                        if(no_stereo)
+                        {
+                            cur_right_sift.emplace_back(0, 0);
+                            // cur_right_sift.emplace_back(match_x, cord_y+y_shift);
+                            cur_sift_dep.push_back(-1.0);
+                            // 当前帧没有深度值的bg新点的状态记为3
+                            status_sift.push_back(3);
+                        }
+                        else
+                        {
+                            cur_right_sift.push_back(r_p);
+                            status_sift.push_back(1);
+                            if(use_tria_stereo)
+                                cur_sift_dep.push_back(depth);
+                            else
+                                cur_sift_dep.push_back(-1.0);
+                        }
+                    }
+                    else
+                    {
+                        // cur_right_sift.emplace_back(match_x, cord_y+y_shift);
+                        // 没有立体匹配的物体新点
+                        if(invalid_depth)
+                        {
+                            cur_right_sift.emplace_back(0, 0);
+                            // 使用depth_map为物体点获取深度值，但是不会将该点作为立体匹配，该深度只是为了估计物体的3D运动。
+                            // 没有立体匹配的新物体点与背景点一样，status都标记为3
+                            // status_sift.push_back(0);
+                            status_sift.push_back(3);
+                            cur_sift_dep.push_back(-1.0);
+                        }
+                        else
+                        {
+                            cur_right_sift.push_back(r_p);
+                            status_sift.push_back(1);
+                            // 物体点必须在这里就给出深度值，即认为立体校正足够准确
+                            cur_sift_dep.push_back(depth);
+                        }
+                    }
+                    
+                    ++num_new_sift;
+                    ++num_sift_add;
+
+                    if(use_motion_to_pred_fea_dep)
+                    {
+                        // 物体点如果有有效的深度估计,则记录
+                        if(obj_id > 0 && !invalid_depth)
+                        {
+                            if(obj_fea_disp_num.find(obj_id) == obj_fea_disp_num.end())
+                            {
+                                obj_fea_disp_num[obj_id] = make_pair(disp_x,1);
+                            }
+                            else
+                            {
+                                obj_fea_disp_num[obj_id].first += disp_x;
+                                obj_fea_disp_num[obj_id].second += 1;
+                            }
+                        }
+                        else if(obj_id == 0 && !no_stereo)
+                        {
+                            ave_dep_bg_cur_frame += depth;
+                            ++num_bg_with_dep;
+                            ++num_bg_sift_with_dep;
+                        }
+                    }
+                }   
             }
         }
         
-        // 之后的不管是old还是new，按照质量排序先后保留
-        for(auto &it: del_sift)
+        if(!add_new_fea_in_next_frame && !no_add_new_sift)
+            cout << "Num of detected new sift (for bg and objs) in cur frame is: " << num_new_sift << endl;
+        else
+            cout << "Num of detected new sift (only for objs) in cur frame  is: " << num_new_sift << endl;
+    }
+    
+    done_select_sift = true;
+    // 当前帧特征点"关联阶段"的最后一个sift（包含跟踪与新检测的）的全局id。注意，实际上当前帧新sift点的最大全局id不是这里的值，因为后续sift中的跟踪外点还会被转为新点！
+    // last_id_sift_cur = n_id - 1; 
+
+    // 后处理，将当前帧的部分信息保存为prev
+    Sift_->Postprocess();
+    
+    // ------------------------------------------------------------------------
+    printf("Sift select costs: %fms \n", t_o.toc());
+}
+
+// 根据已有的sift（跟踪的）和FAST（跟踪的）形成mask，并在当前左图像中检测新的FAST点。对所有左图像FAST点进行右图像点的跟踪,保存有效的立体跟踪点
+// 后续在当前帧中值检测物体上的新点，背景不检测新点
+void FeatureTracker::det_new_FAST_objs(const int num_solid_obj, const cv::Mat &seg_map, const cv::Mat &cls_map,   
+                                        const cv::Mat &depth_map, const bool &marg_old_prev, bool &stereo_match_done)
+{
+    TicToc t_det_new_and_assign;
+    
+    // 上一帧处理后保留的最后一个点的id，这些点中一部分是长跟踪点（即大于2帧连续观测），部分点是新跟踪点（即上一帧的新点）
+    // 这个上一帧保留点中最大全局id的寻找不能这样进行！！！因为可能上一帧某些跟踪点在最终阶段更换了id，而它们却排在上一帧的新点前面！！！
+    // last_id_track_fea_prev = ids_FAST[(num_old_track_FAST-1)];
+    // if(ids_sift[(num_old_track_sift)] > last_id_track_fea_prev) last_id_track_fea_prev = ids_sift[(num_old_track_sift)];
+    
+    // 记录需要在当前帧寻找立体匹配的点的id，提供其预测值
+    vector<Point2f> cur_left_temp, cur_right_temp;
+    vector<int> lid_cur_FAST_temp;
+    
+    // 在当前帧图像中检测新特征点，这对于初始帧图像也会执行
+    if(1)
+    {
+        // 等待sift点的跟踪和新点采集结束，然后再检测新的FAST点
+        while(!done_select_sift)
         {
-            if(it == -1) continue;
-            if(num_new_track > 0)
-            {
-                int cnt = track_cnt_sift[it];
-                // 如果长跟踪点数已经达到了最大值，则放弃该点
-                if(cnt > 2 && num_old_track <= 0)
-                {
-                    status_sift[it] = 0;
-                    continue;
-                }
-
-                --num_new_track;
-
-                if(cnt > 2) 
-                {
-                    --num_old_track;
-                    ++num_old_track_fea;
-                }
-
-                int g_id = ids_sift[it];
-                // 上一帧有深度值的跟踪点，可能是旧点或新点
-                if(cnt > 2 || prevRightFeaMap.find(g_id) != prevRightFeaMap.end())
-                {
-                    ++num_track_fea_with_dep_prev;
-                }
-            }
-            else
-            {
-                int g_id = ids_sift[it];
-                float dep_prev = prev_sift_dep[it];
-                // 上一帧有深度值的新跟踪点数还没达到最小阈值
-                if(num_track_fea_with_dep_prev < Min_num_bg_track_with_dep_prev && (dep_prev || prevRightFeaMap.find(g_id) != prevRightFeaMap.end()))
-                {
-                    ++num_track_fea_with_dep_prev;
-                }
-                else
-                    status_sift[it] = 0;
-            }
+            usleep(300);
         }
 
-        for(auto &it: new_track_FAST)
-        {
-            if(it == -1) continue;
-            if(num_new_track > 0)
-            {
-                --num_new_track;
-                int g_id = ids_FAST[it];
-                if(prevRightFeaMap.find(g_id) != prevRightFeaMap.end())
-                {
-                    ++num_track_fea_with_dep_prev;
-                }
-            }
-            else
-            {
-                int g_id = ids_FAST[it];
-                float dep_prev = prev_FAST_dep[it];
-                if(num_track_fea_with_dep_prev < Min_num_bg_track_with_dep_prev && (dep_prev > 0 || prevRightFeaMap.find(g_id) != prevRightFeaMap.end()))
-                {
-                    ++num_track_fea_with_dep_prev;
-                }
-                else
-                    status_FAST[it] = 0;
-            }
-        }
+        done_select_sift = false;
 
         // printf("set mask begins \n");
         TicToc t_m;
@@ -5612,29 +12025,24 @@ void FeatureTracker::det_new_FAST_objs(const int &frame_count, const int num_sol
         // 根据cur_sift和cur_FAST来设置黑点区域。去除cur_FAST中的没有完成匹配的点 和 处在cur_sift所造成的黑点区域的匹配点。
         // 另外还可以对cur_FAST中的点根据全局跟踪次数进行排列（用处?不采用)
         // 采用新版的函数
-        setMask(initial_succ, USE_IMU);
+        setMask();
         printf("set mask for new FAST detection costs %fms \n", t_m.toc());
         
-        if (!ids_FAST.empty())
+        if(!ids_FAST.empty())
         {
             last_id_track_FAST_cur = *(std::max_element(ids_FAST.begin(),ids_FAST.end()));
             // 当前帧跟踪点集中的最大点id，注意，sift点id不一定比FAST的小，因为上一帧新的sift点的id不一定比新FAST点的id小！
             last_id_track_fea_cur = std::max(last_id_track_fea_cur,last_id_track_FAST_cur);
-            
-            //printf("track cnt %d\n", num_track_FAST);
-            // cur_FAST中剩下的是跟踪到的点
-            for (auto &n : track_cnt_FAST)
-                ++n;
         }
 
-        // status_FAST.clear();
+        // FAST跟踪点数
         num_track_FAST = cur_FAST.size();
-        // cout << "original num of tracked FAST: " << num_track_FAST << endl;
+        // cout << "num of tracked FAST: " << num_track_FAST << endl;
 
         // start detect new FAST
 
         // 是否要在每一帧完成跟踪后检测和添加新的背景点
-        if(!add_new_sift_in_next_frame)
+        if(!add_new_fea_in_next_frame)
         {
             num_track_fea_static = num_track_FAST_static + num_track_sift_static;
             num_long_track_fea_stat = num_sta_FAST_long_track + num_sta_sift_long_track;
@@ -5650,8 +12058,8 @@ void FeatureTracker::det_new_FAST_objs(const int &frame_count, const int num_sol
             int n_max_cnt_bg = MAX_CNT_PTS_BG - num_track_FAST_bg - num_track_sift_bg - num_new_sift_bg;
 
             // FAST比较容易连续多帧跟踪；而sift采用随机检测和暴力匹配，很难保证相同的点在前后两帧都会出现！
-            // 系统前2帧直接规定背景中的新检测FAST点数最小值
-            if(frame_count < 2) 
+            // 系统前2帧直玥规定背景中的新检测FAST点数最小值
+            if(frame_cnt < 2) 
             {
                 if(num_track_FAST_static < 30)
                     n_max_cnt_bg = std::max(n_max_cnt_bg, 50);
@@ -5660,7 +12068,7 @@ void FeatureTracker::det_new_FAST_objs(const int &frame_count, const int num_sol
             }
             // 从第3帧开始就可以查看长跟踪（至少3帧观测）的静态特征点数
             // 如果滑窗还未满，则不会去除任何一帧的跟踪内点和新特征点
-            else if(frame_count < WINDOW_SIZE)
+            else if(frame_cnt < WINDOW_SIZE)
             {
                 if(num_long_track_fea_stat < 30)
                 {
@@ -5716,7 +12124,7 @@ void FeatureTracker::det_new_FAST_objs(const int &frame_count, const int num_sol
                 // cv::Mat seg_mask(row, col, CV_8UC1);
                 cout << "Start detect new FAST in bg!" << endl;
                 n_max_cnt_bg = 100;
-                // 将当前帧背景的特征点数补充到MAX_CNT_PTS_BG
+                // 岆当前帧背景的特征点数补充到MAX_CNT_PTS_BG
                 // 注意，opencv的此函数检测的其实是Harris或其改进版本Shi-Tomasi角点，其不具备尺度不变性（没有设计多尺度），具有旋转不变性和对光照不敏感（因为采用的是亮度梯度）！
                 // 另外，Shi-Tomasi角点只能提取角点（并且强度较低的角点也不能检测），不能提取边缘或者斑点等特征点！浪费了许多特征点！
                 // https://blog.csdn.net/weixin_34910922/article/details/119045533
@@ -5729,7 +12137,7 @@ void FeatureTracker::det_new_FAST_objs(const int &frame_count, const int num_sol
                 // cv::goodFeaturesToTrack(cur_img, n_FAST_bg, n_max_cnt_bg, 0.02, MIN_DIST_BG*1.0/2, mask_bg);
 
                 // 新FAST点的特征要有足够高的辨识度，且尽可能提高点和点之间的距离，这样才能为下一帧的sift跟踪点保留一些空间
-                cv::goodFeaturesToTrack(cur_img, n_FAST_bg, 1.5*n_max_cnt_bg, 0.04, 25, mask_bg_cur);
+                cv::goodFeaturesToTrack(cur_img, n_FAST_bg, 1.2*n_max_cnt_bg, 0.05, 25, mask_bg_cur);
             }
         }
         
@@ -5737,15 +12145,15 @@ void FeatureTracker::det_new_FAST_objs(const int &frame_count, const int num_sol
         // detect new fea of objs
         if (num_solid_obj > 0)
         {
-            int num_objs_fea_track = (cur_FAST.size() - num_track_FAST_bg) + (cur_sift.size() - num_track_sift_bg - num_new_sift_bg);
-            int n_max_cnt_obj = 0;
+            int num_objs_fea_track = num_track_FAST_obj + num_track_sift_obj;
+            int n_min_cnt_obj = 0;
             if(num_objs_fea_track*1.0/num_solid_obj < 10)
-                // 期望平均每个物体上能保留到MAX_CNT_PTS_OBJ个特征点（后续不够的话可以用像素点匹配来凑？）
-                n_max_cnt_obj = MAX_CNT_PTS_OBJ * num_solid_obj - num_objs_fea_track;
+                // 期望平均每个物体上能保留到MIN_CNT_PTS_OBJ个特征点（包含跟踪点+新点）
+                n_min_cnt_obj = MIN_CNT_PTS_OBJ * num_solid_obj - num_objs_fea_track;
             
-            if (n_max_cnt_obj > 0)
+            if (n_min_cnt_obj > 0)
             {
-                cout << "num of FAST fea need to be detected: " << n_max_cnt_obj << endl;
+                cout << "num of obj FAST fea need to be detected: " << n_min_cnt_obj << endl;
                 
                 if(mask_solid_objs.empty())
                 {
@@ -5782,842 +12190,126 @@ void FeatureTracker::det_new_FAST_objs(const int &frame_count, const int num_sol
 
                 // 物体点不再用检测点的quality进行排序
                 // vector<float> quality;
-                // cv::goodFeaturesToTrack(cur_img, n_FAST_obj, n_max_cnt_obj, 0.02, MIN_DIST_OBJ, mask_solid_objs, quality);
-                cv::goodFeaturesToTrack(cur_img, n_FAST_obj, n_max_cnt_obj, 0.02, MIN_DIST_OBJ, mask_solid_objs);
+                // cv::goodFeaturesToTrack(cur_img, n_FAST_obj, n_min_cnt_obj, 0.02, MIN_DIST_OBJ, mask_solid_objs, quality);
+                cv::goodFeaturesToTrack(cur_img, n_FAST_obj, n_min_cnt_obj, 0.02, MIN_DIST_OBJ, mask_solid_objs);
                 printf("Detect new FAST fea of objs costs: %fms \n", time_for_objs_fea_detect.toc());
             }
         }
-        // printf("detect new FAST feature costs: %f ms \n", t_t.toc());
 
-        // start add right match predict for tracked fea
+        // 当前总的FAST点数（包含跟踪点和新检测的当前帧点）
+        int num_total_FAST = cur_FAST.size();
+        statusLeftRIght.resize(num_total_FAST, 0);
 
-        // cur_right_FAST.clear();
         float pred_u_r, pred_disp, depth, shift_y;
         float l_x, l_y, r_x, r_y;
-        
-        // 记录各个临时物体上的FAST跟踪特征点的视差值之和以及特征点数，以便后续给物体上的新检测点提供视差的参考值
-        // 如果是系统首帧则不会有track特征点，也就不会有各个跟踪点的预测深度
-        // float ave_disp_x_bg = mbf/(3.0/4*mMinDepthPt + 1.0/4*mThDepthBg);
-        // float ave_disp_y_bg = Y_shift_right_image/(3.0/4*mMinDepthPt + 1.0/4*mThDepthBg);
-        // FAST点就选择近一些的点，不然容易选到很远处的树叶
-        float ave_disp_x_bg = mbf/(1.0/2*mMinDepthPt + 1.0/2*10);
-        float ave_disp_y_bg = Y_shift_right_image/(1.0/2*mMinDepthPt + 1.0/2*10);
-
-        float ave_disp_x_objs = mbf/(2.0/3*mMinDepthPt + 1.0/3*mThDepthObj);
-        float ave_disp_y_objs = Y_shift_right_image/(2.0/3*mMinDepthPt + 1.0/3*mThDepthObj);
-
-        num_new_FAST_bg = 0;
         Vec2b pt_info;
         uchar cls_label;
         int obj_id;
 
-        // 跟踪特征点可以使用depth_map或恒速运动模型来设置当前帧的右匹配点预测
-        if(cur_FAST.size() > 0)
+        // start add new FAST
+        
+        if(!n_FAST_obj.empty())
         {
-            // 首帧需要使用depth_map的结果来获取预测值
-            // 之后的帧如果需要，也可以是选择使用depth_map的结果作为深度预测值
-            if(frame_count < 2 || use_motion_to_pred_fea_dep == 0)
+            for(auto &p : n_FAST_obj)
+            {
+                if (!inBorder(p)) continue;
+                l_x = p.x;
+                l_y = p.y;
+                pt_info = seg_map.at<Vec2b>(l_y, l_x);
+                cls_label = pt_info[0];
+
+                // cout << "Class label of obj: " << (int)cls_label << endl;
+
+                if (cls_label == 1 || cls_label == 2 || cls_label == 4 || cls_label == 7 || cls_label == 0) continue;
+                // 不可能在右图像中观测到的特征点。物体点在每一帧都需要有立体匹配，即深度估计
+                if (l_x <= obj_left_border_left_img) continue;
+                
+                // ++num_new_FAST_obj;
+                obj_id = pt_info[1];
+
+                obj_cls_id_FAST.push_back(std::pair<uchar, int>(cls_label, obj_id));
+                prev_FAST_global_obj_id.push_back(obj_id);
+                cur_FAST.push_back(p);
+                ids_FAST.push_back(n_id++);
+                // 新检测的特征地图点，所以跟踪次数设置为1。其实这里的变量应该称为obser_cnt，即该点被观测的帧数，而不是被跟踪的次数（每一个跟踪就需要两帧观测）！
+                track_cnt_FAST.push_back(1);
+                statusLeftRIght.push_back(0);
+                status_FAST.push_back(1);
+                ++num_total_FAST;
+            }
+            
+            // cout << "Num of original detected new FAST of objs: " << num_new_FAST_obj << endl;
+            n_FAST_obj.clear();
+        }
+
+        // start add right match predict for tracked fea and find stereo match
+        
+        // 跟踪特征点可以使用depth_map或恒速运动模型来设置当前帧的右匹配点预测
+        // 只为物体跟踪点在当前帧寻找立体匹配
+        // 先为sift跟踪点在当前帧寻找立体匹配
+        int num_total_sift = cur_sift.size();
+        if(num_total_sift > 0)
+        {
+            if(frame_cnt < 2 || use_motion_to_pred_fea_dep == 0)
             {
                 while(!stereo_match_done)
                 {
                     usleep(300);
                 }
-           
-                int i = 0;
-                float th_x_right_img;
-                for(auto &p: cur_FAST)
-                {
-                    // 上面刚reduceVector，应该是不会出现此情况的
-                    if (!status_FAST[i++]) 
-                    {
-                        assert(status_FAST[i-1]);
-                        continue;
-                    }
-
-                    l_x = p.x;
-                    l_y = p.y;
-                
-                    pred_disp = depth_map.at<float>(l_y,l_x);
-                    if (pred_disp <= 0) 
-                    {
-                        r_x = max(5.0f,l_x-ave_disp_x_bg);
-                        r_y = min(l_y+ave_disp_y_bg, (float)(row-5));
-                        cur_right_FAST.emplace_back(r_x,r_y);
-
-                        continue;
-                    }
-                    depth = mbf/pred_disp;
-                    shift_y = Y_shift_right_image/depth;
-                    r_x = l_x - pred_disp;
-                    
-                    pt_info = seg_map.at<Vec2b>(l_y, l_x);
-                    cls_label = pt_info[0];
-                    
-                    if(cls_label == 0)
-                        th_x_right_img = bg_right_border_right_img;
-                    else
-                        th_x_right_img = obj_right_border_right_img;
-                    
-                    if(r_x >= 5 && r_x <= th_x_right_img)
-                        cur_right_FAST.emplace_back(r_x, l_y+shift_y);
-                    else if (r_x < 5)
-                        cur_right_FAST.emplace_back(5, l_y+shift_y);
-                    else
-                        cur_right_FAST.emplace_back(th_x_right_img, l_y+shift_y);
-                }
             }
             else
             {
-                // 如果系统是使用恒速运动模型为每个点预测了在当前帧的（深度值和）右匹配点
-                // 此时predict_dep_FAST应该不为空
-                assert(!predict_dep_FAST.empty());
-                int obj_id;
-                uchar cls;
-                
-                // 设置当前帧跟踪到的特征点的右图像预测点坐标
-                for(int i = 0; i < cur_FAST.size(); ++i)
-                {
-                    l_x = cur_FAST[i].x;
-                    l_y = cur_FAST[i].y;
-                    // first是与所跟踪的上一帧特征点的全局cls所对齐的（除非上一帧是背景点，而当前帧是物体，则保留为物体cls）。如果是初始帧，则都是当前帧各个点的检测类别
-                    cls = obj_cls_id_FAST[i].first;
-                    obj_id = obj_cls_id_FAST[i].second;
-                    
-                    depth = predict_dep_FAST[i];
-                    bool bad_dep = false;
-                    // 这种情况是上一帧的没有深度值的背景点（可以是上一帧的新背景点，或者不是新背景点，但是之前没有三角化成功）
-                    if(depth <= 0) 
-                    {
-                        if(obj_fea_disp_num.find(obj_id) != obj_fea_disp_num.end())
-                        {
-                            assert(obj_id > 0 && "bg fea should not be in obj_fea_disp_num！");
-                            pred_disp = obj_fea_disp_num[obj_id].first/obj_fea_disp_num[obj_id].second;
-                            depth = mbf/pred_disp;
-                            bad_dep = true;
-                        }
-                        else
-                        {
-                            if(cls == 0)
-                            {
-                                // 最后我们规定FAST的深度必须比较近，最远不超过10m，因为FAST点的检测和匹配精度均比较低
-                                // if(ave_dep_bg_cur_frame != 0 && num_bg_with_dep > 15) 
-                                // {
-                                //     float ave_dep = ave_dep_bg_cur_frame/num_bg_with_dep;
-                                //     float ave_disp_x = mbf/ave_dep;
-                                //     float ave_disp_y = Y_shift_right_image/ave_dep;
-                                //     // 检查超出边界
-                                //     r_x = max(5.0f,l_x-ave_disp_x);
-                                //     r_y = min(l_y+ave_disp_y, (float)(row-5));
-                                //     cur_right_FAST.emplace_back(r_x,r_y);
-                                // }
-                                // else
-                                {
-                                    r_x = max(5.0f,l_x-ave_disp_x_bg);
-                                    r_y = min(l_y+ave_disp_y_bg, (float)(row-5));
-                                    cur_right_FAST.emplace_back(r_x,r_y);
-                                }
-                            }
-                            else
-                            {
-                                r_x = max(5.0f,l_x-ave_disp_x_objs);
-                                r_y = min(l_y+ave_disp_y_objs, (float)(row-5));
-                                cur_right_FAST.emplace_back(r_x,r_y);
-                            }
-                            
-                            continue;
-                        }
-                    }
-                    else
-                        pred_disp = mbf/depth;
-                    
-                    shift_y = Y_shift_right_image/depth;
-                    
-                    // 检验该深度是否合适
-                    r_x = l_x - pred_disp;
-                    r_y = min(l_y+shift_y, (float)(row-5));
-                    if(cls == 0)
-                    {
-                        
-                        if(r_x >= 5 && r_x <= bg_right_border_right_img)
-                            cur_right_FAST.emplace_back(r_x, r_y);
-                        else if(r_x < 5)
-                            cur_right_FAST.emplace_back(5, r_y);
-                        else
-                            cur_right_FAST.emplace_back(bg_right_border_right_img, r_y);
-                    }
-                    else
-                    {   
-                        if(r_x >= 5 && r_x <= obj_right_border_right_img)
-                            cur_right_FAST.emplace_back(r_x, r_y);
-                        else if(r_x < 5)
-                            cur_right_FAST.emplace_back(5, r_y);
-                        else
-                            cur_right_FAST.emplace_back(obj_right_border_right_img, r_y);
-                        
-                        // 只保存检测出来的物体的跟踪特征点的视差值，对于当前帧漏检的物体的跟踪点，只能用预测的深度值或者直接用左图像点坐标 来计算右观测点（否则这里会把背景点也记录进去，而背景点的深度的差异是很大的！）
-                        if(obj_id != 0 && !bad_dep)
-                        {
-                            if(obj_fea_disp_num.find(obj_id) == obj_fea_disp_num.end())
-                            {
-                                obj_fea_disp_num[obj_id] = std::pair<float,int>(pred_disp,1);
-                            }
-                            else
-                            {
-                                // 可以这样做加法并赋值吗？
-                                obj_fea_disp_num[obj_id].first  += pred_disp;
-                                obj_fea_disp_num[obj_id].second += 1;
-                                // obj_fea_disp_num[obj_id].first  = obj_fea_disp_num[obj_id].first + pred_disp;
-                                // obj_fea_disp_num[obj_id].second = obj_fea_disp_num[obj_id].second + 1;
-                            }
-                        }
-                    }
-                }
+                // 对于上一帧的新物体点，直接默认其为静态，即使用相机运动模型来估计该点在当前帧的深度
+                Ptspredict_motion(true, true, true);
             }
+            find_stereo_for_fea_in_cur_frame(true, seg_map, depth_map, (!add_new_fea_in_next_frame));
         }
-
-        // start add new FAST and set their right match predict
-
-        // int tmp_id = n_id + 1000000;
-        // int num_FAST = num_track_FAST;
         
-
-        // while(!stereo_match_done)
-        // {
-        //     usleep(300);
-        // }
-
-        // 添加背景新点。新点在当前帧的右匹配点预测只能通过depth_map获取
-        if(!add_new_sift_in_next_frame)
+        if(num_total_FAST > 0)
         {
-            for(auto &p: n_FAST_bg)
-            {
-                bool has_no_stereo = false;
-                // 位于左图像最左和最右边小部分区域的点暂不考虑
-                if (!inBorder(p)) continue;
-                l_x = p.x;
-                l_y = p.y;
-                // 图像的边界用左右相机重叠视野以及考虑的深度范围来确定。左图像的最左边部分不可能有右图像观测，右图像最右边不可能有左图像观测！
-                pt_info = seg_map.at<Vec2b>(l_y, l_x);
-                cls_label = pt_info[0];
-                // assert(cls_label == 0 && "Why detect a new FAST which belongs to obj!");
-                if (cls_label != 0) continue;
+            cur_FAST_dep.resize(num_total_FAST, -1.0);
+            cur_right_FAST.resize(num_total_FAST, Point2f(0,0));
 
-                // if (l_x <= bg_left_border_left_img) continue;
-                // ++count;
-                // if(l_x <= bg_left_border_left_img) 
-                // {
-                //     // has_no_stereo = true;
-                //    continue
-                // }
-                
-                obj_id = pt_info[1];
-                
-                // 新特征点的cls label为当前帧的检测类别，后续等物体匹配完成后再改为全局cls label
-                obj_cls_id_FAST.push_back(std::pair<uchar, int>(cls_label, obj_id));
-                // 注意，在完成物体关联和确定物体的全局id之后，要对这个量进行修改，保存当前帧每个特征点的所属全局物体的id，用于与下一帧进行物体关联
-                prev_FAST_global_obj_id.push_back(obj_id);
-                cur_FAST.push_back(p);
-                // 该特征地图点的（滑窗内）临时全局id，后续确定这部分新检测的FAST点中哪些需要被添加，再将其id减去100000
-                //ids_FAST.push_back(tmp_id++);
-                ids_FAST.push_back(n_id++);
-                // 新检测的特征地图点，所以跟踪次数设置为1。其实这里的变量应该称为obser_cnt，即该点被观测的帧数，而不是被跟踪的次数（每一个跟踪就需要两帧观测）！
-                track_cnt_FAST.push_back(1);
-                //left_id_of_right_FAST.push_back(num_FAST++);
-                // 背景中其实有可能某些点是属于漏检物体点的，后续发现该漏检物体之后需要修正这个值?
-                ++num_new_FAST_bg;
-                // 给定右匹配点的预测值
-                // 如果是首帧，则使用depth_map；
-                // 对于后续帧，也可以使用depth_map来设置
-                if(frame_count == 0 || !use_motion_to_pred_fea_dep)
+            if(frame_cnt < 2 || use_motion_to_pred_fea_dep == 0)
+            {
+                while(!stereo_match_done)
                 {
-                    pred_disp = depth_map.at<float>(l_y,l_x);
-                    if (pred_disp <= 0) 
-                    {
-                        // if(ave_dep_bg_cur_frame != 0 && num_bg_with_dep > 15) 
-                        // {
-                        //     float ave_dep = ave_dep_bg_cur_frame/num_bg_with_dep;
-                        //     float ave_disp_x = mbf/ave_dep;
-                        //     float ave_disp_y = Y_shift_right_image/ave_dep;
-                        //     // 检查超出边界
-                        //     r_x = max(5.0f,l_x-ave_disp_x);
-                        //     r_y = min(l_y+ave_disp_y, (float)(row-5));
-                        //     cur_right_FAST.emplace_back(r_x,r_y);
-                        // }
-                        // else
-                        {
-                            r_x = max(5.0f,l_x-ave_disp_x_bg);
-                            r_y = min(l_y+ave_disp_y_bg, (float)(row-5));
-                            cur_right_FAST.emplace_back(r_x,r_y);
-                        }
-                        // cur_right_FAST.emplace_back(l_x,l_y);
-                        continue;
-                    }
-                    depth = mbf/pred_disp;
+                    usleep(300);
                 }
-                // 对于非首帧，不等待depth_map的结果，那么背景中的新FAST特征点就没法给定较为精确的视差预测值！
-                else
-                {
-                    // sift背景点的深度不能用来为FAST点提供平均值，我们设定FAST点需要比较近，因为其检测精度很有限
-                    // if(ave_dep_bg_cur_frame != 0 && num_bg_with_dep > 15) 
-                    // {
-                    //     float ave_dep = ave_dep_bg_cur_frame/num_bg_with_dep;
-                    //     float ave_disp_x = mbf/ave_dep;
-                    //     float ave_disp_y = Y_shift_right_image/ave_dep;
-                    //     // 检查超出边界
-                    //     r_x = max(5.0f,l_x-ave_disp_x);
-                    //     r_y = min(l_y+ave_disp_y, (float)(row-5));
-                    //     cur_right_FAST.emplace_back(r_x,r_y);
-                    // }
-                    // else
-                    {
-                        r_x = max(5.0f,l_x-ave_disp_x_bg);
-                        r_y = min(l_y+ave_disp_y_bg, (float)(row-5));
-                        cur_right_FAST.emplace_back(r_x,r_y);
-                    }
-                    continue;
-                }
-                shift_y = Y_shift_right_image/depth;
-                r_x = l_x - pred_disp;
-                
-                if(r_x >= 5 && r_x <= bg_right_border_right_img)
-                    cur_right_FAST.emplace_back(r_x, l_y+shift_y);
-                else if (r_x < 5)
-                    cur_right_FAST.emplace_back(5, l_y+shift_y);
-                else(r_x > bg_right_border_right_img);
-                    cur_right_FAST.emplace_back(bg_right_border_right_img, l_y+shift_y);
             }
-            n_FAST_bg.clear();
-            //printf("feature cnt after add %d\n", (int)ids_FAST.size());
+            find_stereo_for_fea_in_cur_frame(false, seg_map, depth_map, (!add_new_fea_in_next_frame));
         }
-
-        // must add new objs fea with depth in every frame
-
-        // cout << "Num of original detected new FAST of objs: " << n_FAST_obj.size() << endl;
-        // int num_new_FAST_obj = 0;
-        for(auto &p : n_FAST_obj)
-        {
-            if (!inBorder(p)) continue;
-            l_x = p.x;
-            l_y = p.y;
-            pt_info = seg_map.at<Vec2b>(l_y, l_x);
-            cls_label = pt_info[0];
-
-            // cout << "Class label of obj: " << (int)cls_label << endl;
-
-            if (cls_label == 1 || cls_label == 2 || cls_label == 4 || cls_label == 7 || cls_label == 0) continue;
-            // 不可能在右图像中观测到的特征点。物体点在每一帧都需要有立体匹配，即深度估计
-            if (l_x <= obj_left_border_left_img) continue;
-            
-            // ++num_new_FAST_obj;
-
-            obj_id = pt_info[1];
-
-            obj_cls_id_FAST.push_back(std::pair<uchar, int>(cls_label, obj_id));
-            prev_FAST_global_obj_id.push_back(obj_id);
-            cur_FAST.push_back(p);
-            ids_FAST.push_back(n_id++);
-            // 新检测的特征地图点，所以跟踪次数设置为1。其实这里的变量应该称为obser_cnt，即该点被观测的帧数，而不是被跟踪的次数（每一个跟踪就需要两帧观测）！
-            track_cnt_FAST.push_back(1);
-            // left_id_of_right_FAST.push_back(num_FAST++);
-
-            // 设置右图像点的预测
-            if(frame_count == 0 || !use_motion_to_pred_fea_dep)
-            {
-                pred_disp = depth_map.at<float>(l_y,l_x);
-                bool false_disp = false;
-                if (pred_disp <= 0 || pred_disp >= 192) 
-                {
-                    // assert(pred_disp > 0 && "Weired! disp in depth map is <= 0!");
-                    false_disp =true;
-                    // 利用之前已经有有效深度的检测点的视差值
-                    if(obj_fea_disp_num.find(obj_id) != obj_fea_disp_num.end())
-                        pred_disp = obj_fea_disp_num[obj_id].first/obj_fea_disp_num[obj_id].second;
-                    else
-                    {
-                        r_x = max(5.0f,l_x-ave_disp_x_objs);
-                        r_y = min(l_y+ave_disp_y_objs, (float)(row-5));
-                        // 那这些点是否可以等到全部遍历完再查看是否有同一obj id的点的视差值可提供参考？
-                        cur_right_FAST.emplace_back(r_x,r_y);
-                        continue;
-                    }
-                }
-                depth = mbf/pred_disp;
-
-                if(!false_disp)
-                {
-                    // 记录每个检测物体上的新特征点的视差估计，为那些有明显错误视差值的点提供参考值
-                    if(obj_fea_disp_num.find(obj_id) == obj_fea_disp_num.end())
-                    {
-                        obj_fea_disp_num[obj_id] = std::pair<float,int>(pred_disp,1);
-                    }
-                    else
-                    {
-                        // 可以这样做加法并赋值吗？
-                        obj_fea_disp_num[obj_id].first  += pred_disp;
-                        obj_fea_disp_num[obj_id].second += 1;
-                        // obj_fea_disp_num[obj_label].first  = obj_fea_disp_num[obj_label].first + pred_disp;
-                        // obj_fea_disp_num[obj_label].second = obj_fea_disp_num[obj_label].second + 1;
-                    }
-                }
-            }
-            else
-            {
-                if(obj_fea_disp_num.find(obj_id) != obj_fea_disp_num.end())
-                {
-                    pred_disp = obj_fea_disp_num[obj_id].first/obj_fea_disp_num[obj_id].second;
-                    depth = mbf/pred_disp;
-                }
-                // 如果是当前帧出现的新物体，则只能用左图像点当作预测值。或者用平均深度对应的平均视差？
-                else
-                {
-                    r_x = max(5.0f,l_x-ave_disp_x_objs);
-                    r_y = min(l_y+ave_disp_y_objs, (float)(row-5));
-                    // cur_right_FAST.emplace_back(l_x,l_y);
-                    cur_right_FAST.emplace_back(r_x,r_y);
-                    continue;
-                }
-            }
-            
-            shift_y = Y_shift_right_image/depth;
-            r_x = l_x - pred_disp;
-            r_y = min(l_y+shift_y, (float)(row-5));
-            if(r_x >= 5 && r_x <= obj_right_border_right_img)
-                cur_right_FAST.emplace_back(r_x, r_y);
-            else if (r_x < 5)
-                cur_right_FAST.emplace_back(5, r_y);
-            else
-                cur_right_FAST.emplace_back(obj_right_border_right_img, r_y);
-        }
-        // cout << "Num of original detected new FAST of objs: " << num_new_FAST_obj << endl;
-        n_FAST_obj.clear();
-        obj_fea_disp_num.clear();
         
-        printf("num of cur_FAST: %d num of cur_right_FAST: %d\n", cur_FAST.size(), cur_right_FAST.size());
+        if(use_motion_to_pred_fea_dep)
+            obj_fea_disp_num.clear();
+        
+        // printf("num of cur_FAST: %d", num_total_FAST);
     }
-    // cout << "Number of all FAST:" << cur_FAST.size() << endl;
     
-    // cur_un_FAST.clear();
-    // 将点从像素坐标去畸变并提升到归一化平面坐标
-    // undistortedPts(cur_FAST, cur_un_FAST, m_camera[0]);
-
-    // 可以将跟右图像相关的变量在此处用完后及时释放所占据的内存？（调用clear()后再调用Vector的shrink_to_fit()）。当前帧的右图像点的信息到最后还有用！
-
-    // 如果是双目，则还要计算左右图像之间的光流跟踪以获得在右图像中的特征点位置
-    // 上面先确定了当前帧左图像中的特征点，然后再确定右图像能跟踪到左图像中的哪些点（对于其中的新地图点，如果能在右图像中找到匹配，则在后续估计这些点的深度时是使用当前帧左右相机的位姿估计来进行三角化）
-    if(!cur_img_r.empty() && stereo_cam)
+    if(use_motion_to_pred_fea_dep)
     {
-        if(!cur_FAST.empty())
+        // 用于替代INIT_DEPTH来为三角化失败的点赋予深度值
+        // if(num_bg_with_dep > 1) ave_dep_bg_cur_frame = ave_dep_bg_cur_frame/num_bg_with_dep;
+        if(num_bg_with_dep > 5)
         {
-            // 后续对此处还没有深度的点进行补充深度值（如果是背景或静态物体点，则可以用三角化测量的结果；如果是动态物体的点，则只能用dep_map的视差值），然后复制给prev_FAST_dep
-            cur_FAST_dep.resize(cur_FAST.size(), -1.0);
-
-            //printf("stereo image; track feature on right image\n");
-            vector<cv::Point2f> reverseLeftPts;
-            vector<uchar> statusRightLeft;
-            vector<float> err, err_rl;
-            
-            cout << "Start stereo match for FAST in current right image!" << endl;
-            
-            // cur left ---- cur right
-            // 不给出预测的右图像中的匹配点吗？因为不给出预测点位置，所以需要使用3层的图像金字塔来进行光流估计。那为什么不直接使用双目立体匹配的结果作为匹配的初值或者最终值呢？
-            // 其实对于双目立体图像而言，这里使用3层光流应该就足以跟踪了，因为只要点的深度不要太大，它其实很好寻找（就沿着x轴）。另外，这里使用普通的光流跟踪，可以适配非立体校准图像对的情况！
-            // 注意，无论有没有预测值，cur_right_pts和status的长度都与cur_pts的是一样的，status的值会指示cur_right_pts中的对应元素是否为有效的光流估计匹配点
-            // TODO: 右图像中的FAST点不应该跟SIFT的点相重叠，这点后续要如何排除？可以再给定一个在SIFT点周围画黑点区域的右图像的mask，用来查询这里的FAST匹配是否在黑点区域外?T  太麻烦了
-
-            // 如果用cv::OPTFLOW_USE_INITIAL_FLOW指明了cur_right_FAST有初始估计值，则cur_FAST和cur_right_FAST的size需要一致
-            assert(cur_right_FAST.size() == cur_FAST.size());
-            cv::calcOpticalFlowPyrLK(cur_img, cur_img_r, cur_FAST, cur_right_FAST, statusLeftRIght, err, cv::Size(21, 21), 2,
-                                    cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
-            
-            // cv::calcOpticalFlowPyrLK(cur_img, rightImg, cur_FAST, cur_right_FAST, statusLeftRIght, err, cv::Size(21, 21), 3);
-            // reverse check cur right ---- cur left
-            FLOW_BACK = 1;
-            if(FLOW_BACK)
-            {
-                reverseLeftPts = cur_FAST;
-                cv::calcOpticalFlowPyrLK(cur_img_r, cur_img, cur_right_FAST, reverseLeftPts, statusRightLeft, err_rl, cv::Size(21, 21), 1,
-                                        cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
-                // cv::calcOpticalFlowPyrLK(rightImg, cur_img, cur_right_FAST, reverseLeftPts, statusRightLeft, err, cv::Size(21, 21), 3);
-            }
-            
-            float r_x, r_y, disp_x, disp_y, shift_y;
-            
-            bool keep = false;
-            // 如果不使用depth_map作为预测值，则新物体上的FAST点比较不容易寻找右匹配点
-            keep = (frame_count > 0 && use_motion_to_pred_fea_dep);
-            
-            int detected_new_FAST = 0;
-            int num_tracked_bg_FAST_with_dep = 0;
-            uchar cls;
-            for(size_t i = 0; i < statusLeftRIght.size(); ++i)
-            {
-                uchar find_track_l_r = 0;
-
-                if(FLOW_BACK)
-                {
-                    find_track_l_r = statusLeftRIght[i] * statusRightLeft[i];
-                }
-                else
-                {
-                    find_track_l_r = statusLeftRIght[i];
-                }
-                
-                // 采用当前帧的cls来判断是否为物体,因为跟踪点的cls是与上一帧的全局物体的cls对齐的(除非上一帧为背景而当前帧为物体)
-                cls = obj_cls_id_FAST[i].first;
-
-                // 如果是最先的版本，即在每一最新中都检测新的背景和物体点，则在此处排除图像最顶部区域的点
-                if(!add_new_sift_in_next_frame)
-                {
-                    // 室外场景图像的中顶部区域一般是天空或者比较远的建筑，两侧顶部还可能是建筑
-                    // TODO：其实最好的办法还是与激光雷达相结合，把深度明显太远的方向的图像区域全部去除！
-                    // 光靠图像的话只能用全景分割来区别更一般的区域！例如将天空、树木等物体区域去除
-                    // 注意，前面的分数要有一个数是浮点，否则该分数实际结果为0！！！
-                    // if(cls == 0 && (cur_FAST[i].y < 1.0/6*row || (cur_FAST[i].x > 2.0/5*col && cur_FAST[i].x < 3.0/5*col)))
-                    // 路面其实也可以检测特征点，但是很难跟踪，参考SOFT2！！
-                    if(cls == 0 && (cur_FAST[i].y < 1.0/6*row))
-                    {
-                        statusLeftRIght[i] = 0;
-                        continue;
-                    }
-                }
-                
-                // 通过CPU光流找到左右匹配点
-                if(find_track_l_r)
-                {
-                    if (!(inBorder(cur_right_FAST[i])))
-                    {
-                        // 如果是物体点且没有立体匹配（位于图像边缘），则放弃该点
-                        if(cls != 0)
-                            statusLeftRIght[i] = 0;
-                        //invalid_cur_FAST++;
-                        continue;
-                    }
-
-                    if(FLOW_BACK && distance(cur_FAST[i], reverseLeftPts[i]) > 0.6)
-                    {
-                        // 跟踪点如果在当前帧没有立体匹配
-                        if(i < num_track_FAST)
-                        {
-                            // 背景跟踪点是否保留取决于该点上一帧是否有深度值，而不是取决于当前帧是否有立体匹配
-                            if(cls == 0)
-                            {
-                                statusLeftRIght[i] = 2;
-                                FAST_no_stereo_bg.push_back(i);
-                                // invalid_cur_FAST++;
-                            }
-                            else
-                            {
-                                // 如果该物体点的右观测点预测值是通过运动模型来设置的，则可能匹配得不是很准确，后续可以使用depth_map直接获取深度值
-                                if(keep)
-                                {
-                                    id_FAST_no_depth.push_back(i);
-                                    statusLeftRIght[i] = 2;
-                                }
-                                else
-                                    statusLeftRIght[i] = 0;
-                            }
-                        }
-                        else
-                        {
-                            if(cls == 0)
-                            {
-                                // 如果在当前帧检测了新的FAST背景点，是否允许其没有立体匹配取决于是否使用前后2帧的三角测量来恢复深度
-                                if(USE_TRIANGULATE_TWO_FRAME)
-                                {
-                                    statusLeftRIght[i] = 3;
-                                    FAST_no_stereo_bg.push_back(i);
-                                }
-                                else
-                                    statusLeftRIght[i] = 0;
-                            }
-                            else
-                            {
-                                if(keep)
-                                {
-                                    id_FAST_no_depth.push_back(i);
-                                    statusLeftRIght[i] = 3;
-                                }
-                                else
-                                    statusLeftRIght[i] = 0;
-                            }
-                        }
-                        
-                        continue;
-                    }
-                    
-                    r_x = cur_right_FAST[i].x;
-                    r_y = cur_right_FAST[i].y;
-                    // 右图像中的点不能大于指定深度范围内的左右相机重叠视野在右图像中的投影边界
-                    if (cls == 0 && r_x > bg_right_border_right_img)
-                    {
-                        // 跟踪点是否保留取决于该点上一帧是否有深度值，而不是取决于当前帧是否有立体匹配
-                        if(i < num_track_FAST)
-                        {
-                            statusLeftRIght[i] = 2;
-                            FAST_no_stereo_bg.push_back(i);
-                            // invalid_cur_FAST++;
-                        }
-                        else
-                        {
-                            // 匹配的点位于右图像边缘，认为该点下一帧很难被跟踪到了？
-                            // statusLeftRIght[i] = 0;
-
-                            if(USE_TRIANGULATE_TWO_FRAME)
-                            {
-                                statusLeftRIght[i] = 3;
-                                FAST_no_stereo_bg.push_back(i);
-                            }
-                            else
-                                statusLeftRIght[i] = 0;
-                        }
-                        //invalid_cur_FAST++;
-                        continue;
-                    }
-                    else if (cls > 0 &&  r_x > obj_right_border_right_img)
-                    {
-                        statusLeftRIght[i] = 0;
-                        //invalid_cur_FAST++;
-                        continue;
-                    }
-
-                    disp_x = cur_FAST[i].x - r_x;
-                    disp_y = cur_FAST[i].y - r_y;
-                    // 认为FAST匹配是较为准确的立体匹配，即y方向上没有视差
-                    // disp_x is the (x_left_img - x_right_img), so disp_x should be > 0
-                    // 如果左右图像没有严格的立体校正，则y方向上的视差可能不会接近0。
-                    if (disp_x <= 0) 
-                    {
-                        if (cls == 0)
-                        {
-                            // 当前帧没有深度值的FAST跟踪点的状态用2，新FAST点则用3
-                            // 最后还是决定如果当前帧没有深度值，则必须是跟踪点且上一帧有深度值，才能保留该点
-                            if(i < num_track_FAST)
-                            {
-                                statusLeftRIght[i] = 2;
-                                FAST_no_stereo_bg.push_back(i);
-                            }
-                            else 
-                            {
-                                // 要不要保留当前帧背景中没有立体匹配的新sift点
-                                if(USE_TRIANGULATE_TWO_FRAME)
-                                {
-                                    FAST_no_stereo_bg.push_back(i);
-                                    statusLeftRIght[i] = 3;
-                                } 
-                                else
-                                    statusLeftRIght[i] = 0;
-                            }
-                        }
-                        else
-                        {
-                            if (keep) 
-                            {
-                                id_FAST_no_depth.push_back(i);
-                                if(i < num_track_FAST)
-                                    statusLeftRIght[i] = 2;
-                                else
-                                    statusLeftRIght[i] = 3;
-                            }
-                            else
-                                statusLeftRIght[i] = 0;
-                        }
-                        continue;
-                        //invalid_cur_FAST++;
-                    }
-
-                    float depth = mbf/disp_x;
-
-                    // FAST点经常会把很远处的树叶作为特征点，并且深度估计也是错误的。因此限制FAST点的深度值
-                    // 深度值太大时认为立体匹配不够准确，后续采用运动变换来计算深度
-                    // if (cls == 0 && (depth >= mThDepthBg || depth < mMinDepthPt))
-                    if (cls == 0 && (depth > 20 || depth < 1.6)) 
-                    {
-                        if(i < num_track_FAST)
-                        {
-                            statusLeftRIght[i] = 2;
-                            FAST_no_stereo_bg.push_back(i);
-                        }
-                        else
-                            // 深度不合适的新点就不要了，因为下一帧很难跟踪
-                            statusLeftRIght[i] = 0;
-                        
-                        //invalid_cur_FAST++;
-                        continue;
-                    }
-                    else if(cls > 0 && (depth >= mThDepthObj || depth < mMinDepthPt)) 
-                    {
-                        if (keep) 
-                        {
-                            id_FAST_no_depth.push_back(i);
-                            if(i < num_track_FAST)
-                                statusLeftRIght[i] = 2;
-                            else
-                                statusLeftRIght[i] = 3;
-                        }
-                        else
-                            statusLeftRIght[i] = 0;
-                    }
-
-                    shift_y = Y_shift_right_image/depth;
-
-                    //  FAST点的匹配在纵向上不够准确，是否要从depth_map获取该点的深度？不需要了，因为depth_map的结果很难比这里的flow optical要好
-                    // if(abs(disp_y + shift_y) >= 0.5)
-                    // if(0 && abs(disp_y + shift_y) >= 0.5)
-                    // if(abs(disp_y + shift_y) >= 1.0)
-                    
-                    if(abs(disp_y) > 1.1)
-                    {
-                        if (cls == 0)
-                        {
-                            if(i < num_track_FAST)
-                            {
-                                statusLeftRIght[i] = 2;
-                                FAST_no_stereo_bg.push_back(i);
-                            }
-                            else
-                            {
-                                if(USE_TRIANGULATE_TWO_FRAME)
-                                {
-                                    statusLeftRIght[i] = 3;
-                                    FAST_no_stereo_bg.push_back(i);
-                                }
-                                else
-                                    statusLeftRIght[i] = 0;
-                            }
-                            // invalid_cur_FAST++;
-                        }
-                        else
-                        {
-                            if (keep) 
-                            {
-                                id_FAST_no_depth.push_back(i);
-                                if(i < num_track_FAST)
-                                    statusLeftRIght[i] = 2;
-                                else
-                                    statusLeftRIght[i] = 3;
-                            }
-                            else
-                                statusLeftRIght[i] = 0;
-                        }
-
-                        //invalid_cur_FAST++;
-                        continue;    
-                        
-                    }
-
-                    // 会出现这种情况吗？？所估计的深度值使得3D点位于右相机的视锥左侧面之外（更左边）且位于规定深度区域内，则排除，因为该点不可能在右图像观测到
-                    // float err = (r_cam_3D_plane[0]*cur_un_FAST[i].x+r_cam_3D_plane[1]*cur_un_FAST[i].y+r_cam_3D_plane[2])*depth+r_cam_3D_plane[3];
-                    // if (err <= 0) 
-                    // {
-                    //     statusLeftRIght[i] = 0;
-                    //     //invalid_cur_FAST++;
-                    //     continue;
-                    // }
-
-                    // 如果所估计的深度满足要求，则记录
-                    // 是否直接默认为立体校对后的匹配，还是需要使用左右匹配进行三角化（一般还要同时优化左右相机的外参）
-                    if(cls == 0)
-                    {
-                        if(use_tria_stereo)
-                            cur_FAST_dep[i] = -1.0;
-                        else
-                            cur_FAST_dep[i] = depth;
-                    }
-                    else
-                    {
-                        // 能这么做是因为立体校正足够准确
-                        cur_FAST_dep[i] = depth;
-                    }
-                    
-                    if(i >= num_track_FAST)
-                    {
-                        ++detected_new_FAST;
-                    }
-                    
-                    if(cls == 0)
-                    {
-                        if(!use_tria_stereo)
-                        {
-                            ave_dep_bg_cur_frame += depth;
-                            ++num_bg_with_dep;
-                        }
-
-                        if(i < num_track_FAST) ++num_tracked_bg_FAST_with_dep;
-                    }
-                }
-                else
-                {
-                    if(obj_cls_id_FAST[i].first == 0)
-                    {
-                        if(i < num_track_FAST)
-                        {
-                            statusLeftRIght[i] = 2;
-                            FAST_no_stereo_bg.push_back(i);
-                        }
-                        else
-                        {
-                            if(USE_TRIANGULATE_TWO_FRAME)
-                            {
-                                statusLeftRIght[i] = 3;
-                                FAST_no_stereo_bg.push_back(i);
-                            }
-                            else
-                                statusLeftRIght[i] = 0;
-                        }
-                        // invalid_cur_FAST++;
-                    }
-                    else
-                    {
-                        if(keep)
-                        {
-                            id_FAST_no_depth.push_back(i);
-                            if(i < num_track_FAST)
-                                statusLeftRIght[i] = 2;
-                            else
-                                statusLeftRIght[i] = 3;
-                            // ++detected_new_FAST;
-                        }
-                        else
-                            statusLeftRIght[i] = 0;
-                    }
-                }
-            }
-            
-            reverseLeftPts.clear();
-            statusRightLeft.clear();
-
-            if(add_new_sift_in_next_frame)
-                cout << "num of new FAST with stereo match (only for objs) using CPU optical flow in current frame: " << detected_new_FAST << endl;
-            else
-                cout << "num of new FAST with stereo match (for bg and objs) using CPU optical flow in current frame: " << detected_new_FAST << endl;
-            
-            cout << "num of tracked FAST with stereo match in current frame: " << num_tracked_bg_FAST_with_dep << endl;
+            cout << "Num of bg fea with stereo match: " << num_bg_with_dep << endl;
+            cout << "Average dep of bg fea with stereo match: " << (ave_dep_bg_cur_frame/num_bg_with_dep) << endl;
         }
     }
-    
-    // 用于替代INIT_DEPTH来为三角化失败的点赋予深度值
-    // if(num_bg_with_dep > 1) ave_dep_bg_cur_frame = ave_dep_bg_cur_frame/num_bg_with_dep;
-    if(num_bg_with_dep > 5)
-    {
-        cout << "Num of bg fea with stereo match: " << num_bg_with_dep << endl;
-        cout << "Average dep of bg fea with stereo match: " << (ave_dep_bg_cur_frame/num_bg_with_dep) << endl;
-    }
-    
+
     // 标注新检测的背景FAST点，排除掉与已有点重合的新背景sift点！
-    if(!add_new_sift_in_next_frame) set_new_fea_in_mask(initial_succ);
+    if(!add_new_fea_in_next_frame) set_new_fea_in_mask();
 
     printf("new FAST detection and depth eatimation for all FAST fea costs: %fms \n", t_det_new_and_assign.toc());
 }
 
 // 等待GPU立体匹配估计完成之后，使用depth_map补充没有深度估计的FAST特征点。最后将FAST点按照cls分配给当前帧各个临时物体。
-void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &end_flow_post, bool &end_stereo_post, const Mat &_img1, const vector<int> &valid_obj_id, const Mat &obj_id_map, map<int, YoloV8::Box> &bbox_mask)
+void FeatureTracker::assign_fea_objs(const Mat &dep_map, bool &end_flow_post, bool &end_stereo_post, const vector<int> &valid_obj_id, const Mat &obj_id_map, map<int, YoloV8::Box> &bbox_mask)
 {
     TicToc t_o;
 
     cout << "num of detected objs: " << valid_obj_id.size() << endl;
-    // cv::Mat rightImg = _img1;
 
-    // 对于当前帧 物体 的sift跟踪点或新点，如果先前没有得到可靠的左右帧匹配，则在这里使用depth_map来获取深度
     if(!id_sift_no_depth.empty())
     {
         while (!end_stereo_post)
@@ -6627,12 +12319,16 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
 
         float l_x, l_y, r_x, disp, depth, y_shift, err;
         int id_cur_sift;
+        uchar status_pts;
         for(int i = 0; i < id_sift_no_depth.size(); ++i)
         {
             id_cur_sift = id_sift_no_depth[i];
-
+            status_pts = status_sift[id_cur_sift];
             // status可以是2或3，即没有立体匹配的物体跟踪点或新点
-            if(status_sift[id_cur_sift] == 0) continue;
+            if(status_pts == 0) continue;
+
+            // 如果是跟踪点，则其可能不需要设置深度值了(前面设置点的深度预测时就使用了depth_map，因此这里就不再使用了)？
+            if(status_pts == 2 && !use_motion_to_pred_fea_dep) continue;
 
             l_x = cur_sift[id_cur_sift].x;
             l_y = cur_sift[id_cur_sift].y;
@@ -6698,25 +12394,7 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
         }
     }
     
-    // 是否还要对sift跟踪点进行筛选？如果跟踪点与flow_map给出的结果相距太远，则拒绝该点？
-    if(0 && use_motion_to_pred_fea_dep)
-    {
-        while(!end_flow_post)
-        {
-            usleep(400);
-        }
-        // todo
-        for(int i = 0; i < cur_sift.size(); ++i)
-        {
-
-        }
-    }
-
-    // invalid_cur_FAST = 0;
-    // 如果是首帧，则这里不会再进行任何FAST特征点的深度获取。当然，非首帧时这里也可能不需要（前面已经完成所有跟踪点的深度估计）
-    // int invalid_FAST = id_FAST_no_depth.size();
-    // cout << "Original num of FAST without depth from optical flow: " << id_FAST_no_depth.size() << endl;
-    // 对于当前帧“物体”的新FAST点，尝试用depth_map来为其获取立体匹配
+    // 对于当前帧某些FAST物体点，尝试直接用depth_map的值作为立体匹配
     if (!id_FAST_no_depth.empty())
     {
         while (!end_stereo_post)
@@ -6726,11 +12404,19 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
         
         float l_x, l_y, r_x, r_y, disp, depth, y_shift, err;
         int id_cur_FAST;
+        uchar status_pts;
         // 部分物体FAST点如果没法通过FAST光流找到左右匹配，则直接使用立体匹配图! 
         for(int i = 0; i < id_FAST_no_depth.size(); ++i)
         {
             // 视差值为正，即左点-右点
             id_cur_FAST = id_FAST_no_depth[i];
+
+            status_pts = statusLeftRIght[id_cur_FAST];
+            // status可以是2或3，即没有立体匹配的物体跟踪点或新点
+            if(status_pts == 0) continue;
+            // 如果是跟踪点，则其可能不需要设置深度值了(前面设置点的深度预测时就使用了depth_map，因此这里就不再使用了)？？
+            if(status_pts == 2 && !use_motion_to_pred_fea_dep) continue;
+            
             l_x = cur_FAST[id_cur_FAST].x;
             l_y = cur_FAST[id_cur_FAST].y;
 
@@ -6772,7 +12458,6 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
                 continue;
             }
 
-
             // if (cls == 0 && (depth >= mThDepthBg || depth < mMinDepthPt))
             if (cls == 0 && (depth >= mThDepthObj || depth < mMinDepthPt))
             {
@@ -6802,65 +12487,9 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
             cur_FAST_dep[id_cur_FAST] = depth;
             // --invalid_FAST;
         }
-        // // 左图像中的特征点也要进行reduce！因为我们只保留有深度估计的点！
-        // reduceVector(cur_FAST, statusLeftRIght);
-        // reduceVector(ids_FAST, statusLeftRIght);
-        // reduceVector(track_cnt_FAST, statusLeftRIght);
-        // reduceVector(obj_cls_id_FAST, statusLeftRIght);
-        // reduceVector(cur_un_FAST, statusLeftRIght);
-        // // 对于上一帧的FAST点也要进行删减，因此只截取来自跟踪的那部分FAST点的状态
-        // vector<uchar> sub_vector(statusLeftRIght.begin(),statusLeftRIght.begin()+num_track_FAST);
-        // reduceVector(prev_FAST_global_obj_id, sub_vector);
-        // reduceVector(prev_FAST_dep, sub_vector);
-
-        // // 更新当前帧中有效的FAST跟踪点数量
-        // num_track_FAST = prev_FAST_global_obj_id.size();
-        // ids_FAST_right = ids_FAST;
-        
-        // // 这里对于左图像中无法在右图像跟踪到的点，只在右图像中去除无法匹配的点，剩下的跟踪到的点可以在后续BA提供约束；而在左图像不操作，这样这些地图点在当前帧只有在左图像中有观测约束
-        // reduceVector(cur_right_FAST, statusLeftRIght);
     }
     // cout << "Final num of FAST without depth: " << invalid_FAST << endl;
-
-    // 是否再用depth_map筛选FAST和sift新点，对于太远的FAST则抛弃。增加这一步是因为上面CPU光流阶段的立体匹配并不准确，很多十分遥远的树叶或房子的点的深度估计错误，导致其被加入FAST点中！
-    bool check_dep_with_dep_map = false;
-    if(check_dep_with_dep_map)
-    {
-        while (!end_stereo_post)
-        {
-            usleep(300);
-        }
-        float dep_, disp_;
-        for(int i = num_track_FAST; i < cur_FAST.size(); ++i)
-        {
-            if(statusLeftRIght[i] == 0 || statusLeftRIght[i] == 1) continue;
-            disp_ = dep_map.at<float>(cur_FAST[i].y,cur_FAST[i].x);
-            if(disp_ > 0)
-            {
-                dep_ = mbf/disp_;
-                if(dep_ > 15)
-                    statusLeftRIght[i] = 0;
-            }
-        }
-
-        for(int i = num_track_sift; i < cur_sift.size(); ++i)
-        {
-            if(status_sift[i] == 0 || status_sift[i] == 1) continue;
-            disp_ = dep_map.at<float>(cur_sift[i].y,cur_sift[i].x);
-            if(disp_ > 0)
-            {
-                dep_ = mbf/disp_;
-                if(dep_ > mThDepthBg)
-                    status_sift[i] = 0;
-            }
-
-            // if (cur_sift[i].y < 1.0/6*row && cur_sift[i].x > 1.0/3*col && cur_sift[i].x < 2.0/3*col)
-            // {
-            //     status_sift[i] == 0;
-            // }
-        }
-    }
-
+    
     // 删除所有无效的sift跟踪点和新点
     // 但是如果这里删除无效sift点，会导致id_sift_no_depth中的序号无效！！！
     // reduce_invalid_fea(true);
@@ -6895,96 +12524,13 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
     }
 
     // 此时prevLeftPtsMap还没更新，因此其保存的是上一帧左图像最终的特征像素点，用于表示画图表示当前帧左图像中跟踪上一帧的点的光流(用一个小箭头和两个像素位置处的小点表示)
-    if(SHOW_TRACK)
-    {
-        drawTrack(cur_img, _img1, ids_FAST, cur_FAST, cur_right_FAST, prevLeftFeaMap);
-        drawTrack(cur_img, _img1, ids_sift, cur_sift, cur_right_sift, prevLeftFeaMap);
-    }
+    // if(SHOW_TRACK)
+    // {
+    //     drawTrack(cur_img, _img1, ids_FAST, cur_FAST, cur_right_FAST, prevLeftFeaMap);
+    //     drawTrack(cur_img, _img1, ids_sift, cur_sift, cur_right_sift, prevLeftFeaMap);
+    // }
     
     // Mat img_for_debug = prev_color_img_l.clone();
-    
-    show_tracked_fea = false;
-    // draw and show valid tracked fea in prev images!!
-    if(show_tracked_fea && frame_count > 0)
-    {
-        Mat img_for_stereo = prev_color_img_l.clone();
-
-        for(int i = 0; i < prev_sift.size(); ++i)
-        {
-            if(status_sift[i] == 0) continue;
-            // 暂不显示物体/背景点
-            if(obj_cls_id_sift[i].first != 0) continue;
-
-            int gl_id = ids_sift[i];
-            if(find(reserve_bg_track_pt_id.begin(),reserve_bg_track_pt_id.end(),gl_id) != reserve_bg_track_pt_id.end()) continue;
-            Point2f &pt = prev_sift[i];
-            // 实线的圈代表sift。红色的圈代表被跟踪sift点
-            circle(prev_color_img_l, pt, 4, Scalar(0,0,255), 1, 16);
-            Point2f &pt_cur = cur_sift[i];
-            // 蓝色的线
-            line(prev_color_img_l, pt, pt_cur, Scalar(255,0,0), 1, 16);
-
-            if(prevRightFeaMap.find(gl_id) != prevRightFeaMap.end())
-            {
-                // 绿色的圈代表有立体匹配的sift点
-                circle(img_for_stereo, pt, 4, Scalar(0,255,0), 1, 16);
-                Point2f &pt_r = prevRightFeaMap[gl_id];
-                line(img_for_stereo, pt, pt_r, Scalar(255,0,0), 1, 16);
-            }
-        }
-        
-        for(int i = 0; i < prev_FAST.size(); ++i)
-        {
-            if(statusLeftRIght[i] == 0) continue;
-            // 暂不显示物体点
-            if(obj_cls_id_FAST[i].first != 0) continue;
-
-            int gl_id = ids_FAST[i];
-            if(find(reserve_bg_track_pt_id.begin(),reserve_bg_track_pt_id.end(),gl_id) != reserve_bg_track_pt_id.end()) continue;
-            Point2f &pt = prev_FAST[i];
-            // 虚线的圈代表FAST.
-            circle(prev_color_img_l, pt, 4, Scalar(255,0,255), 1, 8);
-            Point2f &pt_cur = cur_FAST[i];
-            // 线还是保持实线.FAST的线用绿色的
-            line(prev_color_img_l, pt, pt_cur, Scalar(0,0,255), 1, 16);
-            
-            if(prevRightFeaMap.find(gl_id) != prevRightFeaMap.end())
-            {
-                circle(img_for_stereo, pt, 4, Scalar(255,255,0), 1, 8);
-                Point2f &pt_r = prevRightFeaMap[gl_id];
-                line(img_for_stereo, pt, pt_r, Scalar(0,0,255), 1, 16);
-            }
-        }
-
-        // while(true)
-        // {
-        //     cv::imshow("mask of obj in cur frame", prev_mask_solid_objs);
-        //     // 一直等待用户按下ESC键（ASCI码为27）
-        //     if(waitKey(0) == 27)
-        //     {
-        //         break;
-        //     }
-        // }
-        
-        while(true)
-        {
-            cv::imshow("final all tracked fea in prev left image", prev_color_img_l);
-            // 一直等待用户按下ESC键（ASCI码为27）
-            if(waitKey(0) == 27)
-            {
-                break;
-            }
-        }
-        
-        while(true)
-        {
-            cv::imshow("final tracked fea with stereo match in prev left image", img_for_stereo);
-            if(waitKey(0) == 27)
-            {
-                break;
-            }
-        }
-    }
     
     // ————————————————————————————ₔ—————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
     // 根据当前帧局部obj_id分配sift点
@@ -6992,10 +12538,16 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
     int num_sift_track = 0;
     int num_sift_new = 0;
     vector<pair<int,Vector8d>> test_vec;
-    cout << "Start assign sift to local objs!" << endl;
-    bool weired = false;
+    // cout << "Start assign sift to local objs!" << endl;
+
     uchar cls_;
     int l_id;
+    int cnt_track;
+    num_3D_2D_bg_track = 0;
+    num_track_sift_bg = 0;
+    num_new_sift_bg = 0;
+    num_old_track_fea = 0;
+    
     for (int i = 0; i < cur_sift.size(); ++i)
     {
         // 跟踪sift点和新sift点中的无效点
@@ -7010,22 +12562,45 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
 
         cls_ = obj_cls_id_sift[i].first;
         l_id = obj_cls_id_sift[i].second;
+        cnt_track = track_cnt_sift[i];
+
+        if(i < num_track_sift && cls_ == 0)
+        {
+            if(prevRightFeaMap.find(feature_id) != prevRightFeaMap.end())
+                ++num_3D_2D_bg_track;
+            
+            if(frame_cnt > 1)
+                if(fea_with_more_frames_in_map.find(feature_id) != fea_with_more_frames_in_map.end()) 
+                    ++num_old_track_fea;
+        }
 
         // 当前帧下背景新sift点暂时不放入NewObjFeaFrame中,因为后面无需用到
         if(status_sift[i] == 1)
         {
             if(i < num_track_sift)
+            {
                 ++num_sift_track;
+                if(cls_ == 0)
+                {
+                    num_track_sift_bg += 1;
+                    // 纯背景的跟踪点是否有必要加入TrackObjFeaFrame中？它们似乎在物体关联阶段没有实质性作用?
+                    // continue;
+                }
+            }
             else
             {
                 ++num_sift_new;
                 if(cls_ == 0)
+                {
+                    ++num_new_sift_bg;
                     continue;
+                }
             }
         }
         else
         {
-            // 背景或物体点中根据depth_map直接获取深度值,但是没有右观测，因此在这里暂时不修改此变量,等到用三角测量恢复点的深度值之后,再修改该值!
+            // 背景或物体点的跟踪点中根据在没有立体匹配（可以有从depth_map直接获取的近似深度值,但是不作为右观测）
+            // 后续可以用运动估计值来计算准确的深度值
             if(status_sift[i] == 2)
             {
                 // 没有立体匹配的背景或物体的跟踪点的status为2
@@ -7034,8 +12609,11 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
 
                 // 如果纯背景跟踪点在当前帧没有立体匹配，则不将其加入到TrackObjFeaFrame中，因为它在objs-matching中没有用处
                 if(cls_ == 0)
+                {
+                    num_track_sift_bg += 1;
                     continue;
-            } 
+                }
+            }
 
             if(status_sift[i] == 3) 
             {
@@ -7044,9 +12622,11 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
                 // 背景或物体的没有立体匹配的新点的status都是3
                 // 其中的背景新点无需加入NewObjFeaFrame中，因为后面无需用到
                 if(cls_ == 0)
+                {
+                    ++num_new_sift_bg;
                     continue;
+                }
             }
-            //status_sift[i] = 1;
         }
 
         // 该物体当前的临时id
@@ -7067,7 +12647,7 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
         {
             // 这里可以利用右匹配点的z来保存左图像点的上一帧匹配点的深度值！
             // 该点在上一帧不一定有有效的深度值，后续使用时需要判断其是否大于0
-            xyz_uv_velocity_statu_r << cur_un_right_sift[i].x, cur_un_right_sift[i].y, 1.0, cur_right_sift[i].x, cur_right_sift[i].y, right_sift_velocity[i].x, right_sift_velocity[i].y, prev_obj_id;
+            xyz_uv_velocity_statu_r << cur_un_right_sift[i].x, cur_un_right_sift[i].y, -1.0, cur_right_sift[i].x, cur_right_sift[i].y, right_sift_velocity[i].x, right_sift_velocity[i].y, prev_obj_id;
         }
         
         // 记录当前帧局部物体所包含的特征点的id
@@ -7094,9 +12674,13 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
                 else
                 {
                     // 只有纯背景的跟踪点才可能在上一帧中没有有效深度值
-                    assert(cls_ == 0);
+                    if(cls_ != 0)
+                    {
+                        cout << "Weired! Line 12081" << endl;
+                        exit(-1);
+                    }
                 }
-
+                
                 test_vec.emplace_back(1, xyz_uv_velocity_statu_r);
             }
             
@@ -7115,7 +12699,6 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
             }
 
             // 记录各个物体的sift点中分别来自于track和new detected的个数
-            // num_obj_sift[obj_id].first = num_obj_sift[obj_id].first + 1;
             if(num_obj_sift.find(obj_id) == num_obj_sift.end())
                 num_obj_sift.insert(make_pair(obj_id,std::pair<int,int>(1,0)));
             else
@@ -7165,16 +12748,17 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
     
     // ---------------------------------------------------------------------------------------------------
     // 根据当前帧局部obj_id分配FAST点
-    cout << "Start assign FAST to local objs!" << endl;
+    // cout << "Start assign FAST to local objs!" << endl;
     int valid_FAST = 0;
     int num_FAST_track = 0;
     int num_FAST_new = 0;
+    num_track_FAST_bg = 0; 
+    num_new_FAST_bg = 0;
+    
     for (size_t i = 0; i < ids_FAST.size(); ++i)
     {
         if (statusLeftRIght[i] == 0) continue;
-
         ++valid_FAST;
-
         bool has_stereo = true;
         int feature_id = ids_FAST[i];
         // 为了与sift的第一个元素(index都为0)区分开来，这里对所有FAST点的index都+1
@@ -7182,17 +12766,39 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
 
         cls_ = obj_cls_id_FAST[i].first;
         l_id = obj_cls_id_FAST[i].second;
+        cnt_track = track_cnt_FAST[i];
+
+        if(i < num_track_FAST && cls_ == 0)
+        {
+            if(prevRightFeaMap.find(feature_id) != prevRightFeaMap.end())
+                ++num_3D_2D_bg_track;
+            
+            if(frame_cnt > 1)
+                if(fea_with_more_frames_in_map.find(feature_id) != fea_with_more_frames_in_map.end()) 
+                    ++num_old_track_fea;
+        }
 
         // 当前帧下背景新FAST点暂时不放入NewObjFeaFrame中,因为后面无需用到
         if(statusLeftRIght[i] == 1)
         {
             if(i < num_track_FAST)
+            {
                 ++num_FAST_track;
+                if(cls_ == 0)
+                {
+                    ++num_track_FAST_bg;
+                    // 纯背景的跟踪点是否有必要加入TrackObjFeaFrame中？即使其在当前帧有立体匹配，但它们似乎在物体关联阶段没有实质性作用?
+                    // continue;
+                }
+            }
             else
             {
                 ++num_FAST_new;
                 if(cls_ == 0)
+                {
+                    ++num_new_FAST_bg;
                     continue;
+                }
             }
         }
         else 
@@ -7205,7 +12811,10 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
                 
                 // 如果纯背景跟踪点在当前帧没有立体匹配，则不将其加入到TrackObjFeaFrame中，因为它在objs-matching中没有用处
                 if(cls_ == 0)
+                {
+                    ++num_track_FAST_bg;
                     continue;
+                }
             }
 
             // 没有立体匹配的背景或物体新点
@@ -7216,8 +12825,11 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
 
                 // 背景的新点不用加入NewObjFeaFrame
                 if(cls_ == 0)
+                {
+                    ++num_new_FAST_bg;
                     continue;
-            }  
+                }
+            }
         }
         
         double x, y ,z;
@@ -7252,7 +12864,7 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
         //xyz_uv_velocity_statu_r << cur_un_right_FAST[i].x, cur_un_right_FAST[i].y, 1, cur_right_FAST[i].x, cur_right_FAST[i].y, right_FAST_velocity[i].x, right_FAST_velocity[i].y, obj_id;
         if(has_stereo) 
         {
-            xyz_uv_velocity_statu_r << cur_un_right_FAST[i].x, cur_un_right_FAST[i].y, 1.0, cur_right_FAST[i].x, cur_right_FAST[i].y, right_FAST_velocity[i].x, right_FAST_velocity[i].y, prev_obj_id;
+            xyz_uv_velocity_statu_r << cur_un_right_FAST[i].x, cur_un_right_FAST[i].y, -1.0, cur_right_FAST[i].x, cur_right_FAST[i].y, right_FAST_velocity[i].x, right_FAST_velocity[i].y, prev_obj_id;
         }
 
         // 如果是跟踪点
@@ -7338,18 +12950,11 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
         test_vec.clear();
     }
 
-    // 如果当前帧背景中既没有跟踪点也没有新检测点。则当前帧只能靠IMU的积分值来推导当前帧的相机位姿
-    // if(TrackObjFeaFrame.find(0) == TrackObjFeaFrame.end() && NewObjFeaFrame.find(0) == NewObjFeaFrame.end())
-    // {
-    //     // assert(false && "There is no bg fea (tracked or new) in the cur frame!");
-    //     cout << "There is no bg fea (tracked or new) in the cur frame!!" << endl;
-    // }
-
-    // 如果当前帧背景中没有跟踪点。则当前帧只能靠IMU的积分值来推导当前帧的相机位姿
+    // 如果TrackObjFeaFrame没有纯背景跟踪点
     // 为了后面的objs_matching函数顺利执行（其实是懒得大幅修改函数逻辑了....)，这里添加一个无效的背景跟踪点
-    if(frame_count > 0 && TrackObjFeaFrame.find(0) == TrackObjFeaFrame.end())
+    if(frame_cnt > 0 && TrackObjFeaFrame.find(0) == TrackObjFeaFrame.end())
     {
-        cout << "There is no tracked bg fea in the cur frame!!" << endl;
+        // cout << "There is no tracked bg fea in the cur frame!!" << endl;
         Vector8d xyz_uv_velocity_statu;
         xyz_uv_velocity_statu << 0, 0, 0, 1, 1, 0, 0, 0;
         test_vec.emplace_back(0,xyz_uv_velocity_statu);
@@ -7360,8 +12965,192 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
     
     // 这里直接把yolo后处理得到的所有valid objs当作跟踪阶段的有效物体，通过obj-matching查看是否为被跟踪物体，或者通过像素点采样的ave-depth查看是否为新物体
     valid_detect_obj = valid_obj_id;
+    
+    // 为当前帧各个被检测物体上的所有3D特征点（包括跟踪点和新点）寻找明显离群值
+    if(!valid_detect_obj.empty())
+    {
+        vector<int> l_id_fea, g_id_fea;
+        vector<uchar> status_fea;
+        vector<float> dist_pts, dep_pts;
+        set<int> outliers;
 
-    if(frame_count > 0 && !valid_obj_id.empty())
+        // 对当前帧物体，对其所有被跟踪点在上一帧的深度值进行MAD计算排除明显离群点（因为有些跟踪点在上一帧的立体匹配在当前帧才找到，可能是离群值）
+        // 这部分是否要在当前进行？还是等到当前帧物体单独与某个上一帧物体进行关联时再进行？？
+        for(auto &obj_id: valid_detect_obj)
+        {
+            Vec3f pt, cent_pt;
+            int l_id, g_id;
+            float dep_prev, dep_cur, ave_dep;
+            uchar status;
+            // 物体的跟踪点不一定都是3D-3D点，也可能是3D-2D点
+            // todo: 是否要对局部物体的所有上一帧匹配点进行深度外点筛除？这是否可以辅助排除一部分错误的flow match？
+            if(TrackObjFeaFrame.find(obj_id) != TrackObjFeaFrame.end())
+            {
+                for(auto &iter: TrackObjFeaFrame[obj_id])
+                {
+                    g_id = iter.first;
+                    if(g_id == -1) continue;
+                    // 如果在上一帧或当前帧该点有深度值
+                    l_id = gl_id_index_map[g_id];
+                    if(l_id > 0)
+                        dep_prev = prev_FAST_dep[(l_id-1)];
+                    else
+                        dep_prev = prev_sift_dep[(-l_id)];
+
+                    if(dep_prev > 0)
+                    {
+                        l_id_fea.push_back(l_id);
+                        g_id_fea.push_back(g_id);
+                        dep_pts.push_back(dep_prev);
+                    }
+                    else
+                    {
+                        cout << "Weired! Line 12224" << endl;
+                        exit(-1);
+                    }
+                }
+                
+                int num_pts = g_id_fea.size();
+                // 至少要有4个点，才会有所谓离群点
+                if(num_pts >= 4) 
+                {
+                    // 如果是计算深度值的外点，则不需要再计算各个深度到深度均值的距离，而是直接把深度值就当作距离
+                    // 是否要多次筛选外点？
+                    use_MAD_to_filter_dep_outlier(dep_pts, outliers, ave_dep, true, false);
+                    int num_out = outliers.size();
+                    // cout << "For local obj No." << obj_id << " has total " << num_pts << " 3D tracked fea in prev_frame, and found " << num_out << " depth outliers!" << endl;
+                    // cout << "Ave depth of tracked fea in prev frame: " << ave_dep << endl;
+                    if(num_out > 0)
+                    {
+                        for(auto &iter: outliers)
+                        {
+                            float out_dep = dep_pts[iter];
+                            cout << "dep of outlier fea: " << dep_pts[iter] << endl;
+                            l_id = l_id_fea[iter];
+                            g_id = g_id_fea[iter];
+                            if(l_id > 0)
+                                statusLeftRIght[(l_id-1)] = 0;
+                            else
+                                status_sift[(-l_id)] = 0;
+                            
+                            // 删除该物体的跟踪点
+                            TrackObjFeaFrame[obj_id].erase(g_id);
+                        }
+                        outliers.clear();
+                    }
+                }
+
+                if(!l_id_fea.empty()) l_id_fea.clear();
+                if(!g_id_fea.empty()) g_id_fea.clear();
+                if(!dep_pts.empty()) dep_pts.clear();
+            }
+            
+            // 然后，对该物体在当前帧的所有有深度值的点（包括跟踪点和新点）也进行MAD，以便获得该点在当前帧的平均深度值！
+            if(TrackObjFeaFrame.find(obj_id) != TrackObjFeaFrame.end())
+            {
+                for(auto &iter: TrackObjFeaFrame[obj_id])
+                {
+                    g_id = iter.first;
+                    if(g_id == -1) continue;
+                    dep_cur = iter.second[0].second(2);
+                    if(dep_cur > 0)
+                    {
+                        l_id = gl_id_index_map[g_id];
+                        l_id_fea.push_back(l_id);
+                        g_id_fea.push_back(g_id);
+                        // 表示跟踪点
+                        status_fea.push_back(0);
+                        dep_pts.push_back(dep_cur);
+                    }
+                }
+            }
+
+            if(NewObjFeaFrame.find(obj_id) != NewObjFeaFrame.end())
+            {
+                for(auto &iter: NewObjFeaFrame[obj_id])
+                {
+                    g_id = iter.first;
+                    if(g_id == -1) continue;
+                    // 如果在当前帧该点有深度值
+                    dep_cur = iter.second[0].second(2);
+                    if(dep_cur > 0)
+                    {
+                        l_id = gl_id_index_map[g_id];
+                        l_id_fea.push_back(l_id);
+                        g_id_fea.push_back(g_id);
+                        // 表示新点
+                        status_fea.push_back(1);
+                        dep_pts.push_back(dep_cur);
+                    }
+                }
+            }
+
+            int num_pts = status_fea.size();
+            // 至少要有4个点，才尝试计算离群点
+            if (num_pts >= 4)
+            {
+                use_MAD_to_filter_dep_outlier(dep_pts, outliers, ave_dep, true, false);
+
+                int num_out = outliers.size();
+                // cout << "For local obj No." << obj_id << " has total " << num_pts << " 3D fea in cur frame, and found " << num_out << " depth outliers!" << endl;
+                // cout << "Ave depth of all 3D fea: " << ave_dep << endl;
+                if(num_out > 0)
+                {
+                    for(auto &iter: outliers)
+                    {
+                        float out_dep = dep_pts[iter];
+                        cout << "dep of outlier fea: " << dep_pts[iter] << endl;
+                        l_id = l_id_fea[iter];
+                        g_id = g_id_fea[iter];
+                        status = status_fea[iter];
+                        if(l_id > 0)
+                        {
+                            // 如果是跟踪点，则将该跟踪点转为3D-2D点
+                            if(status == 0)
+                            {
+                                statusLeftRIght[(l_id-1)] = 2;
+                                id_FAST_no_depth.push_back((l_id-1));
+                                cur_FAST_dep[(l_id-1)] = -1.0;
+                            }
+                            else
+                                statusLeftRIght[(l_id-1)] = 0;
+                        }
+                        else
+                        {
+                            if(status == 0)
+                            {
+                                status_sift[(-l_id)] = 2;
+                                id_sift_no_depth.push_back((-l_id));
+                                cur_sift_dep[(-l_id)] = -1.0;
+                            }
+                            else
+                                status_sift[(-l_id)] = 0;
+                        }
+                        
+                        // 如果是物体新点 则删除
+                        if(status == 1)
+                            NewObjFeaFrame[obj_id].erase(g_id);
+                        else
+                        {
+                            TrackObjFeaFrame[obj_id][g_id][0].second(2) = -1.0;
+                        }
+                    }
+                    outliers.clear();
+                }
+
+                ave_dep_cur_objs[obj_id] = ave_dep;
+            }
+            else
+                ave_dep_cur_objs[obj_id] = -1.0;
+
+            if(!l_id_fea.empty()) l_id_fea.clear();
+            if(!g_id_fea.empty()) g_id_fea.clear();
+            if(!status_fea.empty()) status_fea.clear();
+            if(!dep_pts.empty()) dep_pts.clear();
+        }
+    }
+
+    if(frame_cnt > 0 && !valid_obj_id.empty())
     {
         set<int> find_tracked_objs;
 
@@ -7391,43 +13180,6 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
                 // 那么就没必要遍历该物体的bbox区域了，既然该物体被检测到了，那么就只需要尝试将它与上一帧的某个物体关联
                 // 另外注意，检测到的物体一定会有bbox,但是其在seg_map和mask map上不一定会有mask区域，这取决于置信度的取值！！如果物体在这两个map上没有标记，那么就没法得到其上的特征点！
                 // 因此最方便的方法就是随便赋予一个无效的跟踪点
-
-                // float left   = bbox_mask[obj_id].left;
-                // float top    = bbox_mask[obj_id].top;
-                // float bbox_W = bbox_mask[obj_id].right - left;
-                // float bbox_H = bbox_mask[obj_id].bottom - top;
-                // int start_x = (int)(left + bbox_W/2);
-                // int start_y = (int)(top + bbox_H/2);
-                // int half_W  = (int)(bbox_W/2);
-                // int half_H  = (int)(bbox_H/2);
-                
-                // for(int i = 0; i < half_W; ++i)
-                // {
-                //     for(int j = 0; j < half_H; ++j)
-                //     {
-                //         if(obj_id_map.at<uchar>(start_y-j,start_x-i) == (uchar)obj_id || obj_id_map.at<uchar>(start_y+j,start_x+i) == (uchar)obj_id)
-                //         {
-                //             // cout << "find a pixel of obj!" << endl;
-                //             Vector8d xyz_uv_velocity_statu;
-                //             xyz_uv_velocity_statu << 0, 0, 0, 1, 1, 0, 0, 0;
-                        
-                //             // if(TrackObjFeaFrame.find(obj_id) == TrackObjFeaFrame.end())
-
-                //             test_vec.emplace_back(0,xyz_uv_velocity_statu);
-                //             map<int, vector<pair<int,Vector8d>>> temp_fea;
-                //             // 这个点的id是-1，是用于让该物体参与物体关联期间的二分图匹配
-                //             temp_fea.insert(make_pair(-1,test_vec));
-                //             TrackObjFeaFrame.insert(std::make_pair(obj_id,temp_fea));
-                //             find = true;
-                //             break;
-                //         }
-                //         else
-                //             continue;
-                //     }
-                //     if(find)
-                //         break;
-                // }
-
                 if(!find)
                 {
                     Vector8d xyz_uv_velocity_statu;
@@ -7438,112 +13190,37 @@ void FeatureTracker::assign_fea_objs(int frame_count, const Mat &dep_map, bool &
                     temp_fea.insert(make_pair(-1,test_vec));
                     TrackObjFeaFrame.insert(std::make_pair(obj_id,temp_fea));
                 }
-            } 
-            // if(obj_id > 0) valid_detect_obj.push_back(obj_id);
+            }
         }
+
         // assert(TrackObjFeaFrame.size() == (valid_obj_id.size()+1) && "Something wrong with var TrackObjFeaFrame!");
         cout << "Num of detected objs with tracked fea: " << find_tracked_objs.size() << endl;
         cout << "Num of detected objs without tracked fea: " << (valid_obj_id.size()-find_tracked_objs.size()) << endl;
     }
 
-    // cout << "Num of (tracked or detected) FAST: " << valid_FAST << endl;
-    cout << "Num of total tracked FAST (with or without depth) : " << num_FAST_track << endl;
-    cout << "Num of total new FAST (with or without depth) : " << num_FAST_new << endl;
-    // cout << "Num of (tracked or detected) FAST: " << valid_sift << endl;
-    cout << "Num of total tracked sift (with or without depth) : " << num_sift_track << endl;
-    cout << "Num of total new sift (with or without depth) : " << num_sift_new << endl;
+    // cout << "Num of total tracked FAST (with or without depth) : " << num_FAST_track << endl;
+    // cout << "Num of total new FAST (with or without depth) : " << num_FAST_new << endl;
+    // // cout << "Num of (tracked or detected) FAST: " << valid_sift << endl;
+    // cout << "Num of total tracked sift (with or without depth) : " << num_sift_track << endl;
+    // cout << "Num of total new sift (with or without depth) : " << num_sift_new << endl;
     printf("feature assign costs: %fms\n", t_o.toc());
-}
-
-// 往当前帧跟踪特征点集合中添加跟踪和新检测的FAST点，以便跟踪点数满足位姿估计的要求
-// 此方法使用情况为当前帧背景中跟踪和检测的特征点点（包括FAST和SIFT）总数可能大于规定的最大数量。
-// ！！此方法已弃用。
-void FeatureTracker::assign_FAST_objs(FASTFrame &FAST_frame, FeaObjFrame &TrackObjFeaFrame, FeaObjFrame &NewObjFeaFrame, vector<pair<int,int>> &num_obj_FAST)
-{
-    // int num_objs = TrackObjFeaFrame.size();
-
-    int cnt_track_bg = MAX_CNT_PTS_BG - num_track_sift_bg - num_new_sift_bg;
-    
-    int num_FAST = 0;
-    int num_FAST_left = ids_FAST.size();
-    
-    // 用于记录保留和丢弃的当前帧中的FAST点
-    vector<uchar> status(cur_FAST.size(), 0);
-
-    for (int i = 0; i < cur_FAST.size(); ++i)
-    {
-        int obj_id = obj_cls_id_FAST[i].second;
-        // 先添加那些有多帧跟踪的ORB点（至少被连续3帧观测到）。部分点可能是没有右图像观测的
-        if (track_cnt_FAST[i] > 2)
-        {
-            status[i] = 1;
-            TrackObjFeaFrame[obj_id][ids_FAST[i]].assign(FAST_frame[ids_FAST[i]].begin(), FAST_frame[ids_FAST[i]].end());
-            // 记录各个物体的FAST点中分别来自于track和new detected的个数
-            num_obj_FAST[obj_id].first = num_obj_FAST[obj_id].first + 1;
-            // 通过临时obj_id来判断是否为背景点
-            if (obj_id == 0) ++num_FAST;
-            continue;
-        }
-        // 如果当前帧纯背景上的跟踪的sift点足够多（后续还可以再添加静态物体上的SIFT点！），就只添加那些有多帧跟踪的FAST点用于LBA，或者添加FAST点直到达到背景点的最大规定数量
-        if (obj_id == 0){
-            if (cnt_track_bg <= 0) {
-                status[i] = 0;
-                continue;
-            }
-            else if (num_FAST >= cnt_track_bg){
-                status[i] = 0;
-                continue;
-            }
-            ++num_FAST;
-        }
-        status[i] = 1;
-        // 观察帧数为2帧的点说明是上一帧中的新FAST点，在当前帧中被跟踪到
-        if (track_cnt_FAST[i] == 2)
-        {
-            // 动态物体上要保留所有的特征点匹配
-            TrackObjFeaFrame[obj_id][ids_FAST[i]] = FAST_frame[ids_FAST[i]];
-            num_obj_FAST[obj_id].first = num_obj_FAST[obj_id].first + 1;
-        }
-        // 只有一帧观测的则为新FAST点，需要修改其全局id
-        else
-        {
-            assert(ids_FAST[i] > 1000000 && "Wrong temporal obj_id of new detected FAST points!");
-            vector<std::pair<int, Eigen::Matrix<double, 8, 1>>> tmp_obs = FAST_frame[ids_FAST[i]];
-            // FAST_frame.erase(ids_FAST[i]);
-            ids_FAST[i] = n_id++;
-            //FAST_frame[ids_FAST[i]].emplace_back(tmp_obs);
-            NewObjFeaFrame[obj_id][ids_FAST[i]] = tmp_obs;
-            num_obj_FAST[obj_id].second = num_obj_FAST[obj_id].second + 1;
-            // TODO：此处还需要修改ids_FAST_right中属于新点的id，需要与左图像中的对应新FAST点的新全局id相同（需要使用find(i)来从left_id_of_right_FAST中找到相应左图像中的点）
-            // ids_FAST_right[index] = ids_FAST[i];
-        }
-    }
-    // 去除掉当前帧中不需要的FAST点
-    reduceVector(cur_FAST, status);
-    // ids中保存的是当前帧特征点（包括从上一帧跟踪到的和当前帧中检测和新添的）所对应的(滑窗内的）特征地图点的全局id。当前帧的ids初始值是上一帧特征跟踪处理结束时的ids（即上一帧左图像中观测到的所有特征地图点）！
-    // track_cnt保存的是对应ids的特征地图点在滑窗内被观测了几帧（包括当前帧的观测）
-    // 对于特征点，只要该点被（连续）观测到的帧数大于2，那么就可以形成BA了！（3帧共视该点时，需要优化的变量是两个相对位姿和该点深度，3个帧互相之间的观测匹配可以形成3个约束）
-    reduceVector(ids_FAST, status);
-    reduceVector(track_cnt_FAST, status);
-    reduceVector(obj_cls_id_FAST, status);
-    reduceVector(prev_FAST_global_obj_id, status);
 }
 
 // Ps和Rs中要保存前一帧和当前帧相机的全局位姿。上一帧中各个物体在到当前帧之间的速度（恒速运动假设）保存在当前对象中
 // 对于特征点数不够最小阈值的物体，从上一帧各个物体保留的m个普通像素点中采样以达到最小阈值数，然后直接使用flow_map进行匹配（当然还有保证其在当前帧中的cls要一致，可以是背景漏检点）
 // 这也就意味着最后需要对当前帧每个物体区域内已经跟踪和检测的特征点进行mask，然后再从剩下的区域中采样像素点！
 // FinalTrackObjFea保存最终上一帧各个物体（非背景）的匹配点对以及新检测出的特征点
-void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::Mat &seg_map, const cv::Mat &flow_map, const cv::Mat &depth_map, 
-                                            bool initial_succ, bool has_pred_motion_objs_cam, const vector<Vector3d> &Ps, const vector<Matrix3d> &Rs)
+void FeatureTracker::objs_matching_assign(const cv::Mat &seg_map, const cv::Mat &flow_map, const cv::Mat &depth_map, 
+                                            bool has_pred_motion_objs_cam, const vector<Vector3d> &Ps, const vector<Matrix3d> &Rs)
 {
     TicToc t_match_objs;
-    ++total_frame;
+    
     // 如果是首帧，或者当前帧与上一帧之间只会有背景点之间的跟踪（上一帧没有任何物体，且上一帧和当前帧之间只有背景上的跟踪点（不存在上一帧漏检的物体被当前帧发现）；当前帧只会有新物体）
-    // if(frame_count == 0 || (!has_lost_obj_prev && TrackObjFeaFrame.size() == 1 && TrackObjFeaFrame.begin()->first == 0 && glob_obj_id_prev.empty()))
-    if(frame_count == 0 || (TrackObjFeaFrame.size() == 1 && TrackObjFeaFrame.begin()->first == 0 && glob_obj_id_prev.empty()))
+    // if(frame_cnt == 0 || (!has_lost_obj_prev && TrackObjFeaFrame.size() == 1 && TrackObjFeaFrame.begin()->first == 0 && glob_obj_id_prev.empty()))
+    if(frame_cnt == 0 || (TrackObjFeaFrame.size() == 1 && TrackObjFeaFrame.begin()->first == 0 && glob_obj_id_prev.empty()))
     {
         new_objs_cur = valid_detect_obj;
-        if(frame_count == 0) cout << "Num of new obj in first frame: " << new_objs_cur.size() << endl;
+        if(frame_cnt == 0) cout << "Num of new obj in first frame: " << new_objs_cur.size() << endl;
         
         int index;
         if(!TrackObjFeaFrame.empty())
@@ -7577,7 +13254,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
     }
     
     // 当前帧没有背景上的跟踪点，这种极端情况在下面还没处理！
-    if(frame_count > 0 && TrackObjFeaFrame.find(0) == TrackObjFeaFrame.end())
+    if(frame_cnt > 0 && TrackObjFeaFrame.find(0) == TrackObjFeaFrame.end())
         assert(false && "No tracked bg fea in cur! Should process this situation!");
 
     const int num_detect_obj = TrackObjFeaFrame.size();
@@ -7751,7 +13428,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
             map<int,vector<int>> empty_assign_prev_id;
 
             // 对于当前帧的背景点集
-            if (i == 0)
+            if(i == 0)
             {
                 // 如果当前帧背景的所有特征点都和上一帧的某个Obj相关联
                 if (count_unique_id.size() == 1)
@@ -7925,7 +13602,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                         // 记录与当前帧背景相关联的上一帧物体，即当前帧的漏检物体点
                         lose_objs_cur_bg.push_back(prev_obj_id);
 
-                        cout << "find a lose objs in cur bg!" << endl;
+                        cout << "find a detect-lost obj in cur bg!" << endl;
                         
                         // 当前的漏检物体点当中可能有异常点已经被排除，则这里不把这些点加入
                         // 但可以保留其中的sift跟踪点作为背景的新点？
@@ -7992,7 +13669,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                             // 其实也没必要，直接当作跟踪中断。该物体下一帧成为新物体即可。
                             // 如果每一帧中需要添加新点，则判断这些点的深度是否太大，如果太大则直接抛弃，因为它当作背景点或者漏检物体点都不太合适
                             
-                            if (add_new_sift_in_next_frame)
+                            if (add_new_fea_in_next_frame)
                             {
                                 status_sift[index] = 0;
                                 continue;
@@ -8020,7 +13697,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                 }
                 
                 // ignore_prev_obj.clear();
-
+                
                 // 至此，当前帧背景点中的跟踪点中的无效匹配点（包括匹配对了物体但是被视为极端异常点）都已经被修改了信息（要么statsu被置为-1，要被删除；要么修改为新的点），之后就无需再考虑背景中的这部分无效跟踪点了！
             }
             // 如果当前物体不是背景
@@ -8042,7 +13719,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                     
                     // 最后一个参数代表要估计上一帧的点的平均深度值，这里之所以要专门计算上一帧的点深度，是因为上一帧为背景点，其允许的深度值可能会大于物体允许的深度值
                     bool matchded = check_match_two_objs(true, false, track_fea_obj_i, prev_obj_id, i, match_pts_of_prev_obj, dep_match_pts_of_prev_obj,
-                                                        final_assign_id_cur_objs, seg_map, flow_map, depth_map, Ps, Rs, has_pred_motion, P_12, R_12, cur_obj_is_stat, ave_depth_obj_prev, assign_prev_id, false, true);
+                                                        final_assign_id_cur_objs, seg_map, flow_map, depth_map, Ps, Rs, has_pred_motion, P_12, R_12, cur_obj_is_stat, ave_depth_obj_prev, assign_prev_id, false, true, true);
                                                         
                     // 重置
                     has_pred_motion = has_pred_motion_objs_cam;
@@ -8112,7 +13789,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                     {
                         // cout << "prev_obj_id: " << prev_obj_id << endl;
                         matched = check_match_two_objs(true, true, track_fea_obj_i, prev_obj_id, i, match_pts_of_prev_obj, dep_match_pts_of_prev_obj,
-                                                        final_assign_id_cur_objs, seg_map, flow_map, depth_map, Ps, Rs, has_pred_motion, P_12, R_12, cur_obj_is_stat, ave_dep_cur_obj, assign_prev_id);
+                                                        final_assign_id_cur_objs, seg_map, flow_map, depth_map, Ps, Rs, has_pred_motion, P_12, R_12, cur_obj_is_stat, ave_dep_cur_obj, assign_prev_id, true);
                         // 如果使用特征点作为校验，则使用后要清空这两个变量，以便后续使用像素点校验的多个循环可以复用同一个统计
                         if(!match_pts_of_prev_obj.empty()) 
                         {
@@ -8127,8 +13804,9 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                         // 后续查看是否有上一帧该物体漏检的部分的特征点
                         need_more_fea = true;
                         matched = check_match_two_objs(false, true, track_fea_obj_i, prev_obj_id, i, match_pts_of_prev_obj, dep_match_pts_of_prev_obj,
-                                            final_assign_id_cur_objs, seg_map, flow_map, depth_map, Ps, Rs, has_pred_motion, P_12, R_12, cur_obj_is_stat, ave_dep_cur_obj, empty_assign_prev_id);
+                                            final_assign_id_cur_objs, seg_map, flow_map, depth_map, Ps, Rs, has_pred_motion, P_12, R_12, cur_obj_is_stat, ave_dep_cur_obj, empty_assign_prev_id, true);
                     }
+
                     if(matched)
                     {
                         if(ave_dep_cur_obj > mThDepthObj || ave_dep_cur_obj < mMinDepthPt)
@@ -8160,7 +13838,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                                     has_pred_motion = false;
                                     float ave_dep_prev_pts = 0.0;
                                     bool succ_matched = check_match_two_objs(true, false, track_fea_obj_i, prev_id, i, match_pts_of_prev_obj, dep_match_pts_of_prev_obj,
-                                                        final_assign_id_cur_objs, seg_map, flow_map, depth_map, Ps, Rs, has_pred_motion, P_12, R_12, cur_obj_is_stat, ave_dep_prev_pts, assign_prev_id, false, true);
+                                                        final_assign_id_cur_objs, seg_map, flow_map, depth_map, Ps, Rs, has_pred_motion, P_12, R_12, cur_obj_is_stat, ave_dep_prev_pts, assign_prev_id, false, true, true);
                                     // 重置
                                     has_pred_motion = has_pred_motion_objs_cam;
                                     // 如果前面使用特征点作为校验，则使用后要清空这两个变量，以便后续使用像素点校验的多个循环可以复用同一个统计
@@ -8256,7 +13934,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                                         statusLeftRIght[index-1] = 0;
                                     else
                                     {
-                                        if(add_new_sift_in_next_frame)
+                                        if(add_new_fea_in_next_frame)
                                         {
                                             status_sift[-1*index] = 0;
                                         }
@@ -8368,10 +14046,24 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                 else
                 {
                     // 注意，对于当前帧的非背景obj，在上面的openML过程中，它的上一帧的匹配obj最多只有两个（如果是两个，则必然一个是物体，另一个是背景；如果只有一个，则只会是物体）
-                    assert(num_match_objs_prev <= 2 && "Weired! Something wrong!");
+                    assert(num_match_objs_prev <= 2 && "Weired! Something wrong! Line 13265");
                     if(num_match_objs_prev > 1)
                         assert(final_assign_id_cur_objs[k][0] == 0 || final_assign_id_cur_objs[k][1] == 0);
                     
+                    if(num_match_objs_prev > 2 )
+                    {
+                        cout << "Weired! Something wrong! Line 13271" << endl;
+                        exit(-1);
+                    }
+                    if(num_match_objs_prev > 1)
+                    {
+                        if(final_assign_id_cur_objs[k][0] > 0 && final_assign_id_cur_objs[k][1] > 0)
+                        {
+                            cout << "Weired! Something wrong! Line 13278" << endl;
+                            exit(-1);
+                        }
+                    }
+
                     vector<int> matched_cur_objs;
                     int prev_obj_id;
                     // 记录上一帧的物体中已经完成匹配的物体
@@ -8587,7 +14279,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
 
                             FinalTrackObj[num_track_g_obj].first = prev_id;
                             FinalTrackObj[num_track_g_obj].second = iter.second;
-
+                            
                             if(id_in_lost != -1) 
                             {
                                 // lose_objs_cur_bg[id_in_lost] = lose_objs_cur_bg[id_in_lost] * (-1);
@@ -8596,7 +14288,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                                 FinalTrackObj[num_track_g_obj].second.push_back(0);
                             }
                             // 注意，这个只是记录上一帧中的已知的全局物体，对于上一帧完全漏检的物体不计算在内（其单独保存在TotalLostObjPrevBg中）
-                            num_track_g_obj++;
+                            ++num_track_g_obj;
 
                             for(int i = 0; i < 2; i++)
                             {
@@ -8696,7 +14388,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
             
             // 寻找上一帧中在上述过程中没有得到任何待匹配（包括当前帧背景的漏检）的物体（glob_obj_id_prev中不包含背景），加入二分图任务
             // cout << "num of obj in prev frame: " << glob_obj_id_prev.size() << endl;
-            for (auto &iter: glob_obj_id_prev)
+            for(auto &iter: glob_obj_id_prev)
             {
                 if (matched_prev_objs_id.find(iter) == matched_prev_objs_id.end())
                 {
@@ -8872,48 +14564,6 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                     {
                         is_new_obj_cur[i] = 0;
                         --final_assoc_obj_cur;
-                        
-                        // 没有任何潜在关联的当前帧物体，其处理不在这里进行
-                        // int id = cur_obj_assign_again[i];
-                        // int num_assoc = final_assign_id_cur_objs[id].size();
-                        // // 如果也没有和上一帧的背景漏检点相关联，则直接认为是新物体
-                        // if (num_assoc == 0) 
-                        // {   
-                        //     new_objs_cur.push_back(id);
-                        // }
-                        // else
-                        // {
-                        //     // 如果当前帧该物体在上一帧有漏检点的关联，则将其作为上一帧完全漏检的物体
-                        //     if((num_assoc == 1 && lose_fea_prev_bg.find(id) != lose_fea_prev_bg.end()) || num_assoc > 1)
-                        //     {
-                        //         bool first = true;
-                        //         // 这就需要在特征点跟踪匹配时，允许上一帧的背景点匹配到当前帧中的物体点！！！FAST的光流跟踪时并不会设置mask，mask只是用于检测新特征点的！！
-                        //         for(auto &iter: TrackObjFeaFrame[id])
-                        //         {
-                        //             if (iter.second[0].second(7) == 0)
-                        //             {
-                        //                 if(first)
-                        //                 {
-                        //                     first = false;
-                        //                     map<int, vector<pair<int,Vector8d>>> temp_fea;
-                        //                     // 这个点的id是-1，是用于让该物体参与物体关联期间的二分图匹配
-                        //                     temp_fea.insert(make_pair(iter.first,iter.second));
-                        //                     TotalLostObjPrevBg.insert(std::make_pair(id,temp_fea));
-                        //                 }
-                        //                 else
-                        //                     // 下面这两种map的插入方法哪个的效率更高？
-                        //                     TotalLostObjPrevBg[id].insert(iter);
-                        //                     // TotalLostObjPrevBg[id][iter.first] = iter.second;
-                        //             }
-                        //         }
-                        //         lose_fea_prev_bg.erase(id);
-                        //     }
-                        //     // 如果该物体仅与上一帧的一个物体有关联点（指的是在上面完成关联检查）
-                        //     else
-                        //     {
-                        //         new_objs_cur.push_back(id);
-                        //     }
-                        // }
                     }
                     else
                         continue;
@@ -8946,7 +14596,6 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                         FinalLostObjPrev.push_back(prev_obj);
                         matched_prev_objs_id.erase(prev_obj);
                     }
-                    
                     continue;
                 }
 
@@ -8971,7 +14620,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                         // 如果当前帧该物体之前有与上一帧的物体相匹配，则该物体是因为 与别的当前帧物体关联到 同一个上一帧物体，然后在二分图匹配中被排除了
                         else
                         {
-                            // 当前帧物体只与上一帧背景中的漏检物体点相关联，则为上一帧完全漏检
+                            // 当前帧物体有与上一帧背景中的漏检物体点相关联，则最终认为该物体在上一帧完全漏检
                             if ((num_match_cur_obj == 1 && lose_fea_prev_bg.find(cur_obj) != lose_fea_prev_bg.end()) || num_match_cur_obj > 1)
                             {
                                 bool first = true;
@@ -8994,7 +14643,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                                 lose_fea_prev_bg[cur_obj].clear();
                                 lose_fea_prev_bg.erase(cur_obj);
                             }
-                            // 如果不是只与上一帧背景相匹配，则将该物体作为新物体，就算有与上一帧背景相匹配，也放弃
+                            // 如果只是与上一帧某个物体有错误的关联点，则放弃该关联
                             else
                             {
                                 new_objs_cur.push_back(cur_obj);
@@ -9011,10 +14660,10 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                     else
                     {
                         // score为0的点则使取非常大的值，否则其值为0会直接影响分配。
-                        // 获取所有上一帧物体与所有当前帧物体的score_match中的最大值，使得所有没有匹配的两个物体的score为此值的10倍
+                        // 获取所有上一帧物体与所有当前帧物体的score_match中的最大值，使得所有没有匹配的两个物体的score为此值的50倍
                         if(association_mat[i][j] == 0)
                             // final_assoc_mat[id_prev][id_cur] = 1000;
-                            final_assoc_mat[id_prev][id_cur] = std::max(max_score*10,max_score_fix);
+                            final_assoc_mat[id_prev][id_cur] = std::max(max_score*50,max_score_fix);
                         else
                             final_assoc_mat[id_prev][id_cur] = association_mat[i][j];
                         ++id_cur;
@@ -9116,7 +14765,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                         lose_fea_prev_bg[iter].clear();
                         lose_fea_prev_bg.erase(iter);
                     }
-                    // 如果不是只与上一帧背景相匹配，则将该物体作为新物体，就算有与上一帧背景相匹配，也放弃
+                    // 如果只与上一帧某物体有错误的点匹配，则将该物体作为新物体
                     else
                     {
                         new_objs_cur.push_back(iter);
@@ -9162,7 +14811,12 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
             // 则加入到待修正的“完整物体”列表中
             else if ((num_match_cur_obj == 1 && final_assign_id_cur_objs[iter][0] == 0) || num_match_cur_obj > 1)
             {
-                assert(lose_fea_prev_bg.find(iter) != lose_fea_prev_bg.end() && "Something weired happened!");
+                // assert(lose_fea_prev_bg.find(iter) != lose_fea_prev_bg.end() && "Something weired happened! Line 13965");
+                if(lose_fea_prev_bg.find(iter) == lose_fea_prev_bg.end())
+                {
+                    cout << "Something weired happened! Line 13940" << endl;
+                    exit(-1);
+                }
                 bool first = true;
                 // 此变量中保存的是当前帧物体的局部id，该物体其实也会被当作新的物体，只不过起始帧是上一帧！这种情况只能依靠SIFT或者FAST（通过光流网络给出预测值）来进行关联！
                 for(auto &pt: lose_fea_prev_bg[iter])
@@ -9220,11 +14874,20 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
     Matrix3d R_12 = Matrix3d::Zero();
     Vector3d P_12 = Vector3d::Zero();
     // 只有系统第3帧开始才会有相机运动的预测（基于恒速运动模型）
-    if(frame_count > 1)
+    if(frame_cnt > 1)
     {
         // 当前帧相机坐标系下的两帧间相机运动预测值
-        R_12 = Rs[1].transpose()*Rs[0];
-        P_12 = Rs[1].transpose()*(Ps[0] - Ps[1]);
+        // 注意，P_cam_motion可能是在F/H估计成功后被重新估计的
+        // P_12 = Rs[1].transpose()*(Ps[0] - Ps[1]);
+        P_12 = P_cam_motion;
+
+        if((!USE_IMU || !IMU_init_succ) && (has_valid_F || has_valid_H))
+            R_12 = R_from_E;
+        else
+        {
+            // R_12 = Rs[1].transpose()*Rs[0];
+            R_12 = R_cam_motion;
+        }
     }
     
     // 遍历物体匹配结果，如果有上一帧一个物体在当前帧有多个匹配物体的情况，则将这多个物体合为一个(保存到最终的FinalTrackObjFea中)！
@@ -9242,13 +14905,17 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
             
             FinalTrackObj[num_track_g_obj].first = id_prev;
             
-            assert(matched_prev_objs_id.find(id_prev) != matched_prev_objs_id.end());
-            assert(matched_prev_objs_id[id_prev].size() > 0);
-
+            // assert(matched_prev_objs_id.find(id_prev) != matched_prev_objs_id.end());
+            // assert(matched_prev_objs_id[id_prev].size() > 0);
+            if(matched_prev_objs_id.find(id_prev) == matched_prev_objs_id.end() || matched_prev_objs_id[id_prev].size() == 0)
+            {
+                cout << "Weired! Line 14026" << endl;
+                exit(-1);
+            }
+            
             // elem是与prev_id物体相关联的当前帧的局部物体们
             for(auto elem: matched_prev_objs_id[id_prev])
             {
-                
                 // 注意要小于号，num_detect_obj中包含了背景
                 if (elem < num_detect_obj)
                 {
@@ -9305,13 +14972,13 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                     }
                 }
                 else
-                {   
+                {  
                     // 如果该物体在当前帧是完全漏检，则记录它
                     if (matched_prev_objs_id[id_prev].size() == 1) 
                     {
                         detect_lost_objs_cur.push_back(id_prev);
                         total_lost_cur = true;
-                        cout << "find a total lost obj in cur frame!" << endl;
+                        cout << "find a total detect-lost obj in cur frame!" << endl;
                     }
 
                     // 如果当前帧物体部分漏检，要把0放进去吗？？统一选择放进去
@@ -9381,22 +15048,40 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
     }
 
     // 查看lose_fea_prev_bg中是否还有剩余元素！
-    assert(lose_fea_prev_bg.size() == 0 && "There is something wrong about lose_fea_prev_bg member erase operation!");
+    if(lose_fea_prev_bg.size() != 0)
+    {
+        cout << "There is something wrong about lose_fea_prev_bg member erase operation!" << endl;
+        exit(-1);
+        // assert(false && "There is something wrong about lose_fea_prev_bg member erase operation!");
+    }
+
     // 去除多余的元素。这个变量中只保留那些在当前帧中有跟踪匹配的上一帧的全局物体
     FinalTrackObj.resize(num_track_g_obj);
     
     {
-        cout << "num of elem in FinalTrackCurObj: " << FinalTrackCurObj.size() << endl;
-        cout << "num of elem in TotalLostObjPrevBg: " << TotalLostObjPrevBg.size() << endl;
-        cout << "num of elem in new_objs_cur: " << new_objs_cur.size() << endl;
+        // cout << "num of elem in FinalTrackCurObj: " << FinalTrackCurObj.size() << endl;
+        // cout << "num of elem in TotalLostObjPrevBg: " << TotalLostObjPrevBg.size() << endl;
+        // cout << "num of elem in new_objs_cur: " << new_objs_cur.size() << endl;
 
         // cout << "num of elem in FinalTrackObj: " << FinalTrackObj.size() << endl;
         // cout << "num of elem in FinalLostObjPrev: " << FinalLostObjPrev.size() << endl;
     }
 
-    assert(FinalTrackCurObj.size() + TotalLostObjPrevBg.size() + new_objs_cur.size() == (num_detect_obj-1) && "Something wrong with vars FinalTrackCurObj and TotalLostObjPrevBg!");
-    assert(FinalTrackObj.size() + FinalLostObjPrev.size() == glob_obj_id_prev.size() && "Something wrong with vars FinalTrackObj and FinalLostObjPrev!");
+    if(FinalTrackCurObj.size() + TotalLostObjPrevBg.size() + new_objs_cur.size() != (num_detect_obj-1))
+    {
+        cout << "Something wrong with vars FinalTrackCurObj and TotalLostObjPrevBg!" << endl;
+        exit(-1);
+        // assert(false && "Something wrong with vars FinalTrackCurObj and TotalLostObjPrevBg!");
+    }
 
+    if(FinalTrackObj.size() + FinalLostObjPrev.size() != glob_obj_id_prev.size())
+    {
+        cout << "Something wrong with vars FinalTrackObj and FinalLostObjPrev!" << endl;
+        cout << "FinalTrackObj.size(): " << FinalTrackObj.size() << ", FinalLostObjPrev.size(): " << FinalLostObjPrev.size() << ", glob_obj_id_prev.size(): " << glob_obj_id_prev.size() << endl;
+        exit(-1);
+        // assert(false && "Something wrong with vars FinalTrackObj and FinalLostObjPrev!");
+    }
+    
     // 为背景 和 各个非静态物体添加匹配点对直到满足数量要求
     
     // 将map转化为set，并按照平均深度值从小到大排列
@@ -9473,32 +15158,47 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
     // }
 
     // invalid_stat_objs.clear();
-
-    // 静态跟踪点至少需要MIN_CNT_PTS_TRACK_BG个
-    num_rest_track = MIN_CNT_PTS_TRACK_BG - TrackBgFea.size();
-    // 上一帧有立体匹配的静态跟踪点至少需要Min_num_bg_track_with_dep_prev个
-    num_rest_track_stereo = Min_num_bg_track_with_dep_prev - num_track_fea_with_dep_prev;
-
+    
     // 如果有静态物体。再从静态物体的关联点中选择超过2帧观测（包括当前帧）的sift点和FAST点。
     // 另外同样地，当VI初始化还没成功时，每一帧都把所有静态物体的仅有两帧观测的sift跟踪点也加入静态点集合！这样子可能会因为点数较多而导致前几帧相机运动估计的时间比较长，但同样地这意味着下一帧背景中的新FAST点的检测数量会减少甚至为0！
     // 物体点不太容易形成多帧跟踪,因此物体点在每一帧中都必须有立体匹配,这就大大减少了能形成多帧跟踪的物体点的数量!
     // 所以,短跟踪长度的静态物体点只能用于VI未初始化时,用于提高视觉位姿估计的精度;VI初始化后,长跟踪长度(大于等于4帧观测)的物体点可以加入地图参与LBA!
-    // if (num_sta_objs > 0 && num_rest_sift > 0)
+    
+    
+    // 再添加近处静态物体的3D-2D跟踪点，这些点都是近点（上一帧深度15m以内）且在上一帧有立体匹配
+    // 之所以不在上面就将静态物体点加入，是因为可能有些静态物体在当前帧开始运动了，而其跟踪点被错当为静态物体（尤其是当F/H失败或者精度不高时），因此优先使用纯背景的3D-2D点
+    // 使得  num_fea_3D2D_big_bloc 中各个大bloc中的点数大致相同或者满足最少数量要求
+    vector<int> num_add_per_bloc(4.0);
+    int num_need_obj_high_NCC = 0;
+    num_total_3D_2D_fea = 0;
+    for(int k = 0; k < 4; ++k)
+    {
+        num_total_3D_2D_fea += num_fea_3D2D_big_bloc[k];
+    }
 
+    if(!g_id_sta_obj_3D2D_high_NCC.empty())
+    {
+        // 使得各个大bloc中的3D-2D点数尽可能接近10个
+        for(int k = 0; k < 4; ++k)
+        {
+            int num = max(0, 10-num_fea_3D2D_big_bloc[k]);
+            num_add_per_bloc[k] = num;
+            num_need_obj_high_NCC += num;
+        }
+    }
+
+    int num_rest_track_stereo = 0;
+    // 已有的静态3D-2D数量是否达到最小值。num_3D_2D_bg_track只计数那些有立体匹配的3D-2D点，而num_total_3D_2D_fea中还可能包含那些来自上一帧运动更新的3D-2D点（如果允许保留这样的背景点）
+    num_rest_track_stereo = Min_num_bg_track_with_dep_prev - num_3D_2D_bg_track;
+    // num_rest_track_stereo = Min_num_bg_track_with_dep_prev - num_total_3D_2D_fea;
+
+    bool need_LBA = (USE_IMU || Use_LBA_for_puer_V) && (frame_cnt > 1);
+    
     if (num_sta_objs > 0)
     {
-        float thres_dep_sta_obj_fea = min(mThDepthBg/2.0, 10.0);
-
-        // cout << "num of static objs during objs-matching: " << num_sta_objs << endl;
-        bool need_PnP_cur_frame = false;
-
-        // 纯双目的话，需要指定PnP_per_frame;双目+IMU的话（本项目暂不考虑单目IMU），需要指定是否未初始化 或者 初始化后的use_pnp_after_imu_init/fea_filtered
-        // need_PnP_cur_frame = (!USE_IMU && PnP_per_frame) || (USE_IMU && (!initial_succ || use_pnp_after_imu_init));
-        need_PnP_cur_frame = (!USE_IMU && PnP_per_frame) || (USE_IMU && (!initial_succ || (!fea_filtered || use_pnp_after_imu_init)));
-
-        assert(mThDepthObj > thres_dep_sta_obj_fea);
-
-        for (auto stat_obj: sorted_depth_sta_objs)
+        int id_row, id_col, id_bloc, half_H = 3*60, half_W = 3*200;
+        float pt_x, pt_y;
+        for(auto stat_obj: sorted_depth_sta_objs)
         {
             float depth = stat_obj.second;
             // 这种情况其实不会出现，因为上一帧 或 当前帧 的漏检点在匹配完成后都进行了平均深度的检查，不满足条件的漏检物体都会放弃！！
@@ -9510,127 +15210,308 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                 invalid_stat_objs.insert(stat_obj.first);
                 continue;
             }
-            // 只添加近处的静态物体的跟踪点到地图中
-            // todo:对于添加进地图的静态物体是否要记录？
-            else if(depth < thres_dep_sta_obj_fea)
+
+            if(!Limit_num_static_track) continue;
+            if(g_id_sta_obj_3D2D_high_NCC.empty()) continue;
+            if(num_need_obj_high_NCC <= 0) continue;
+
+            // 太远的物体上的点一般也不会被选择作为备选
+            if(depth > 21.0) continue;
+
+            int prev_id = stat_obj.first;
+            if(FinalTrackObjFea.find(prev_id) != FinalTrackObjFea.end())
             {
-                if(Limit_num_static_track)
+                for(auto &pt: FinalTrackObjFea[prev_id])
                 {
-                    if(num_rest_track <= 0 && num_rest_track_stereo <= 0)
+                    int id_pt = pt.first;
+                    if(g_id_sta_obj_3D2D_high_NCC.find(id_pt) != g_id_sta_obj_3D2D_high_NCC.end())
                     {
-                        // 如果参与LBA的点数满足最小阈值，则退出所有遍历
-                        if(num_old_track_fea >= 12)
+                        pt_x = pt.second[0].second(3);
+                        pt_y = pt.second[0].second(4);
+                        id_row = pt_y/half_H;
+                        id_col = pt_x/half_W;
+                        if(id_row > 1) id_row = 1;
+                        if(id_col > 1) id_col = 1;
+                        id_bloc = 2*id_row + id_col;
+
+                        if(num_add_per_bloc[id_bloc] > 0)
                         {
-                            // 这里应该是continue而不是break，这样就可以继续遍历所有物体并将平均深度大于阈值的物体放入invalid_stat_objs
-                            continue;
-                            // break;
-                        }
-                    }
-                }
-                
-                int prev_id = stat_obj.first;
-                // 加入各个静态物体的sift跟踪点 和 观察帧数大于2的FAST点
-                // 该静态物体不一定有跟踪特征点（即通过像素匹配来完成关联）,所以要判断
-                if(FinalTrackObjFea.find(prev_id) != FinalTrackObjFea.end())
-                {
-                    for(auto &pt: FinalTrackObjFea[prev_id])
-                    {
-                        int id_pt = pt.first;
-                        
-                        if(Limit_num_static_track)
-                        {
-                            if(num_rest_track <= 0 && num_rest_track_stereo <= 0) 
-                            {
-                                if(num_old_track_fea >= 12)
-                                    break;
-                                else
-                                {
-                                    if(sta_obj_fea_in_map.find(id_pt) == sta_obj_fea_in_map_cur.end()) 
-                                        continue;
-                                }
-                            }
-
-                            // 需要该点在上一帧中具有立体匹配
-                            if(prevRightFeaMap.find(id_pt) == prevRightFeaMap.end()) continue;
-
-                            int index = gl_id_index_map[id_pt];
-                            float dep_pt = 0.0;
-                            if(index > 0)
-                                dep_pt = cur_FAST_dep[(index-1)];
-                            else
-                                dep_pt = cur_sift_dep[(-index)];
-                            
-                            // 具体特征点的深度值不能太大
-                            if(dep_pt > thres_dep_sta_obj_fea) continue;
-
                             sta_obj_fea_in_map_cur.insert(id_pt);
-
+                            // g_id_sta_obj_3D2D.insert(id_pt);
                             if(TrackBgFea.empty())
                                 TrackBgFea.insert(make_pair(id_pt,pt.second));
                             else
                                 TrackBgFea[id_pt] = pt.second;
-
-                            // 如果该静态物体跟踪点在上一帧就已经加入地图，则其是长期点，会参与LBA
-                            if(sta_obj_fea_in_map.find(id_pt) != sta_obj_fea_in_map_cur.end()) ++num_old_track_fea;
-
-                            --num_rest_track;
+                            
+                            g_id_sta_obj_3D2D_high_NCC.erase(id_pt);
+                            num_add_per_bloc[id_bloc] -= 1;
+                            --num_need_obj_high_NCC;
                             --num_rest_track_stereo;
-                        }
-                        else
-                        {
-                            int index = gl_id_index_map[id_pt];
-                            float dep_pt = 0.0;
-                            if(index > 0)
-                                dep_pt = cur_FAST_dep[(index-1)];
-                            else
-                                dep_pt = cur_sift_dep[(-index)];
-                            
-                            // 具体特征点的深度值不能太大
-                            if(dep_pt > thres_dep_sta_obj_fea) continue;
-                            
-                            // 观测帧数大于2的sift和FAST点优先添加，不论当前帧之前是否已经完成VI初始化。
-                            // 注意，对于静态物体点，其实际观测帧数 与 其在地图中的保留观测帧数 不一定相等，因为静态物体点不是在其一开始被跟踪时就能被加入地图
-                            // 但是，总体而言，被跟踪越久的点，其可靠性就越高。因此这里优先添加跟踪帧数更多的物体点（即使其在地图中的帧数不一定足够参与当前帧的LBA）
-                            // 另一方面，上面限制了平均深度小于7m的物体才可以考虑加入地图，由于默认自车不会倒退，因此物体点在当前帧的深度只会比上一帧更小（或不变），这就使得其很大概率还是会被继续加入地图
-                            if (id_pt <= last_id_track_fea_prev)
-                            {
-                                // 对于有超过2帧观测的点，不论其在上一帧有没有立体匹配，都加入地图，因为它们可以参与LBA
-                                sta_obj_fea_in_map.insert(id_pt);
-                                
-                                if(TrackBgFea.empty())
-                                    TrackBgFea.insert(make_pair(id_pt,pt.second));
-                                else
-                                    TrackBgFea[id_pt] = pt.second;
-                                // 暂时不管跟踪点的数量限制
-                                // --num_rest_sift;
-                            }
-                            // 如果当前帧需要PnP得到相机位姿的初始估计
-                            else if(need_PnP_cur_frame)
-                            {
-                                // 对于只有2帧观测的物体点，需要其在上一帧中有立体匹配，这样其深度值比较可靠
-                                if(prevRightFeaMap.find(id_pt) == prevRightFeaMap.end()) continue;
-
-                                sta_obj_fea_in_map.insert(id_pt);
-                                // if(num_rest_sift <= 0) break;
-                                if(TrackBgFea.empty())
-                                    TrackBgFea.insert(make_pair(id_pt,pt.second));
-                                else
-                                    TrackBgFea[id_pt] = pt.second;
-                                // --num_rest_sift;
-                            }
-                            // 否则遍历下一个物体
-                            else 
-                                break;
+                            ++num_total_3D_2D_fea;
+                            // 如果该静态物体跟踪点在上一帧就已经加入地图，则其是长期点，会参与LBA
+                            if(fea_with_more_frames_in_map.find(id_pt) != fea_with_more_frames_in_map.end()) ++num_old_track_fea;
                         }
                     }
                 }
             }
-            else
+        }
+        
+        // 如果总的3D-2D点不足最小要求数量，则部分bloc地选取备用的静态物体跟踪点
+        if(Limit_num_static_track && num_rest_track_stereo > 0)
+        {
+            if(!g_id_sta_obj_3D2D_high_NCC.empty())
             {
-                continue;
-            }
+                for(auto stat_obj: sorted_depth_sta_objs)
+                {
+                    if(num_rest_track_stereo <= 0) break;
 
-            // if (num_rest_sift <= 0) break;
+                    int prev_id = stat_obj.first;
+                    if(invalid_stat_objs.find(prev_id) != invalid_stat_objs.end()) continue;
+
+                    float depth = stat_obj.second;
+                    // 太远的物体也不会被选择加入地图
+                    if(depth > 21.0) continue;
+                    
+                    if(FinalTrackObjFea.find(prev_id) != FinalTrackObjFea.end())
+                    {
+                        for(auto &pt: FinalTrackObjFea[prev_id])
+                        {
+                            if(num_rest_track_stereo <= 0) break;
+                            int id_pt = pt.first;
+                            if(g_id_sta_obj_3D2D_high_NCC.find(id_pt) != g_id_sta_obj_3D2D_high_NCC.end())
+                            {
+                                sta_obj_fea_in_map_cur.insert(id_pt);
+                                // g_id_sta_obj_3D2D.insert(id_pt);
+                                if(TrackBgFea.empty())
+                                    TrackBgFea.insert(make_pair(id_pt,pt.second));
+                                else
+                                    TrackBgFea[id_pt] = pt.second;
+                                
+                                g_id_sta_obj_3D2D_high_NCC.erase(id_pt);
+                                --num_rest_track_stereo;
+                                ++num_total_3D_2D_fea;
+                                if(fea_with_more_frames_in_map.find(id_pt) != fea_with_more_frames_in_map.end()) ++num_old_track_fea;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 如果需要LBA且当前帧旧点不足，则优先从g_id_sta_obj_3D2D_high_NCC中寻找旧点！
+        // 15个长跟踪点是否太多了？12或者10？
+        if(need_LBA && num_old_track_fea < Min_num_old_track_per_frame)
+        {
+            if(!g_id_sta_obj_3D2D_high_NCC.empty())
+            {
+                for(auto stat_obj: sorted_depth_sta_objs)
+                {
+                    if(num_old_track_fea >= Min_num_old_track_per_frame) break;
+
+                    int prev_id = stat_obj.first;
+                    if(invalid_stat_objs.find(prev_id) != invalid_stat_objs.end()) continue;
+
+                    float depth = stat_obj.second;
+                    // 太远的物体也不会被选择加入地图
+                    if(depth > 21.0) continue;
+                    
+                    if(FinalTrackObjFea.find(prev_id) != FinalTrackObjFea.end())
+                    {
+                        for(auto &pt: FinalTrackObjFea[prev_id])
+                        {
+                            if(num_old_track_fea >= Min_num_old_track_per_frame) break;
+                            int id_pt = pt.first;
+                            if(g_id_sta_obj_3D2D_high_NCC.find(id_pt) != g_id_sta_obj_3D2D_high_NCC.end())
+                            {
+                                // 其中的旧点
+                                if(fea_with_more_frames_in_map.find(id_pt) != fea_with_more_frames_in_map.end())
+                                {
+                                    sta_obj_fea_in_map_cur.insert(id_pt);
+                                    if(TrackBgFea.empty())
+                                        TrackBgFea.insert(make_pair(id_pt,pt.second));
+                                    else
+                                        TrackBgFea[id_pt] = pt.second;
+                                    
+                                    g_id_sta_obj_3D2D_high_NCC.erase(id_pt);
+                                    --num_rest_track_stereo;
+                                    ++num_total_3D_2D_fea;
+                                    ++num_old_track_fea;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // int num_sta_obj_pts = g_id_sta_obj_3D2D.size();
+
+        int num_rest_track = 0;
+        // 静态跟踪点至少需要MIN_CNT_PTS_TRACK_BG个
+        // todo: 是否有必要追求总的跟踪点（2D-2D和3D-2D）数量达到最小值？不需要，重要的是3D-2D点的数量（用于PnP），如果要LBA，则直接追求长跟踪点的最小数量！
+        // int num_rest_track = MIN_CNT_PTS_TRACK_BG - (num_track_FAST_bg + num_track_sift_bg + num_sta_obj_pts);
+        
+        // cout << "num of static objs during objs-matching: " << num_sta_objs << endl;
+        bool need_PnP_cur_frame = false;
+        // 纯双目的话，需要指定PnP_per_frame;双目+IMU的话（本项目暂不考虑单目IMU），需要指定是否未初始化 或者 初始化后的use_pnp_after_imu_init/fea_filtered
+        // need_PnP_cur_frame = (!USE_IMU && PnP_per_frame) || (USE_IMU && (!IMU_init_succ || use_pnp_after_imu_init));
+        need_PnP_cur_frame = (!USE_IMU && PnP_per_frame) || (USE_IMU && (!IMU_init_succ || (!fea_filtered || use_pnp_after_imu_init)));
+
+        // 当前系统是否使用LBA，如果使用，是否有足够多的旧点
+        bool need_old_fea = need_LBA && (num_old_track_fea < Min_num_old_track_per_frame);
+
+        float thres_dep_sta_obj_fea = Th_dep_sta_obj_fea_to_add;
+        if(mThDepthObj < thres_dep_sta_obj_fea);
+        {
+            thres_dep_sta_obj_fea = mThDepthObj;
+        }
+
+        // 如果不限制静态3D-2D点的数量，或者限制但是需要添加长跟踪点，或者总的3D-2D点还未达到最小值
+        // if(!Limit_num_static_track || need_old_fea || (num_rest_track > 0 || num_rest_track_stereo > 0))
+        if(!Limit_num_static_track || need_old_fea || (num_rest_track > 0 || num_rest_track_stereo > 0))
+        {
+            for(auto stat_obj: sorted_depth_sta_objs)
+            {
+                int prev_id = stat_obj.first;
+
+                if(invalid_stat_objs.find(prev_id) != invalid_stat_objs.end()) continue;
+
+                float depth = stat_obj.second;
+                
+                // 只添加近处的静态物体的跟踪点到地图中
+                // todo:对于添加进地图的静态物体是否要记录？
+                // 物体的平均深度
+                if(depth <= (thres_dep_sta_obj_fea+2))
+                {
+                    if(Limit_num_static_track)
+                    {
+                        if(num_rest_track <= 0 && num_rest_track_stereo <= 0)
+                        {
+                            if(need_old_fea)
+                            {
+                                // 如果参与LBA的点数满足最小阈值，则退出所有遍历
+                                if(num_old_track_fea >= Min_num_old_track_per_frame)
+                                {
+                                    // 这里应该是continue而不是break，这样就可以继续遍历所有物体并将平均深度大于阈值的物体放入invalid_stat_objs
+                                    break;
+                                    // break;
+                                }
+                            }
+                            else
+                                break;
+                        }
+                    }
+                    
+                    // 加入各个静态物体的sift跟踪点 和 观察帧数大于2的FAST点
+                    // 该静态物体不一定有跟踪特征点（即通过像素匹配来完成关联）,所以要判断
+                    if(FinalTrackObjFea.find(prev_id) != FinalTrackObjFea.end())
+                    {
+                        for(auto &pt: FinalTrackObjFea[prev_id])
+                        {
+                            int id_pt = pt.first;
+                            
+                            if(Limit_num_static_track)
+                            {
+                                if(num_rest_track <= 0 && num_rest_track_stereo <= 0) 
+                                {
+                                    if(need_old_fea)
+                                    {
+                                        if(num_old_track_fea >= Min_num_old_track_per_frame)
+                                            break;
+                                        else
+                                        {
+                                            // 该点上一帧观测没有加入地图，意味着即使其当前帧加入地图，也不会是长跟踪点
+                                            if(fea_with_more_frames_in_map.find(id_pt) == fea_with_more_frames_in_map.end()) 
+                                                continue;
+                                        }
+                                    }
+                                    else
+                                        break;
+                                }
+
+                                // 需要该点在上一帧中具有立体匹配
+                                if(prevRightFeaMap.find(id_pt) == prevRightFeaMap.end()) continue;
+
+                                int index = gl_id_index_map[id_pt];
+                                float dep_pt = 0.0;
+                                if(index > 0)
+                                    dep_pt = cur_FAST_dep[(index-1)];
+                                else
+                                    dep_pt = cur_sift_dep[(-index)];
+                                
+                                // 具体特征点的深度值不能太大
+                                if(dep_pt > thres_dep_sta_obj_fea) continue;
+
+                                sta_obj_fea_in_map_cur.insert(id_pt);
+
+                                if(TrackBgFea.empty())
+                                    TrackBgFea.insert(make_pair(id_pt,pt.second));
+                                else
+                                    TrackBgFea[id_pt] = pt.second;
+
+                                // 如果该静态物体跟踪点在上一帧就已经加入地图，则其是长期点，会参与LBA
+                                if(fea_with_more_frames_in_map.find(id_pt) != fea_with_more_frames_in_map.end()) ++num_old_track_fea;
+
+                                --num_rest_track;
+                                --num_rest_track_stereo;
+                                ++num_total_3D_2D_fea;
+                            }
+                            else
+                            {
+                                int index = gl_id_index_map[id_pt];
+                                float dep_pt = 0.0;
+                                if(index > 0)
+                                    dep_pt = cur_FAST_dep[(index-1)];
+                                else
+                                    dep_pt = cur_sift_dep[(-index)];
+                                
+                                // 具体特征点的深度值不能太大
+                                if(dep_pt > thres_dep_sta_obj_fea) continue;
+                                
+                                // 观测帧数大于2的sift和FAST点优先添加，不论当前帧之前是否已经完成VI初始化。
+                                // 注意，对于静态物体点，其实际观测帧数 与 其在地图中的保留观测帧数 不一定相等，因为静态物体点不是在其一开始被跟踪时就能被加入地图
+                                // 但是，总体而言，被跟踪越久的点，其可靠性就越高。因此这里优先添加跟踪帧数更多的物体点（即使其在地图中的帧数不一定足够参与当前帧的LBA）
+                                // 另一方面，上面限制了平均深度小于7m的物体才可以考虑加入地图，由于默认自车不会倒退，因此物体点在当前帧的深度只会比上一帧更小（或不变），这就使得其很大概率还是会被继续加入地图
+                                if (id_pt <= last_id_track_fea_prev)
+                                {
+                                    // 对于有超过2帧观测的点，不论其在上一帧有没有立体匹配，都加入地图，因为它们可以参与LBA
+                                    sta_obj_fea_in_map.insert(id_pt);
+                                    
+                                    if(TrackBgFea.empty())
+                                        TrackBgFea.insert(make_pair(id_pt,pt.second));
+                                    else
+                                        TrackBgFea[id_pt] = pt.second;
+                                    // 暂时不管跟踪点的数量限制
+                                    // --num_rest_sift;
+                                }
+                                // 如果当前帧需要PnP得到相机位姿的初始估计
+                                else if(need_PnP_cur_frame)
+                                {
+                                    // 对于只有2帧观测的物体点，需要其在上一帧中有立体匹配，这样其深度值比较可靠
+                                    if(prevRightFeaMap.find(id_pt) == prevRightFeaMap.end()) continue;
+
+                                    sta_obj_fea_in_map.insert(id_pt);
+                                    // if(num_rest_sift <= 0) break;
+                                    if(TrackBgFea.empty())
+                                        TrackBgFea.insert(make_pair(id_pt,pt.second));
+                                    else
+                                        TrackBgFea[id_pt] = pt.second;
+                                    // --num_rest_sift;
+                                }
+                                // 否则遍历下一个物体
+                                else 
+                                    break;
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    continue;
+                }
+
+                // if (num_rest_sift <= 0) break;
+            }
         }
 
         //added_short_track_Fea.clear();
@@ -9688,9 +15569,17 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
     }
 
     // cout << "Num of tracked static fea (with stereo match):  " << TrackBgFea.size() << endl;
-
-    sta_obj_fea_in_map.clear();
-    sta_obj_fea_in_map = sta_obj_fea_in_map_cur;
+    cout << "Num of static obj during objs-matching: " << (num_sta_objs-invalid_stat_objs.size()) << endl;
+    for(auto &iter: sorted_depth_sta_objs)
+    {
+        if(invalid_stat_objs.find(iter.first) != invalid_stat_objs.end()) continue;
+        cout << "Global id of static obj: " << iter.first << endl;
+    }
+    
+    if(Limit_num_static_track)
+    {
+        cout << "Finally found total num of 3D-2D static fea (including bg and sta obj fea): " << num_total_3D_2D_fea << endl;
+    }
 
     // 记录在物体跟踪阶段就已经确认为静态点的总数！之所以说是大概的数（approximate），是因为有些上一帧的静态物体此时还无法确认状态，需要后续进行运动估计，因此这里没有计算它们的跟踪点。
     // appro_num_track_stat_fea = 0;
@@ -9704,6 +15593,30 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
         }
     }
 
+    // 由于在上一帧完全漏检的物体 无法 添加像素点跟踪 作为补充，因此需要放弃那些点数不足的物体
+    for(auto iter = TotalLostObjPrevBg.begin(); iter != TotalLostObjPrevBg.end(); )
+    {
+        int num_track = iter->second.size();
+
+        // 执行PnP至少需要4个跟踪点
+        if(num_track < 4)
+        {
+            int cur_obj = iter->first;
+
+            new_objs_cur.push_back(cur_obj);
+
+            // 注意，删除map的某个元素会使对应的迭代器失效，后续对该迭代器进行除了赋值之外的操作（即等号右边的操作，++iter就是这样的操作）都是无效的！
+            // 而map的erase()会返回被删除元素的下一个有效迭代器，用它可以为原迭代器变量赋值
+            // 要么就在遍历时保留需要删除的元素的key，之后再逐一删除，避免了遍历迭代器的操作
+            iter = TotalLostObjPrevBg.erase(iter);
+        }
+        else
+        {
+            // 正常的迭代器可以被引用
+            ++iter;
+        }
+    }
+    
     set<int, greater<int>> dyn_obj_id_del;
     // 遍历各个动态的关联物体，如果其关联点数小于最小阈值，则添加普通像素
     if (cur_dyn_objs.size() > 0)
@@ -9734,7 +15647,13 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                     num_pixel = MIN_CNT_PTS_TRACK_OBJ;
                 }
                 else
-                    num_pixel = MIN_CNT_PTS_TRACK_OBJ - FinalTrackObjFea[id_obj].size();
+                {
+                    // 如果匹配点数不小于8个，则不再添加像素点，否则添加到MIN_CNT_PTS_TRACK_OBJ个
+                    if(FinalTrackObjFea[id_obj].size() >= 8)
+                        num_pixel = 0;
+                    else
+                        num_pixel = MIN_CNT_PTS_TRACK_OBJ - FinalTrackObjFea[id_obj].size();
+                }
             }
             else
             {
@@ -9748,7 +15667,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                 else
                 {
                     // 对于在当前帧完全漏检的跟踪物体，后续如何为其添加像素点跟踪？只能相信flow_map的估计足够好，认为基于光流且关联到背景中的点也是漏检点
-                    num_pixel = 10 - FinalTrackObjFea[id_obj].size();
+                    num_pixel = MIN_CNT_PTS_TRACK_OBJ - FinalTrackObjFea[id_obj].size();
                 }
             }
             
@@ -9763,14 +15682,58 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
             float prev_u, prev_v, cur_u, cur_v, flow_u, flow_v, disp, depth;
             int temp_obj_id;
             
-            int cout_pixel = 0;
+            vector<uchar> invalid_pts(num_valid_pixel, 0);
+            float ave_dep = ave_dep_prev_objs[id_obj];
+
+            // 这里是否还要对上一帧保留的采样像素点进行异常深度筛选？选择进行，因为上面可能对该全局物体的平均深度基于更多的特征点深度（其中部分有立体匹配）进行了更新，其精度会更高，可用于过滤异常的像素点
+            {
+                // 对该物体的所有上一帧的点深度值滤除外点！那么是否让特征点也加入（特征点和部分像素点应该有重合？）？如果加入且发现特征点是外点，那么该如何处理？是直接删除了吗？
+                // 是否对匹配点在当前帧的深度也进行外点滤除？不需要，因为PnP只需要3D-2D点。当然对跟踪点在当前帧的深度值也进行滤除，可能可以排除掉flow_map的一些错误匹配？
+                vector<float> dep_pts;
+                vector<int> l_id_pts;
+                float dep;
+                bool has_outlier = false;
+                for(int i = 0; i < num_valid_pixel; ++i)
+                {
+                    dep = ptr_pixel[(i*3+2)];
+                    if(dep < 1.5 || dep >= mThDepthObj)
+                        invalid_pts[i] = 1;
+                    else
+                    {
+                        if((dep > ave_dep+5.0) || (dep < ave_dep-2.0))
+                        {
+                            invalid_pts[i] = 1;
+                            has_outlier = true;
+                        }
+                        else
+                        {
+                            dep_pts.push_back(dep);
+                            l_id_pts.push_back(i);
+                        }
+                    }
+                }
+
+                if(l_id_pts.size() > 3)
+                {
+                    set<int> outliers;
+                    use_MAD_to_filter_dep_outlier(dep_pts, outliers, ave_dep, true);
+                    if(!outliers.empty())
+                    {
+                        for(auto &it: outliers)
+                        {
+                            int l_id = l_id_pts[it];
+                            invalid_pts[l_id] = 1;
+                        }
+                    }
+                }
+            }
+            
             for(int i = 0; i < num_valid_pixel; ++i)
             {
                 if (num_pixel <= 0) break;
-
+                if(invalid_pts[i] > 0) continue;
                 // 对于当前帧完全漏检的物体，需要把上一帧所有不重复的采样像素点匹配加入点集中用于位姿估计，保留其中的内点作为该物体在当前帧的密集像素点集
-                // 对于非漏检或者部分漏检的物体，添加像素匹配数直到跟踪点数达到最低要求。算了不设置最低数量要求
-                // if (num_pixel == 0) break;
+
                 // 上一帧的物体像素点
                 prev_u = ptr_pixel[(i*3)];
                 prev_v = ptr_pixel[(i*3+1)];
@@ -9794,19 +15757,9 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                 //     cout << "flow_v: " << flow_v << endl;
                 // }
                 
-                if(inBorder(Point2f(cur_u,cur_v)))
-                    disp = depth_map.at<float>(cur_v,cur_u);
-                else
+                if(!inBorder(Point2f(cur_u,cur_v)))
                     continue;
                 
-                if(disp <= 0) continue;
-                depth = mbf/disp;
-                // if(cout_pixel < 5)
-                // {
-                //     cout << "depth: " << depth << endl;
-                // }
-                
-                if (depth >= mThDepthObj || depth <= mMinDepthPt) continue;
                 // 判断物体obj_id是否一致
                 temp_obj_id = seg_map.at<Vec2b>(cur_v,cur_u)[1];
 
@@ -9817,6 +15770,28 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                 // 而对于当前帧完全漏检的物体，则直接保留那些匹配到当前帧背景中的像素点...
                 if ((temp_obj_id == 0 && !total_lost) || std::find(match_cur_objs.begin(),match_cur_objs.end(),temp_obj_id) == match_cur_objs.end()) continue;
 
+                disp = depth_map.at<float>(cur_v,cur_u);
+                if(disp <= 0) continue;
+                depth = mbf/disp;
+                if (depth >= mThDepthObj || depth <= mMinDepthPt) 
+                    continue;
+                else
+                {
+                    // 如果是当前帧的漏检物体，则用上一帧该物体的深度值来大致排除跟踪点在当前帧的显著异常值
+                    // 考虑到相机自身的运动和物体自身的运动，异常值范围扩大一些
+                    float ave_dep_cur = ave_dep, Th_high = 6.0, Th_low = 6.0;
+                    if(temp_obj_id > 0 && ave_dep_cur_objs[temp_obj_id] > 0)
+                    {
+                        ave_dep_cur = ave_dep_cur_objs[temp_obj_id];
+                        // 是否应该用先前计算平均深度的MAD时的up_boundry和low_boundry？
+                        Th_high = 4.0;
+                        Th_low = 2.0;
+                    }
+
+                    if(depth <= (ave_dep_cur - Th_low) || depth >= (ave_dep_cur + Th_high))
+                        continue;
+                }
+                
                 undistortedPts(cv::Point2f(cur_u,cur_v),un_pt_cur,m_camera[0]);
                 undistortedPts(cv::Point2f(prev_u,prev_v),un_pt_prev,m_camera[0]);
 
@@ -9857,7 +15832,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                 dyn_obj_id_del.insert(id_tracked_obj);
             }
         }
-
+        
         if(!dyn_obj_id_del.empty())
         {
             int index;
@@ -9891,7 +15866,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
                                 else
                                 {
                                     index = -1*index;
-                                    if(add_new_sift_in_next_frame)
+                                    if(add_new_fea_in_next_frame)
                                         status_sift[index] = 0;
                                     else
                                     {
@@ -9934,19 +15909,21 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
         }
     }
 
-    cout << "num of new objs cur during objs-matching: " << new_objs_cur.size() << endl;
+    // cout << "num of new objs cur during objs-matching: " << new_objs_cur.size() << endl;
     // for(auto iter:new_objs_cur)
     // {
     //     cout << "id of new objs: " << iter << endl;
     // }
-    cout << "num of dyn tracked objs during objs-matching: " << cur_dyn_objs.size() << endl;
+
+    // cout << "num of dyn tracked objs during objs-matching: " << cur_dyn_objs.size() << endl;
     // for(auto iter:cur_dyn_objs)
     // {
     //     if(FinalTrackObj[iter].second.size() > 1) cout << "There is more than 1 cur objs matched with the same prev obj!" << endl;
     //     for(auto it: FinalTrackObj[iter].second)
     //         cout << "id of dyn objs: " << it << endl;
     // }
-    cout << "num of static tracked objs during objs-matching: " << cur_stat_objs.size() << endl;
+
+    // cout << "num of static tracked objs during objs-matching: " << cur_stat_objs.size() << endl;
     // for(auto iter:cur_stat_objs)
     // {
     //     cout << "id of sta objs: " << iter.first << endl;
@@ -9957,7 +15934,7 @@ void FeatureTracker::objs_matching_assign(int frame_count, double dt, const cv::
     
     // ROS_DEBUG("Matching objects costs: %fms", t_match_objs.toc());
     printf("Matching objects costs: %fms\n", t_match_objs.toc());
-
+    
     final_assign_id_cur_objs.clear();
     prev_objs_assign_again.clear();
     matched_prev_objs_id.clear();
@@ -9973,7 +15950,7 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
                                             map<int, pair<vector<Vec2f>,vector<Vec2f>>> &match_pts_of_prev_obj, map<int, pair<vector<float>,vector<float>>> &dep_match_pts_of_prev_obj,
                                             vector<vector<int>> &final_assign_id_cur_objs, const cv::Mat &seg_map, const cv::Mat &flow_map, const cv::Mat &depth_map_2, const vector<Vector3d> &Ps, 
                                             const vector<Matrix3d> &Rs, bool has_pred_motion, Vector3d &P_12, Matrix3d &R_12, bool &cur_sta_obj, float &ave_depth, 
-                                            map<int,vector<int>> &assign_prve_id, bool direct_erase_pts, bool cal_ave_depth_prev_pts)
+                                            map<int,vector<int>> &assign_prve_id, bool direct_erase_pts, bool cal_ave_dep, bool cal_ave_depth_prev_pts)
 {
     int match_index;
     cur_sta_obj = false;
@@ -9983,7 +15960,7 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
     vector<int> fea_id;
 
     // 如果特征关联点数足够多
-    if (use_fea)
+    if(use_fea)
     {
         // 使用特征点进行关联校验前清空这两个变量
         if (!match_pts_of_prev_obj.empty()) 
@@ -9992,7 +15969,7 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
             dep_match_pts_of_prev_obj.clear();
         }
         
-        factor_fea = factor_fea * 0.85;
+        factor_fea = factor_fea * 0.9;
 
         int num_fea = fea_cur_obj.size();
         vector<float> temp_dep(num_fea,0);
@@ -10012,39 +15989,63 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
             match_index = 0;
             float depth_cur, depth_prev;
             
-            for (auto &iter: fea_cur_obj)
+            for(auto &iter: fea_cur_obj)
             {
+                bool valid_dep = true;
                 // 有些上一帧的静态物体，可能在初步物体关联期间已经排除了其中的特征点异常匹配；后面如果该静态物体需要和别的物体进行融合，则这里就直接先把该异常匹配排除，免得之后进行计算两个点集的相似性时还要再次排除它！
                 int index = gl_id_index_map[iter.first];
                 if (index > 0) 
                 {
                     if(statusLeftRIght[index-1] == 0)
                         continue;
+                    
+                    depth_cur = cur_FAST_dep[index-1];
                 }
                 else
                 {
                     if(status_sift[-index] == 0)
                         continue;
+                    
+                    depth_cur = cur_sift_dep[-index];
                 }
 
-                depth_cur = iter.second[0].second(2,0);
-                if (depth_cur <= 0) continue;
-
-                // 物体点在每一帧中不一定有立体匹配。但是物体点一定有深度值
-                if (iter.second.size() == 2)
+                // 对于物体，单纯的2D点集属性始终无法提供较好的物体匹配可信度（投影时的形变等），3D点集合的属性相对更可信，而通过与物体运动预测相关联的3D-3D投影距离则最可信！
+                // depth_cur = iter.second[0].second(2,0);
+                if (depth_cur <= 0) 
                 {
-                    depth_prev = iter.second[1].second(2,0);
+                    valid_dep = false;
+                    depth_cur = -1.0;
+                    // todo: 是否只选择3D-3D点？如果只选择3D-3D点的话，会不会点数太少？这样会使得2D-2D点也一样很少，导致连2D点集的属性都没法计算？
+                    // continue;
+                }
+
+                if(valid_dep)
+                {
+                    // 虽然物体点在每一帧中一定有立体匹配或深度值，但对于纯背景点则不一定
+                    // if (iter.second.size() == 2)
+                    // {
+                    //     depth_prev = iter.second[1].second(2,0);
+                    // }
+                    // else
+                    {
+                        if (index > 0)
+                            depth_prev = prev_FAST_dep[index-1];
+                        else
+                            depth_prev = prev_sift_dep[-index];
+                    }
+                    
+                    // 有些点（只能是纯背景跟踪点）可能没有深度值，但这些匹配点可以参与2D点集的相似度计算
+                    if (depth_prev <= 0) 
+                    {
+                        valid_dep = false;
+                        depth_prev = -1.0;
+                        // continue;
+                    }
                 }
                 else
                 {
-                    if (index > 0)
-                        depth_prev = prev_FAST_dep[index-1];
-                    else
-                        depth_prev = prev_sift_dep[-index];
+                    depth_prev = -1.0;
                 }
-                
-                // 有些点可能没有深度值，但这些匹配点可以参与2D点集的相似度计算
-                if (depth_prev <= 0) continue;
 
                 // 归一化平面坐标
                 float pts1_x = iter.second[0].second(0,0);
@@ -10052,8 +16053,8 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
                 // match_pts_of_prev_obj[match_index].second.emplace_back(pts1_x, pts1_y);
                 temp_pair_fea.second.emplace_back(pts1_x, pts1_y);
 
-                float prev_x = pts1_x - iter.second[0].second(5,0) * (cur_time - prev_time);
-                float prev_y = pts1_y - iter.second[0].second(6,0) * (cur_time - prev_time);
+                float prev_x = pts1_x - iter.second[0].second(5,0) * cur_dt;
+                float prev_y = pts1_y - iter.second[0].second(6,0) * cur_dt;
                 // match_pts_of_prev_obj[match_index].first.emplace_back(prev_x, prev_y);
                 temp_pair_fea.first.emplace_back(prev_x, prev_y);
 
@@ -10079,7 +16080,7 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
                 //         dep_match_pts_of_prev_obj[match_index].second.push_back(cur_sift_dep[index]);
                 //     }
                 // }
-
+                
                 temp_pair_dep.first.push_back(depth_prev);
                 temp_pair_dep.second.push_back(depth_cur);
                 
@@ -10102,6 +16103,7 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
                 float depth_prev, depth_cur;
                 for(int i = 0; i < assign_prve_id[id_checked_prev_obj].size(); i++)
                 {
+                    bool valid_dep = true;
                     int g_id_pt = assign_prve_id[id_checked_prev_obj][i];
                     
                     int index = gl_id_index_map[g_id_pt];
@@ -10109,31 +16111,54 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
                     {
                         if(statusLeftRIght[index-1] == 0)
                             continue;
+                        
+                        depth_cur = cur_FAST_dep[index-1];
                     }
                     else
                     {
                         if(status_sift[-index] == 0)
                             continue;
+                        
+                        depth_cur = cur_sift_dep[-index];
                     }
 
                     Eigen::Matrix<double, 8, 1> &pt = fea_cur_obj[g_id_pt][0].second;
-                    depth_cur = pt(2);
-                    if (depth_cur <= 0) continue;
-
-                    // 如果该点有立体匹配
-                    if (fea_cur_obj[g_id_pt].size() == 2) 
+                    // depth_cur = pt(2);
+                    if (depth_cur <= 0) 
                     {
-                        depth_prev = fea_cur_obj[g_id_pt][1].second(2);
+                        valid_dep = false;
+                        depth_cur = -1.0;
+                        // continue;
+                    }
+
+                    if(valid_dep)
+                    {
+                        // if (fea_cur_obj[g_id_pt].size() == 2) 
+                        // {
+                        //     // 该点当前帧有立体匹配不意味着上一帧有立体匹配，右观测的第三个值如果不是上一帧的点深度值，则是1.0！！因此其正负性不能用于判断点在上一帧是否有深度值
+                        //     // 当然，只有纯背景跟踪点会被允许是2D-2D点，物体点必须是3D-2D点或3D-3D点！
+                        //     depth_prev = fea_cur_obj[g_id_pt][1].second(2);
+                        // }
+                        // else
+                        {
+                            if(index > 0)
+                                depth_prev = prev_FAST_dep[index-1];
+                            else
+                                depth_prev = prev_sift_dep[-index];
+                        }
+                        
+                        // 这种情况只能是纯背景跟踪点
+                        if (depth_prev <= 0) 
+                        {
+                            valid_dep = false;
+                            depth_prev = -1.0;
+                            // continue;
+                        }
                     }
                     else
                     {
-                        if(index > 0)
-                            depth_prev = prev_FAST_dep[index-1];
-                        else
-                            depth_prev = prev_sift_dep[-index];
+                        depth_prev = -1.0;
                     }
-                    
-                    if (depth_prev <= 0) continue;
 
                     // dep_match_pts_of_prev_obj[id_checked_prev_obj].first.push_back(depth_prev);
                     // dep_match_pts_of_prev_obj[id_checked_prev_obj].second.push_back(depth_cur);
@@ -10146,8 +16171,8 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
                     // match_pts_of_prev_obj[id_checked_prev_obj].second.emplace_back(pts1_x, pts1_y);
                     temp_pair_fea.second.emplace_back(pts1_x, pts1_y);
 
-                    float prev_x = pts1_x - pt(5) * (cur_time - prev_time);
-                    float prev_y = pts1_y - pt(6) * (cur_time - prev_time);
+                    float prev_x = pts1_x - pt(5) * cur_dt;
+                    float prev_y = pts1_y - pt(6) * cur_dt;
                     // match_pts_of_prev_obj[id_checked_prev_obj].first.emplace_back(prev_x, prev_y);
                     temp_pair_fea.first.emplace_back(prev_x, prev_y);
                     fea_id.push_back(g_id_pt);
@@ -10164,6 +16189,7 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
                 float depth_prev,depth_cur;
                 for (auto &iter: fea_cur_obj)
                 {
+                    bool valid_dep = true;
                     // 需要确认该点的obj id为需要的id_checked_prev_obj！
                     if (iter.second[0].second(7,0) != id_checked_prev_obj) continue;
                     
@@ -10174,30 +16200,48 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
                     {
                         if(statusLeftRIght[index-1] == 0)
                             continue;
+                        
+                        depth_cur = cur_FAST_dep[index-1];
                     }
                     else
                     {
                         if(status_sift[-index] == 0)
                             continue;
+                        
+                        depth_cur = cur_sift_dep[-index];
                     }
 
-                    float depth_cur  = iter.second[0].second(2,0);
-                    if (depth_cur <= 0) continue;
-
-                    // 该点在上一帧是否有立体匹配
-                    if (iter.second.size() == 2)
+                    // depth_cur = iter.second[0].second(2,0);
+                    if (depth_cur <= 0) 
                     {
-                        depth_prev = iter.second[1].second(2,0);
+                        valid_dep = false;
+                        depth_cur = -1.0;
+                        // continue;
+                    }
+
+                    if(valid_dep)
+                    {
+                        // if (iter.second.size() == 2)
+                        // {
+                        //     depth_prev = iter.second[1].second(2,0);
+                        // }
+                        // else
+                        {
+                            if(index > 0)
+                                depth_prev = prev_FAST_dep[index-1];
+                            else
+                                depth_prev = prev_sift_dep[-index];
+                        }
+                        
+                        if (depth_prev <= 0) 
+                        {
+                            valid_dep = false;
+                            depth_prev = -1.0;
+                            // continue;
+                        }
                     }
                     else
-                    {
-                        if(index > 0)
-                            depth_prev = prev_FAST_dep[index-1];
-                        else
-                            depth_prev = prev_sift_dep[-index];
-                    }
-                    
-                    if (depth_prev <= 0) continue;
+                        depth_prev = -1.0;
 
                     // dep_match_pts_of_prev_obj[id_checked_prev_obj].first.push_back(depth_prev);
                     // dep_match_pts_of_prev_obj[id_checked_prev_obj].second.push_back(depth_cur);
@@ -10210,8 +16254,8 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
                     // match_pts_of_prev_obj[id_checked_prev_obj].second.emplace_back(pts1_x, pts1_y);
                     temp_pair_fea.second.emplace_back(pts1_x, pts1_y);
 
-                    float prev_x = pts1_x - iter.second[0].second(5,0) * (cur_time - prev_time);
-                    float prev_y = pts1_y - iter.second[0].second(6,0) * (cur_time - prev_time);
+                    float prev_x = pts1_x - iter.second[0].second(5,0) * cur_dt;
+                    float prev_y = pts1_y - iter.second[0].second(6,0) * cur_dt;
                     // match_pts_of_prev_obj[id_checked_prev_obj].first.emplace_back(prev_x, prev_y);
                     temp_pair_fea.first.emplace_back(prev_x, prev_y);
 
@@ -10227,12 +16271,14 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
             match_index = id_checked_prev_obj;
         }   
     }
-    // 如果关联的特征点不够多，则使用上一帧采样的物体像素点进行关联程度计算
     else
+    // todo: 如果要求使用像素点关联，或者找到的有效的（指3D-3D）关联特征点不够多，则使用上一帧采样的物体像素点进行关联程度计算
+    // if(!use_fea || (fea_id.size() < 4 && id_checked_cur_obj != -1))
     {
-        factor_fea = factor_fea * 0.98;
+        factor_fea = factor_fea * 1.0;
         int num_prev_pixel = 0;
         // 是否需要先要寻找指定的两个物体之间的配对像素点，要注意这时是采用当前帧的物体临时id作为map的key
+        // 像素点采样必须是3D-3D点
         if (match_pts_of_prev_obj.empty())
             num_prev_pixel = track_pixels_one_prev_obj(id_checked_prev_obj, seg_map, flow_map, depth_map_2, match_pts_of_prev_obj, dep_match_pts_of_prev_obj);
         else
@@ -10266,7 +16312,6 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
     Matrix3d Rs_c2;
     
     bool has_cam_motion = false;
-    bool has_obj_motion = true;
 
     if(has_pred_motion)
     {
@@ -10283,7 +16328,7 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
             has_pred_motion = false;
         }
     }
-
+    
     bool prev_sta_obj = false;
     // 给定相机坐标下的 该物体的帧间运动，即将该物体在上一帧相机坐标系下的点 变换到 当前帧相机坐标下的该对应点
     auto iter = RP_objs_pred.find(id_checked_prev_obj);
@@ -10294,10 +16339,11 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
         // P_12 = Rs_c2.transpose()*(RP_objs_pred[id_checked_prev_obj].first*Ps_c1 + RP_objs_pred[id_checked_prev_obj].second - Ps_c2);
         R_12 = RP_objs_pred[id_checked_prev_obj].first;
         P_12 = RP_objs_pred[id_checked_prev_obj].second;
+        has_pred_motion = true;
     }
     else 
     {
-        // 如果待验证关联的上一帧物体不是动态物体
+        // 如果待验证关联的上一帧物体不是动态物体,则上一帧待验证的可能是背景、静态物体或新物体
         auto iter_ = status_objs_prev.find(id_checked_prev_obj);
         // 上一帧新出现的物体（例如当前帧为系统第二帧，则首帧出现的所有物体都是新物体）。status_objs_prev中为0的物体一定在RP_objs_prev中有区别于相机的运动模型
         // 上一帧如果是背景点（且当前帧为物体，即为校验上一帧是否漏检），两帧之间还没有物体运动估计（系统前2帧），或者上一帧为新物体
@@ -10306,17 +16352,33 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
             has_pred_motion = false;
             // 注意，此函数默认不会进行两帧之间的纯背景点的关联验证，因此如果上一帧的被验证物体为背景，则当前帧的被验证物体一定不再是背景
             if(id_checked_prev_obj == 0 && id_checked_cur_obj != -1)
-                assert(id_checked_cur_obj != 0);
+            {
+                if(id_checked_cur_obj == 0)
+                {
+                    cout << "Weired! Line 15629" << endl;
+                    exit(-1);
+                }
+            }
         }
         // 如果校验的上一帧物体为已有的静态物体(1)
         // 另外，系统第2帧时没有相机的运动先验，则此时所有物体都不会有运动先验，这就需要函数调用者给定此时的has_pred_motion为false！
         else if(has_cam_motion)
         {
-            R_12 = Rs_c2.transpose()*Rs_c1;
+            // 如果当前帧成功估计F/H（只在纯视觉阶段才进行），则使用其得到的旋转变换矩阵。其实在IMU初始化成功后也可以每帧估计F/H，但是这种情况下还是更信任IMU积分的运动个预测
+            if((!USE_IMU || !IMU_init_succ) && (has_valid_F || has_valid_H))
+            {
+                R_12 = R_from_E;
+                // 注意，这里也要用来自F/H的旋转运动估计值来推导当前帧姿态的新预测值！它会影响后面的P_12！
+                Rs_c2 = Rs_c1 * R_12;
+            }
+            else
+                R_12 = Rs_c2.transpose()*Rs_c1;
+            
             P_12 = Rs_c2.transpose()*(Ps_c1 - Ps_c2);
             prev_sta_obj = true;
         }
     }
+
     // 计算两个匹配点集合之间的匹配程度
     // 这里的has_pred_motion包含了无法得知上一帧背景中的漏检物体是否运动，根据此函数调用者给定的值来决定是否使用相机运动来进行3D点的变换
     vector<float> dist;
@@ -10326,7 +16388,7 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
         // 默认如果使用特征点匹配进行关联，则给定的都是特征点的归一化平面坐标
         bool is_pixel = !use_fea;
         outliers = calcu_2d_3d_pts_dist(dist, is_pixel, match_pts_of_prev_obj[match_index].first, ave_depth, match_pts_of_prev_obj[match_index].second, true, true, 
-                                        P_12, R_12, dep_match_pts_of_prev_obj[match_index].first, dep_match_pts_of_prev_obj[match_index].second, cal_ave_depth_prev_pts);
+                                        P_12, R_12, dep_match_pts_of_prev_obj[match_index].first, dep_match_pts_of_prev_obj[match_index].second, cal_ave_dep, cal_ave_depth_prev_pts);
         // 如果当前背景点和上一帧的物体点一样比较集中(2D以及3D），且速度模型的预测点与匹配点的平均3D距离小于阈值
         // 2D点的分布方差会跟成像距离有关，而3D的分布方差不受距离影响。
         //if (dist[1] < 1.4 * dist[0] && dist[3] < 1.25 * dist[2] && dist[2] < 6 && dist[4] < AVE_DIST_3D_PTS_THRES)
@@ -10337,15 +16399,62 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
         bool valid = false;
         if(dist.size() == 2)
         {
-            if(min(dist[1],dist[0]) > 0 && max(dist[1],dist[0])/min(dist[1],dist[0]) < factor_fea*1.35) valid = true;
+            if(min(dist[1],dist[0]) > 0 && max(dist[1],dist[0])/min(dist[1],dist[0]) < factor_fea*1.35) 
+                valid = true;
+            else
+            {
+                if(prev_sta_obj)
+                {
+                    cout << "For prev global static obj " << id_checked_prev_obj << " cannot pass static check in objs-matching!" << endl;
+                    cout  << "2D dist simi: " << max(dist[1],dist[0])/min(dist[1],dist[0]) << endl;
+                }
+            }
+        }
+        else if(dist.size() == 4)
+        {
+            if(min(dist[1],dist[0]) > 0 && min(dist[3],dist[2]) > 0)
+            {
+                if(max(dist[1],dist[0])/min(dist[1],dist[0]) < factor_fea*1.3 && max(dist[3],dist[2])/min(dist[3],dist[2]) < factor_fea*1.5)
+                    valid = true;
+                else
+                {
+                    if(prev_sta_obj)
+                    {
+                        cout << "For prev global static obj " << id_checked_prev_obj << " cannot pass static check in objs-matching!" << endl;
+                        cout  << "2D dist simi: " << max(dist[1],dist[0])/min(dist[1],dist[0]) << ", 3D dist simi: " << max(dist[3],dist[2])/min(dist[3],dist[2]) << endl;
+                    }
+                }
+            }
         }
         else if(dist.size() == 5)
         {
             if(min(dist[1],dist[0]) > 0 && min(dist[3],dist[2]) > 0)
-                if(max(dist[1],dist[0])/min(dist[1],dist[0]) < factor_fea*1.5 && max(dist[3],dist[2])/min(dist[3],dist[2]) < factor_fea*1.4 && dist[4] < factor_fea*AVE_DIST_3D_PTS_THRES)
+            {
+                // 虽然3D物体在不同视角下的投影可能会有一定程度的形变，但这种形变其实相当小；反而是3D点，由于分割mask不精准，远处的背景点可能混入物体点，会导致这里3D点集的差异更大？
+                if(max(dist[1],dist[0])/min(dist[1],dist[0]) < factor_fea*1.3 && max(dist[3],dist[2])/min(dist[3],dist[2]) < factor_fea*1.4 && dist[4] < AVE_DIST_3D_PTS_THRES)
+                {
                     valid = true;
+                }
+                else
+                {
+                    // 3D点集会提前进行基于深度值的外点滤除，在很大程度上会减小3D点集属性的差异。但在计算3D点集属性时仍会进行3D离群点的滤除，而这可能导致两个3D点集的数量不一致，近而导致两者的差异较大！
+                    // 如果3D点集确实有外点（其实应该更精确的条件应该是两个3D点集的外点是否一致），则可以放弃考虑比较单独的3D点集属性，而是直接考虑3D-3D的重投影误差是否足够小！
+                    if(!outliers.empty() && max(dist[1],dist[0])/min(dist[1],dist[0]) < factor_fea*1.3 && dist[4] <= AVE_DIST_3D_PTS_THRES)
+                    {
+                        valid = true;
+                    }
+                    else
+                    {
+                        if(prev_sta_obj)
+                        {
+                            cout << "For prev global static obj " << id_checked_prev_obj << " cannot pass static check in objs-matching!" << endl;
+                            cout  << "2D dist simi: " << max(dist[1],dist[0])/min(dist[1],dist[0]) << ", 3D dist simi: " << max(dist[3],dist[2])/min(dist[3],dist[2]) << ", 3D reproj dist: " << dist[4] << endl;
+                        }
+                    }
+                }
+            }
         }
-
+        
         if(valid)
         {
             // 这里的-1是一种特殊情况，是当前帧多个物体要融合时，验证它们的合集与上一帧物体的匹配关系，并不要求加入匹配结果
@@ -10403,20 +16512,18 @@ bool FeatureTracker::check_match_two_objs(bool use_fea, bool cal_3D_pred_err, ma
     else
     {
         bool is_pixel = !use_fea;
-        // 赋值为-1.0则不会计算物体在当前帧的平均深度
-        if(!cal_ave_depth_prev_pts)
-            ave_depth = -1.0;
         
         // 新物体或上一帧的漏检物体无法进行3D变换预测，则只计算2D和3D匹配点集合的聚集性的相似程度
         outliers = calcu_2d_3d_pts_dist(dist, is_pixel, match_pts_of_prev_obj[match_index].first, ave_depth, match_pts_of_prev_obj[match_index].second, true, false, 
-                            P_12, R_12, dep_match_pts_of_prev_obj[match_index].first, dep_match_pts_of_prev_obj[match_index].second, cal_ave_depth_prev_pts);
+                            P_12, R_12, dep_match_pts_of_prev_obj[match_index].first, dep_match_pts_of_prev_obj[match_index].second, cal_ave_dep, cal_ave_depth_prev_pts);
         //if (dist[1] < 1.4 * dist[0] && dist[3] < 1.25 * dist[2] && dist[2] < 6)
-
+        
         if(dist.empty()) return false;
+        // if(id_checked_prev_obj > 0) cout << "for gl obj " << id_checked_prev_obj << " has num of dist: " << dist.size() << endl;
         bool succ = false;
         if(dist.size() == 2 && max(dist[1],dist[0])/min(dist[1],dist[0]) < factor_fea*1.35) succ = true;
 
-        if (dist.size() == 4 && max(dist[1],dist[0])/min(dist[1],dist[0]) < factor_fea*1.5 && max(dist[3],dist[2])/min(dist[3],dist[2]) < factor_fea*1.4) succ = true;
+        if (dist.size() == 4 && max(dist[1],dist[0])/min(dist[1],dist[0]) < factor_fea*1.35 && max(dist[3],dist[2])/min(dist[3],dist[2]) < factor_fea*1.5) succ = true;
         if(succ)
         {
             // if的原因同上
@@ -10497,8 +16604,8 @@ bool FeatureTracker::check_stat_obj(bool use_fea, map<int, vector<pair<int, Eige
             float cur_x = iter.second[0].second(0,0);
             float cur_y = iter.second[0].second(1,0);
             
-            float prev_x = cur_x - iter.second[0].second(5,0) * (cur_time - prev_time);
-            float prev_y = cur_y - iter.second[0].second(6,0) * (cur_time - prev_time);
+            float prev_x = cur_x - iter.second[0].second(5,0) * cur_dt;
+            float prev_y = cur_y - iter.second[0].second(6,0) * cur_dt;
 
             match_pts_of_prev_obj.emplace_back(prev_x,prev_y);
             match_pts_of_cur_obj.emplace_back(cur_x,cur_y);
@@ -10549,7 +16656,7 @@ bool FeatureTracker::check_stat_obj(bool use_fea, map<int, vector<pair<int, Eige
     bool is_pixel = !use_fea;
 
     outliers_3D_reproj = calcu_2d_3d_pts_dist(dist, is_pixel, match_pts_of_prev_obj, ave_depth_cur, match_pts_of_cur_obj, true, true, 
-                        P_12, R_12, dep_pts_of_prev_obj, dep_pts_of_cur_obj);
+                        P_12, R_12, dep_pts_of_prev_obj, dep_pts_of_cur_obj, true);
     // 如果当前背景点和上一帧的物体点一样比较集中(2D以及3D），且速度模型的预测点与匹配点的平均3D距离小于阈值
     // 2D点的分布方差会跟成像距离有关，而3D的分布方差不受距离影响。
     //if (dist[1] < 1.4 * dist[0] && dist[3] < 1.25 * dist[2] && dist[2] < 6 && dist[4] < AVE_DIST_3D_PTS_THRES)
@@ -10559,8 +16666,17 @@ bool FeatureTracker::check_stat_obj(bool use_fea, map<int, vector<pair<int, Eige
     // 如果没有3D重投影距离误差，则不认为是静态物体
     if(dist.size() == 5)
     {
-        if(max(dist[1],dist[0])/min(dist[1],dist[0]) < factor_fea*1.5 && max(dist[3],dist[2])/min(dist[3],dist[2]) < factor_fea*1.35 && dist[4] < factor_fea*AVE_DIST_3D_PTS_THRES)
+        if(max(dist[1],dist[0])/min(dist[1],dist[0]) < factor_fea*1.30 && max(dist[3],dist[2])/min(dist[3],dist[2]) < factor_fea*1.4 && dist[4] < AVE_DIST_3D_PTS_THRES)
             valid = true;
+        else
+        {
+            // 3D点集会提前进行基于深度值的外点滤除，在很大程度上会减小3D点集属性的差异。但在计算3D点集属性时仍会进行3D离群点的滤除，而这可能导致两个3D点集的数量不一致，近而导致两者的差异较大！
+            // 如果3D点集确实有外点（其实应该更精确的条件应该是两个3D点集的外点是否一致），则可以放弃考虑比较单独的3D点集属性，而是直接考虑3D-3D的重投影误差是否足够小！
+            if(!outliers_3D_reproj.empty() && max(dist[1],dist[0])/min(dist[1],dist[0]) < factor_fea*1.30 && dist[4] <= AVE_DIST_3D_PTS_THRES)
+            {
+                valid = true;
+            }
+        }
     }
     
     if(valid)
@@ -10587,7 +16703,6 @@ bool FeatureTracker::check_stat_obj(bool use_fea, map<int, vector<pair<int, Eige
         return false;
 }
 
-
 // 根据上一帧采样的像素点 和 两帧之间的flow_map图，找到当前帧中的匹配点。
 // 有一种情况会导致前后两帧图像中某物体的特征点或像素点的匹配都比较少：目标汽车在前后两帧中发生较大的旋转，比如路口的掉头。
 // 这时就需要相机的频率足够高！或者在运动模型中考虑到物体在具体场景下可能的运动（根据汽车的转向灯），比如物体可能会调转方向等。本工作中暂时不考虑这些，如果匹配不到，就当作新物体出现吧！
@@ -10609,10 +16724,32 @@ int FeatureTracker::track_pixels_one_prev_obj(int prev_glob_obj_id, const cv::Ma
         Vec2b pt_info;
         // 注意，上一帧保存的三维像素点中，x和y是像素坐标，而z为深度值（注意不是视差值！）
         Point3f pts1;
-
         int obj_id;
+
+        vector<uchar> is_outlier_pixel(total_pixel,0);
+        // 是否要排除所有采样像素点中的深度异常值？
+        {
+            vector<float> dep_pts;
+            float ave_dep;
+            set<int> outliers;
+            for(int i = 0; i < total_pixel; ++i)
+            {
+                dep_pts.push_back(ptr_pixel[i*3+2]);
+            }
+
+            use_MAD_to_filter_dep_outlier(dep_pts, outliers, ave_dep, true);
+            if(!outliers.empty())
+            {
+                for(auto &it: outliers)
+                    is_outlier_pixel[it] = 1;
+            }
+        }
+
         for (int i = 0; i < total_pixel; ++i)
         {   
+            // 上一帧的像素点集的深度值的外点
+            if(is_outlier_pixel[i]) continue;
+
             pts1.x = ptr_pixel[i*3];
             pts1.y = ptr_pixel[i*3+1];
             pts1.z = ptr_pixel[i*3+2];
@@ -10678,7 +16815,7 @@ int FeatureTracker::track_pixels_one_prev_obj(int prev_glob_obj_id, const cv::Ma
                 // }
             }
             
-            int obj_id = (int)pt_info[1];
+            obj_id = (int)pt_info[1];
             // cout << "find matched pixel for obj " << obj_id <<endl;
             // 此时加入的点为像素坐标，后续如果使用这些点，需要先去畸变并转换到归一化平面坐标
             
@@ -10686,6 +16823,9 @@ int FeatureTracker::track_pixels_one_prev_obj(int prev_glob_obj_id, const cv::Ma
             // match_pts[obj_id].second.emplace_back(x_match, y_match);
             // match_pts_depth[obj_id].first.push_back(pts1.z);
             // match_pts_depth[obj_id].second.push_back(depth);
+
+
+            // todo:是否对所有跟踪点在当前帧中的深度排除异常点？？可以不用，这里像素点的匹配只是用于检测两个物体是否相关联，不会具体用于判断该物体是否为静态（需要较精确的flow和stereo匹配）
 
             if(match_pts.find(obj_id) == match_pts.end())
             {
@@ -10816,8 +16956,16 @@ bool FeatureTracker::match_score_two_objs(const int id_checked_prev_obj, const v
             // 如果上一帧对应的物体为已有的静态物体(1)或者背景点（可能是两帧间的背景点关联；也可能是上一帧背景中的漏检物体的一些散落在背景中的特征点关联到了当前帧的某物体，但是我们无法得知该物体是否运动，因此需要此函数调用着给定has_pred_motion的值）
             else if(has_motion_cam)
             {
-                R_12 = Rs_c2.transpose()*Rs_c1;
-                P_12 = Rs_c2.transpose()*(Ps_c1 - Ps_c2);
+                // P_12 = Rs_c2.transpose()*(Ps_c1 - Ps_c2);
+                P_12 = P_cam_motion;
+
+                if((!USE_IMU || !IMU_init_succ) && (has_valid_F || has_valid_H))
+                    R_12 = R_from_E;
+                else
+                {
+                    // R_12 = Rs_c2.transpose()*Rs_c1;
+                    R_12 = R_cam_motion;
+                }
             }
         }
         vector<float> dist;
@@ -10881,9 +17029,9 @@ bool FeatureTracker::match_score_two_objs(const int id_checked_prev_obj, const v
 
 // 给定图像平面上的2d像素点集，计算这些点之间的距离均方差。如果是给定两个互相配对的点集以及它们的深度值和刚体转换矩阵，则计算变换后的平均3D点距离。
 // 默认depth_map中保存的是disparity值，需要转换成深度值。pts_depth_中保存的则是深度值
-set<int> FeatureTracker::calcu_2d_3d_pts_dist(vector<float> &dist, bool pixel_pt, vector<Vec2f> &pts1, float &ave_depth_cur, vector<Vec2f> &pts2, 
+set<int> FeatureTracker::calcu_2d_3d_pts_dist(vector<float> &dist, bool pixel_pt, vector<Vec2f> &pts1, float &ave_depth, vector<Vec2f> &pts2, 
                                             bool cal_pts_var, bool cal_ave_3d_dist, const Vector3d &p_obj12, const Matrix3d &r_obj12, 
-                                            const vector<float> &pts_depth_1, const vector<float> &pts_depth_2, const bool &cal_ave_depth_prev_pts)
+                                            const vector<float> &pts_depth_1, const vector<float> &pts_depth_2, const bool &cal_ave_dep, const bool &cal_ave_depth_prev_pts)
 {
     if (!dist.empty()) dist.clear();
     int num_1 = pts1.size();
@@ -10914,36 +17062,76 @@ set<int> FeatureTracker::calcu_2d_3d_pts_dist(vector<float> &dist, bool pixel_pt
             // 是否在计算中心点时就把这个极端的点去除？例如利用mean_shift来寻找中心点？
             // 应该不需要，当绝大部分点比较聚集，而异常点数量很少且其偏离程度足够大时，即使使用它来计算出中心点，后续也还是可以用MAD来去除这些点！但是假如本身点集的大部分点不够集中，则也不会出现某些所谓的异常值！
             // cal_centre_and_dist_pts(pts1, outliers_pts, dist_pts1, factor_, false, cent_pts);
-            normalized_stderr = cal_rubust_norm_stderr_pts_dist(dist_pts, true, pts1, factor_, outliers_pts, false, cent_pts);
+            normalized_stderr = cal_rubust_norm_stderr_pts_dist(dist_pts, true, pts1, factor_, outliers_pts, false, cent_pts, true, true);
             dist.push_back(normalized_stderr);
         }
         
         if (num_2 >= 3)
         {
             // cal_centre_and_dist_pts(pts2, outliers_pts, dist_pts1, factor_, false, cent_pts);
-            normalized_stderr = cal_rubust_norm_stderr_pts_dist(dist_pts, true, pts2, factor_, outliers_pts, false, cent_pts);
+            normalized_stderr = cal_rubust_norm_stderr_pts_dist(dist_pts, true, pts2, factor_, outliers_pts, false, cent_pts, true, true);
             dist.push_back(normalized_stderr);
         }
+    }
+
+    if(!outliers_pts.empty())
+    {
+        cout << "Found " << outliers_pts.size() << " outliers in 2D fea of given pair of matched objs!" << endl;
+        outliers_pts.clear();
     }
 
     // 计算3D点的属性
     if (num_1 >= 3 && pts_depth_1.size() == num_1 && (cal_pts_var || cal_ave_3d_dist))
     {
-        // 默认如果pts2如果不为空，则其必须与pts1是点数相同且一一配对的。因为如果不是匹配点对的话，那这里用于比较两个点集的属性是没有意义的！
-        bool has_pts2 = (num_1 == num_2) && (num_2 == pts_depth_2.size());
-        if (ave_depth_cur != -1.0)
+        int num_3D_pts1 = 0, num_3D_pts2 = 0, num_3D_3D = 0;
+        // 要求计算物体在前一帧或当前帧的平均深度值
+        if(cal_ave_dep)
         {
-            float sum;
+            float sum = 0.0;
+            int num_3D = 0;
             if (!cal_ave_depth_prev_pts)
             {
                 // 默认pts2是当前帧的点，而pts1是上一帧的点
-                sum = std::accumulate(pts_depth_2.begin(), pts_depth_2.end(), 0.0); 
-                ave_depth_cur = sum/pts_depth_2.size();
+
+                // 注意，给定的pts1或pts2不一定都是有深度的点！！！
+                // sum = std::accumulate(pts_depth_2.begin(), pts_depth_2.end(), 0.0); 
+                // ave_depth = sum/pts_depth_2.size();
+
+                for(auto &iter: pts_depth_2)
+                {
+                    if(iter > 0)
+                    {
+                        ++num_3D_pts2;
+                        sum += iter;
+                    }
+                }
+                
+                if(num_3D_pts2 > 0) 
+                {
+                    ave_depth = sum/num_3D_pts2;
+                    // 默认如果pts1或pts2的一对关联点中有一个是3D点，则另一个一定也是3D点！
+                    num_3D_3D = num_3D_pts2;
+                }
             }
             else
             {
-                sum = std::accumulate(pts_depth_1.begin(), pts_depth_1.end(), 0.0); 
-                ave_depth_cur = sum/pts_depth_1.size();
+                // sum = std::accumulate(pts_depth_1.begin(), pts_depth_1.end(), 0.0); 
+                // ave_depth = sum/pts_depth_1.size();
+                
+                for(auto &iter: pts_depth_1)
+                {
+                    if(iter > 0)
+                    {
+                        ++num_3D_pts1;
+                        sum += iter;
+                    }
+                }
+                
+                if(num_3D_pts1 > 0) 
+                {
+                    ave_depth = sum/num_3D_pts1;
+                    num_3D_3D = num_3D_pts1;
+                }
             }
         }
 
@@ -10956,144 +17144,175 @@ set<int> FeatureTracker::calcu_2d_3d_pts_dist(vector<float> &dist, bool pixel_pt
         }
         
         vector<Vec3f> tmp_pts1, tmp_pts2;
+        vector<int> l_id_pts;
         vector<float> dist_transf;
         Vec3d cent_pts_1(0,0,0), cent_pts_2(0,0,0);
         float depth_1, depth_2;
         float var_pts_1 = 0, var_pts_2 = 0;
 
+        // 默认如果pts2如果不为空，则其必须与pts1是点数相同且一一配对的。因为如果不是匹配点对的话，那这里用于比较两个点集的属性是没有意义的！
+        bool has_pts2 = (num_1 == num_2) && (num_2 == pts_depth_2.size());
         bool cal_3D_repro_err = has_pts2 && cal_ave_3d_dist;
         Vector3d pt1, pt2;
         int num_valid_dep = 0;
-        // 需要给定两个点集之间的刚体位姿变换矩阵！
-        for (int i = 0; i < pts1.size(); ++i)
-        {
-            depth_1 = pts_depth_1[i];
-            depth_2 = pts_depth_2[i];
-            
-            // 最大距离统一采用物体的限制距离
-            if (depth_1 > mMinDepthPt && depth_1 <= mThDepthObj && depth_2 > mMinDepthPt && depth_2 <= mThDepthObj)
-            {
-                ++num_valid_dep;
-                float X_1 = pts1[i](0) * depth_1;
-                float Y_1 = pts1[i](1) * depth_1;
-                Vec3d Pts1(X_1, Y_1, depth_1);
-                
-                tmp_pts1.emplace_back(X_1, Y_1, depth_1);
-                if(cal_pts_var)
-                {
-                    cent_pts_1 += Pts1;
-                    if(has_pts2)
-                    {
-                        float X_2 = pts2[i](0) * depth_2;
-                        float Y_2 = pts2[i](1) * depth_2;
-                        Vec3d Pts2(X_2,Y_2,depth_2);
-                        tmp_pts2.emplace_back(X_2,Y_2,depth_2);
-                        cent_pts_2 += Pts2;
 
-                        // 3D点运动转换后的平均距离
-                        if (cal_3D_repro_err)
+        // 如果先前没有统计过3D-3D点数，或者点数不小于3，则这里进行3D点集属性的计算，并且计算3D点重投影距离
+        if(ave_depth == -1.0 || num_3D_3D >= 3)
+        {
+            // 需要给定两个点集之间的刚体位姿变换矩阵！
+            for (int i = 0; i < num_1; ++i)
+            {
+                // 2D点集的外点不用来参与3D点集的计算？
+                if(outliers_pts.find(i) != outliers_pts.end()) continue;
+
+                depth_1 = pts_depth_1[i];
+                depth_2 = pts_depth_2[i];
+                
+                // 最大距离统一采用物体的限制距离
+                // 该点在当前帧的深度允许比阈值再小一些，因为上一帧该点深度可能比较接近mMinDepthPt
+                // if (depth_1 >= mMinDepthPt && depth_1 <= mThDepthObj && depth_2 >= mMinDepthPt && depth_2 <= mThDepthObj)
+                if (depth_1 > 1.5 && depth_1 <= mThDepthObj && depth_2 >= 1.5 && depth_2 <= mThDepthObj)
+                {
+                    ++num_valid_dep;
+                    float X_1 = pts1[i](0) * depth_1;
+                    float Y_1 = pts1[i](1) * depth_1;
+                    Vec3d Pts1(X_1, Y_1, depth_1);
+                    
+                    tmp_pts1.emplace_back(X_1, Y_1, depth_1);
+                    l_id_pts.push_back(i);
+                    if(cal_pts_var)
+                    {
+                        cent_pts_1 += Pts1;
+                        if(has_pts2)
                         {
-                            cv::cv2eigen(Pts1,pt1);
-                            cv::cv2eigen(Pts2,pt2);
-                            float dist_tranff_3d = ((r_obj12 * pt1 + p_obj12) - pt2).norm();
-                            dist_transf.push_back(dist_tranff_3d);
+                            float X_2 = pts2[i](0) * depth_2;
+                            float Y_2 = pts2[i](1) * depth_2;
+                            Vec3d Pts2(X_2,Y_2,depth_2);
+                            tmp_pts2.emplace_back(X_2,Y_2,depth_2);
+                            cent_pts_2 += Pts2;
+
+                            // 3D点运动转换后的平均距离
+                            if (cal_3D_repro_err)
+                            {
+                                cv::cv2eigen(Pts1,pt1);
+                                cv::cv2eigen(Pts2,pt2);
+                                float dist_tranff_3d = ((r_obj12 * pt1 + p_obj12) - pt2).norm();
+                                dist_transf.push_back(dist_tranff_3d);
+                            }
                         }
                     }
                 }
             }
-        }
+            
+            // 3D点集合 和 2D点集合 不完全相同，因此不能将2D点集合的外点来筛选3D点集
+            // 此外，默认检测物体的2D点集是没有异常离群点的（因为都是在一个mask内采样），除非是背景区域漏检点集或者多个物体的融合？？
+            // if(!outliers_pts.empty()) outliers_pts.clear();
 
-        // 3D点集的分布方差
-        if (cal_pts_var)
-        {
-            if(num_valid_dep > 0)
+            bool has_3D_pts = true;
+            set<int> outliers_3D;
+
+            // 3D点集的分布方差
+            if (cal_pts_var)
             {
-                // outliers_pts.clear();
-                // cent_pts_1 = cent_pts_1 / num_1;
-                cent_pts_1 = cent_pts_1 / num_valid_dep;
-                Vec3f cent1(cent_pts_1[0],cent_pts_1[1],cent_pts_1[2]);
-
-                // cal_centre_and_dist_pts(tmp_pts1, outliers_pts, dist_pts1, 1.0, true, cent);
-                // 注意3D距离均为米制单位，其均值与方差都应该不会很大！
-                // 3D距离的方差不需要进行归一化（即除以距离的均值），因为刚体上的相同两点的距离是不会改变的！
-                normalized_stderr = cal_rubust_norm_stderr_pts_dist(dist_pts, true, tmp_pts1, 1.0, outliers_pts, true, cent1, false);
-
-                dist.push_back(normalized_stderr);
-
-                if(has_pts2) 
-                {   
-                    cent_pts_2 = cent_pts_2 / num_valid_dep;
-                    Vec3f cent2(cent_pts_2[0],cent_pts_2[1],cent_pts_2[2]);
-                    normalized_stderr = cal_rubust_norm_stderr_pts_dist(dist_pts, true, tmp_pts2, 1.0, outliers_pts, true, cent2, false);
-                    dist.push_back(normalized_stderr);
-                }
-            }
-        }
-
-        if (cal_3D_repro_err) 
-        {
-            if(num_valid_dep > 0)
-            {
-                // 记得初始化这些变量
-                Vec3f cent(0.0,0.0,0.0);
-                float ave_3d_dist = 0.0;
-                int num_valid_3d = 0;
-                // 3D距离的方差不需要进行归一化（即除以距离的均值）
-                normalized_stderr = cal_rubust_norm_stderr_pts_dist(dist_transf, false, tmp_pts1, 1.0, outliers_pts, false, cent, false, false);
-                if(outliers_pts.empty())
+                // 单个检测物体的fea应该是不会再出现异常离群3D点的，除非是背景处的漏检点或者多个物体的融合!
+                if(num_valid_dep > 2)
                 {
-                    ave_3d_dist = std::accumulate(dist_transf.begin(), dist_transf.end(), 0.0);
-                    num_valid_3d = num_valid_dep;
-                }
-                else
-                {
+                    cent_pts_1 = cent_pts_1 / num_valid_dep;
+                    Vec3f cent1(cent_pts_1[0],cent_pts_1[1],cent_pts_1[2]);
 
-                    for(int n = 0; n < num_valid_dep; ++n)
+                    // cal_centre_and_dist_pts(tmp_pts1, outliers_3D, dist_pts1, 1.0, true, cent);
+                    // 注意3D距离均为米制单位，其均值与方差都应该不会很大！
+                    // 3D距离的方差不需要进行归一化（即除以距离的均值），因为刚体上的相同两点的距离是不会改变的！
+                    // 注意，outliers_3D的元素是可以在两个点集中累积的，即pts1中的外点在下面计算pts2点集属性时也不会被采用！！两者的所有外点在之后计算重投影误差时也不会被使用！
+                    normalized_stderr = cal_rubust_norm_stderr_pts_dist(dist_pts, true, tmp_pts1, 1.0, outliers_3D, true, cent1, true);
+
+                    if(normalized_stderr > 0.0)
                     {
-                        if(outliers_pts.find(n) != outliers_pts.end()) continue;
-                        ave_3d_dist += dist_transf[n];
-                        ++num_valid_3d;
+                        dist.push_back(normalized_stderr);
+                        
+                        if(has_pts2) 
+                        {   
+                            // cent_pts_2 = cent_pts_2 / num_valid_dep;
+                            // Vec3f cent2(cent_pts_2[0],cent_pts_2[1],cent_pts_2[2]);
+                            Vec3f cent2;
+                            int orig_num_out = outliers_3D.size();
+                            // 计算pts1的3D点集的属性时，可以排除一些外点；但在即计算pts2点集的属性时就不应该再进一步排除外点了，否则两个3D点集的个数都不同，其分布自然就不同了！
+                            // 如果两个点集的3D属性差别较大，有可能就是点数不一致了，但是两个剩下的有效3D-3D关联点可以计算重投影误差，只以这个重投影误差来衡量两个物体在3D空间的相关相似性！
+                            normalized_stderr = cal_rubust_norm_stderr_pts_dist(dist_pts, true, tmp_pts2, 1.0, outliers_3D, false, cent2, true);
+                            
+                            // 如果两个3D点集最终的数量不一致，是要还要保留两个3D点集的属性值？保留，是否采用则留到判断步骤再决定
+                            // if(normalized_stderr > 0.0 && outliers_3D.size() > orig_num_out)
+                            if(normalized_stderr > 0.0)
+                            {
+                                dist.push_back(normalized_stderr);
+                            }
+                            else
+                            {
+                                has_3D_pts = false;
+                                dist.pop_back();
+                            }
+                        }
+                    }
+                    else
+                    {
+                        has_3D_pts = false;
                     }
                 }
-                if(num_valid_3d > 0)
-                    dist.push_back(ave_3d_dist/num_valid_3d);
+            }
+            
+            if(cal_3D_repro_err && has_3D_pts) 
+            {
+                int num_out_3D = outliers_3D.size();
+                if((num_valid_dep - num_out_3D) >= 2)
+                {
+                    // 保留pts1和pts2的3D点集中的外点，它们不参与重投影误差的计算
+                    // outliers_3D.clear();
+                    
+                    Vec3f cent(0,0,0);
+                    float ave_3d_dist = 0.0;
+                    int num_valid_3d = 0;
+                    
+                    // 需要去除因tmp_pts1或tmp_pts2中的外点导致的dist_transf中的无效点
+                    if(num_out_3D > 0)
+                    {
+                        vector<uchar> status_3D_pts(num_valid_dep,1);
+                        for(auto &it: outliers_3D) status_3D_pts[it] = 0;
+
+                        reduceVector(dist_transf, status_3D_pts);
+                    }
+                    
+                    // 3D距离的方差不需要进行归一化（即除以距离的均值)。tmp_pts1和cent不参与下面计算，只是占用参数，只有dist_transf参与计算
+                    // 是否要多次排除外值？
+                    normalized_stderr = cal_rubust_norm_stderr_pts_dist(dist_transf, false, tmp_pts1, 1.0, outliers_3D, true, cent, false, false, false, true);
+                    
+                    // 3D重投影误差应该不需要计算重投影了，因为上面把每个3D点集的离群点排除了，剩下的匹配点就不再排除！
+                    if(outliers_3D.empty())
+                    {
+                        ave_3d_dist = std::accumulate(dist_transf.begin(), dist_transf.end(), 0.0);
+                        num_valid_3d = num_valid_dep;
+                    }
+                    else
+                    {
+                        for(int n = 0; n < num_valid_dep; ++n)
+                        {
+                            if(outliers_3D.find(n) != outliers_3D.end()) 
+                            {
+                                int l_id = l_id_pts[n];
+                                outliers_pts.insert(l_id);
+                                continue;
+                            }
+                            ave_3d_dist += dist_transf[n];
+                            ++num_valid_3d;
+                        }
+                    }
+
+                    if(num_valid_3d > 0)
+                        dist.push_back(ave_3d_dist/num_valid_3d);
+                }
             }
         }
     }
     return outliers_pts;
-}
-
-int FeatureTracker::check_flow_with_F(const Matrix3d &cam_F, const Point2f &pt1, const Point2f &pt2)
-{
-    // 静态点需要离预测的极线不能太远
-    // 极线的参数
-    float a = cam_F(0,0) * pt1.x + cam_F(0,1) * pt1.y + cam_F(0,2);
-    float b = cam_F(1,0) * pt1.x + cam_F(1,1) * pt1.y + cam_F(1,2);
-    float c = cam_F(2,0) * pt1.x + cam_F(2,1) * pt1.y + cam_F(2,2);
-
-    float num = a * pt2.x + b * pt2.y + c;
-
-    float den = a * a + b * b;
-
-    // F矩阵无效，一般是因为相机位移t为0? 也有可能是误差造成的
-    if(den != 0) 
-    {
-        // 点到线的距离 的平方
-        float dsqr = num*num/den;
-        
-        // 如何设定这个距离阈值？越近的点，其绝对匹配误差就会越大，但是相对地，相同的绝对误差所造成的深度或位移的估计绝对误差越小
-        // 由于这是预测的运动构成的极线，精度不高，所以不应该限制太大
-        if(dsqr > Th_epipolar_con * Th_epipolar_con) 
-        {
-            return -1;
-        }
-        else
-        {
-            return 1;
-        }
-    }
-    else
-        return 0;
 }
 
 // 分解E矩阵来得到两帧之间的R和t。其中t不具有真实尺度，且其取正或负得到的E是等价的（即E和-E都可以满足极线约束）；而R也有2个解。
@@ -11171,86 +17390,142 @@ void FeatureTracker::DecomposeE(const Mat &E, Mat &R1, Mat &R2, Mat &t)
 //     return valid_F;
 // }
 
-
-// 用H矩阵排除不是该平面或者视差太大的点
-bool FeatureTracker::HomographyConstrain(vector<Point2f> &kp1, vector<Point2f> &kp2, const Eigen::Matrix3d& Mat_H, const Eigen::Matrix3d& Mat_H_inv, 
-                                            vector<uchar> &is_inlier, const float &Th_score, float &score, const float &Th_dist)
+bool FeatureTracker::check_3D2D_fea_by_reproj(const Vector3d &pt_3D, const Point2f &pt_2D, const Matrix3d &R_motion, const Vector3d &P_motion, const float &Th_err)
 {
-    int num_pts = kp1.size();
-    if(is_inlier.empty()) is_inlier.resize(num_pts, 0);
+    Vector3d pt_3D_proj = R_motion * pt_3D + P_motion;
+    Point2f pt_2D_proj;
+    spaceToPlane(pt_3D_proj, pt_2D_proj, m_camera[0]);
+    if((pt_2D.x - pt_2D_proj.x)*(pt_2D.x - pt_2D_proj.x) + (pt_2D.y - pt_2D_proj.y)*(pt_2D.y - pt_2D_proj.y) > Th_err*Th_err)
+        return false;
+    else
+        return true;
+}
 
-    float proj_x, proj_y, proj_z;
-    float h_00 = Mat_H(0,0);
-    float h_01 = Mat_H(0,1);
-    float h_02 = Mat_H(0,2);
-    float h_10 = Mat_H(1,0);
-    float h_11 = Mat_H(1,1);
-    float h_12 = Mat_H(1,2);
-    float h_20 = Mat_H(2,0);
-    float h_21 = Mat_H(2,1);
-    float h_22 = Mat_H(2,2);
+// 基于现有的3D-2D点，通过重投影误差 检验 估计F/H得到的 旋转运动R 是否可靠！这里意味着相信立体匹配的质量。
+// 同时应该将3D-2D点分为 近点 和 远点，在小旋转时近点的光流长度则一般比远点大（相同的空间位移长度/不同的深度z），在大旋转时近点的光流长度可能反而比不上远点（扇形半径越大，圆弧越大，当这个效应大于逆深度带来的效应，则远点的光流会大于近点）
+// 因此应该分情况考虑这些点中的内点比例，再决定R估计是否可靠！对于旋转较大的情况，近点和远点的平均长度可认为是差不多的；而当旋转较小时，则适当放宽近点的重投影误差阈值（即降低内点的比例要求）
+// todo: 如果上一帧的3D点数较少，是否可以用更早的该点的3D观测（如果该点是旧点）和对应2帧间的运动？
+float FeatureTracker::cal_ave_reproj_err(const Matrix3d &R_motion, const Vector3d &P_motion, const vector<int> &l_id_all_inliers, int &num_3D_2D,
+                                            float &ratio_inlier_reproj, set<int> &outliers, float Th_err_near_pt, float Th_err_far_pt, bool pt_2D_is_pixel)
+{
+    int num_pt = l_id_all_inliers.size();
 
-    // todo: 要计算当前帧投影到上一帧的误差
-    float inv_proj_x, inv_proj_y, inv_proj_z;
-    float inv_h_00 = Mat_H_inv(0,0);
-    float inv_h_01 = Mat_H_inv(0,1);
-    float inv_h_02 = Mat_H_inv(0,2);
-    float inv_h_10 = Mat_H_inv(1,0);
-    float inv_h_11 = Mat_H_inv(1,1);
-    float inv_h_12 = Mat_H_inv(1,2);
-    float inv_h_20 = Mat_H_inv(2,0);
-    float inv_h_21 = Mat_H_inv(2,1);
-    float inv_h_22 = Mat_H_inv(2,2);
+    int num_3D_2D_valid = 0;
+    num_3D_2D = 0;
+    double ave_err = 0.0;
+    float dep_prev;
+    Point2f cur_pt, re_2d_pt;
+    Vector3d pt_in_w, re_pt_in_c;
 
-    // float Th_dist = 2.0;
-    for(int i = 0; i < num_pts; ++i)
+    int l_id, g_id, num_near_pt = 0, num_far_pt = 0;
+
+    for(int i = 0; i < num_pt; ++i)
     {
-        Point2f &prev_pt = kp1[i];
-        Point2f &cur_pt = kp2[i];
+        l_id = l_id_all_inliers[i];
 
-        // prev -> cur_pt
-        proj_x = prev_pt.x * h_00 + prev_pt.y * h_01 + h_02;
-        proj_y = prev_pt.x * h_10 + prev_pt.y * h_11 + h_12;
-        proj_z = prev_pt.x * h_20 + prev_pt.y * h_21 + h_22;
-        if(proj_z == 0)
+        if(l_id <= 0)
         {
-            // is_inlier[i] = 0;
+            cur_pt = cur_sift[-l_id];
+            g_id = ids_sift[-l_id];
+        }
+        else
+        {
+            cur_pt = cur_FAST[(l_id-1)];
+            g_id = ids_FAST[(l_id-1)];
+        }
+
+        if(prev_un_r_Fea_map.find(g_id) == prev_un_r_Fea_map.end())
+        {
             continue;
         }
-        proj_x = proj_x/proj_z;
-        proj_y = proj_y/proj_z;
 
-        float dist = (proj_x - cur_pt.x) * (proj_x - cur_pt.x) + (proj_y - cur_pt.y) * (proj_y - cur_pt.y);
+        Vec4f &p_un_p = prev_un_Fea_map[g_id];
+        Vec4f &p_un_p_r = prev_un_r_Fea_map[g_id];
 
-        // cur_pt -> prev_pt
-        inv_proj_x = cur_pt.x * inv_h_00 + cur_pt.y * inv_h_01 + inv_h_02;
-        inv_proj_y = cur_pt.x * inv_h_10 + cur_pt.y * inv_h_11 + inv_h_12;
-        inv_proj_z = cur_pt.x * inv_h_20 + cur_pt.y * inv_h_21 + inv_h_22;
-        if(inv_proj_z == 0)
+        float disp_x_un = p_un_p(0) - p_un_p_r(0);
+        if(disp_x_un <= 0)
         {
-            // is_inlier[i] = 0;
+            cout << "Weired! Line 16892" << endl;
+            exit(-1);
+        }
+
+        ++num_3D_2D;
+
+        dep_prev = mbf/disp_x_un/FOCAL_LENGTH_X;
+
+        pt_in_w(0) = p_un_p(0) * dep_prev;
+        pt_in_w(1) = p_un_p(1) * dep_prev;
+        pt_in_w(2) = dep_prev;
+
+        re_pt_in_c = R_motion * pt_in_w + P_motion;
+        // 可能是运动估计的问题，也可能是该点深度估计的问题
+        if(re_pt_in_c(2) <= 0)
+        {
+            // cout << "Weired! Line 14077" << endl;
+            // exit(-1);
             continue;
         }
-        inv_proj_x = inv_proj_x/inv_proj_z;
-        inv_proj_y = inv_proj_y/inv_proj_z;
 
-        float inv_dist = (inv_proj_x - prev_pt.x) * (inv_proj_x - prev_pt.x) + (inv_proj_y - prev_pt.y) * (inv_proj_y - prev_pt.y);
+        spaceToPlane(re_pt_in_c, re_2d_pt, m_camera[0]);
 
-        // 这里Th_dist其实是允许距离误差阈值的平方
-        if(dist < Th_dist && inv_dist < Th_dist) 
+        double err = (cur_pt.x - re_2d_pt.x)*(cur_pt.x - re_2d_pt.x) + (cur_pt.y - re_2d_pt.y)*(cur_pt.y - re_2d_pt.y);
+
+        // 如果给定的2D点是归一化平面上的点距离(m制）误差阈值
+        if(!pt_2D_is_pixel) err = err/FOCAL_LENGTH_X/FOCAL_LENGTH_X;
+
+        if(dep_prev < 15.0)
         {
-            is_inlier[i] = 1;
-            score += (Th_score - dist);
-            score += (Th_score - inv_dist);
+            if(err < Th_err_near_pt)
+            {
+                ave_err += err;
+                ++num_3D_2D_valid;
+                // ++num_near_pt;
+            }
+            else
+            {
+                if(err >= 3*Th_err_near_pt)
+                {
+                    outliers.insert(l_id);
+                }
+            }
+        }
+        else
+        {
+            if(err < Th_err_far_pt)
+            {
+                ave_err += err;
+                ++num_3D_2D_valid;
+                // ++num_far_pt;
+            }
+            else
+            {
+                if(err >= 3*Th_err_near_pt)
+                {
+                    outliers.insert(l_id);
+                }
+            }
         }
     }
     
-    return true;
+    // 单位从m转为cm或像素距离
+    if(num_3D_2D_valid > 0) 
+    {
+        if(!pt_2D_is_pixel)
+            ave_err = ave_err/num_3D_2D_valid * 10000;
+        else
+            ave_err = ave_err/num_3D_2D_valid;
+    }
+    
+    // 给定跟踪点集中的3D-2D点中的重投影内点比例
+    ratio_inlier_reproj = num_3D_2D_valid*1.0/num_3D_2D;
+
+    // 返回内点的平均误差
+    return ave_err;
 }
 
 // 根据对极约束估计F矩阵，并筛除其中的异常匹配点。
 // 如果是已知相机大概的运动变换T，则可以用已知的F来排除原理极线的当前匹配点
-void FeatureTracker::rejectWithFV1(bool for_sift, bool init_succ_IMU, const set<int> &pts_for_F)
+void FeatureTracker::rejectWithFV1(bool for_sift, const set<int> &pts_for_F)
 {
     if(for_sift)
         printf("FM ransac for sift begins\n");
@@ -11315,7 +17590,6 @@ void FeatureTracker::rejectWithFV1(bool for_sift, bool init_succ_IMU, const set<
         vector<uchar> status_fea;
         vector<cv::Point2f> prev_pts_match, cur_pts_match;
         vector<cv::Point2f> prev_pts_for_F, cur_pts_for_F;
-        Matrix3d F_cam;
 
         vector<int> id_pt_for_epi;
         for(unsigned int i = 0; i < num_track; ++i)
@@ -11333,12 +17607,13 @@ void FeatureTracker::rejectWithFV1(bool for_sift, bool init_succ_IMU, const set<
         // bool has_T = (P_cam_motion.norm() >= 0.05) && (frame_count > 1 || (has_motion_pred_first_two_frame));
         bool has_T = true;
         // 注意，对于纯双目，还是要判断当前帧是否有位移的，否则下面无法估计F和利用F。纯双目可以使用恒速模型
-        if(!USE_IMU || init_succ_IMU)
+        if(!USE_IMU || IMU_init_succ)
             has_T = (P_cam_motion.norm() >= 0.05);
 
-        bool use_ransac = EASI_RANSAC_FH && has_T;
+        bool use_ransac = ESTI_RANSAC_FH && has_T;
 
         // 考虑旋转较大的情况，此时需要使用sift匹配来获取较好的F矩阵估计
+        
         Quaterniond delta_Q(R_cam_motion);
         double delta_angle = acos(delta_Q.w()) * 2.0 / 3.1416 * 180.0;
         if (delta_angle >= 2.0)
@@ -11435,7 +17710,8 @@ void FeatureTracker::rejectWithFV1(bool for_sift, bool init_succ_IMU, const set<
                     float score;
                     int num_pt = cur_pts_match.size();
                     vector<uchar> is_inlier(num_pt, 0);
-                    bool valid_F = epipolarConstrain(prev_pts_match, cur_pts_match, F_cam, is_inlier, 5.0, score);
+                    int has_outlier = 0;
+                    bool valid_F = epipolarConstrain(prev_pts_match, cur_pts_match, F_cam, is_inlier, 5.0, score, has_outlier);
                     if(valid_F)
                     {
                         for(int i = 0; i < num_pt; ++i)
@@ -11573,7 +17849,7 @@ void FeatureTracker::rejectWithFV1(bool for_sift, bool init_succ_IMU, const set<
 }
 
 // sift和FAST跟踪点一起用来估计F矩阵，因为sift跟踪点中近处点很少，如果只用sift点估计F矩阵，后续会排除掉很多近处的FAST跟踪点
-void FeatureTracker::rejectWithFV2(bool init_succ_IMU, const set<int> &pts_for_F)
+void FeatureTracker::rejectWithFV2(const set<int> &pts_for_F)
 {   
     TicToc t_f;
     
@@ -11582,15 +17858,49 @@ void FeatureTracker::rejectWithFV2(bool init_succ_IMU, const set<int> &pts_for_F
 
     vector<cv::Point2f> prev_pts_match, cur_pts_match;
     vector<cv::Point2f> prev_pts_for_FH, cur_pts_for_FH;
-    Matrix3d F_cam, H_cam;
 
+    vector<int> l_id_inliers_F, l_id_inliers_H;
+
+    // 这是所有的背景跟踪点
     int num_track_sift = id_bg_track_sift.size();
     int num_track_FAST = id_bg_track_FAST.size();
     int valid_match_sift = num_track_sift;
     int valid_match_FAST = num_track_FAST;
 
+    // check distribution of fea for estimating F or H
+    if(0)
+    {
+        Mat img_for_pts_FH = prev_color_img_l.clone();
+        for(auto &pt: pts_for_cal_F)
+        {
+            if(pt > 0)
+            {
+                int id = pt -1;
+                Point2f &pt = prev_FAST[id];
+                circle(img_for_pts_FH, pt, 4, Scalar(255,0,0), 1, 16);
+            }
+            else
+            {
+                int id = -pt;
+                Point2f &pt = prev_sift[id];
+                circle(img_for_pts_FH, pt, 4, Scalar(0,0,255), 1, 16);
+            }
+        }
+
+        while(true)
+        {
+            cv::imshow("pts for cal FH in prev left image", img_for_pts_FH);
+            // 一直等待用户按下ESC键（ASCI码为27）
+            if(waitKey(0) == 27)
+            {
+                break;
+            }
+        }
+    }
+
     vector<int> pt_id_for_F;
     set<int> pt_id_in_sift, pt_id_in_FAST;
+    // pts_for_F中是部分匹配精度较为靠前的背景跟踪点，还有加入的部分静态物体跟踪点
     for(auto pt_id: pts_for_F)
     {
         if(pt_id <= 0)
@@ -11622,30 +17932,43 @@ void FeatureTracker::rejectWithFV2(bool init_succ_IMU, const set<int> &pts_for_F
     int valid_FAST_F = num_track_FAST;
     int valid_FAST_H = num_track_FAST;
 
+    int total_static_track = (num_track_sift + num_track_FAST);
+
     int num_track_for_F = prev_pts_for_FH.size();
 
-    bool has_T = true;
+    bool has_T = false;
     double delta_angle = 0;
     bool filter_fea = true;
     // 判断当前帧是否有位移，否则下面无法估计F和利用F。纯双目可以使用恒速模型;使用IMU，在VI初始化成功之前用双目的恒速模型，之后用IMU的积分
     if(frame_cnt > 1)
     {
-        cout << "norm of predicted P_cam_motion: " << P_cam_motion.norm() << endl;
-        // 预测的位移至少要5cm
-        has_T = (P_cam_motion.norm() >= 0.05);
-
+        // 预测的位移至少要10cm
+        // 预测的运动值不一定准确(尤其是纯视觉配置），例如，当汽车刚好处于启动或停止瞬间！因此，应该再添加一个条件，即所有静态跟踪点的平均光流长度值大于阈值！
+        // 结合这两种条件可以避免纯视觉条件下 汽车从小运动到近乎停止这种时刻的 误判;但是无法避免由静止到运动瞬间的误判!
+        // 注意，之前只有在根据预测运动值得到 small_p=true(即norm>=0.1) 时才会计算ave_flow_len_sta_fea
+        // 此时即使汽车接近于停下来，最多只是额外估计E或H，根据估计结果会发现汽车接近静止
+        if(ave_flow_len_sta_fea >= 4 || (P_cam_motion.norm() >= 0.1))
+            has_T = true;
+        
         // 考虑旋转较大的情况
-        Quaterniond delta_Q(R_cam_motion);
-        delta_angle = fabs(acos(delta_Q.w()) * 2.0 / 3.1416 * 180.0);
+        if(pred_delta_angle_cam > 0)
+        {
+            delta_angle = pred_delta_angle_cam;
+        }
+        else
+        {
+            Quaterniond delta_Q(R_cam_motion);
+            delta_angle = fabs(acos(delta_Q.w()) * 2.0 / 3.1416 * 180.0);
+        }
 
         if(delta_angle >= 1.5)
         {
             printf(" big delta_angle!\n");
         }
 
-        if(delta_angle < 0.3 && !has_T) 
+        // 如果旋转和位移均很小，即接近静止，则默认不对sift和FAST进行筛选（认为绝大多数跟踪是正确的）？
+        if(delta_angle < 0.25 && !has_T)
         {
-            // 如果旋转和位移均很小，即接近静止，则默认不对sift和FAST进行筛选（认为绝大多数跟踪是正确的）
             // 其实就算没有IMU，也可以使用恒速模型来预估当前帧相机的运动
             // 如果相机静止，则也无法无需估计F或H矩阵
             // filter_fea = false;
@@ -11653,7 +17976,7 @@ void FeatureTracker::rejectWithFV2(bool init_succ_IMU, const set<int> &pts_for_F
             return;
         }
         
-        if(num_track_for_F < 8)
+        if(num_track_for_F < 7)
         {
             cout << "Not enough tracked fea in current frame!" << endl;
             return;
@@ -11661,11 +17984,12 @@ void FeatureTracker::rejectWithFV2(bool init_succ_IMU, const set<int> &pts_for_F
     }
     else if(frame_cnt == 1)
     {
-        // 系统第2帧，只能选择估计H或F矩阵。如果点数太少不足以估计H或F矩阵
-        if(num_track_for_F < 8)
+        // 系统第2帧，只能选择估计H或F矩阵。
+        // 如果点数太少不足，则选择不估计
+        if(num_track_for_F < 7)
         {
             // filter_fea = false;
-            cout << "Not enough tracked fea in the second frame!" << endl;
+            cout << "Not enough tracked fea or too small disparity between first two frames!" << endl;
             return;
         }
     }
@@ -11676,27 +18000,32 @@ void FeatureTracker::rejectWithFV2(bool init_succ_IMU, const set<int> &pts_for_F
     }
 
     bool filter_by_F_from_predict_motion = false;
+    
     bool need_PnP = true;
     if(filter_fea)
     {
-        // 如果使用IMU，且已经完成IMU初始化，且当前帧预测的相机位移不接近0，则可以直接使用IMU的数据构建F矩阵，而不需要进行基于视觉的F或H矩阵的估计
-        if(USE_IMU && init_succ_IMU)
+        // 如果使用IMU，且已经完成IMU初始化，且当前帧预测的相机位移不接近0，则也可以直接使用IMU的数据构建F矩阵，而不需要进行基于视觉的F或H矩阵的估计
+        // 这些条件本身就包含了frame_cnt>1的条件
+        if(USE_IMU && IMU_init_succ)
         {
-            // todo: IMU初始化之后，如果这里采用某种方式过滤了匹配点，则当前帧后续不再需要进行PnP？
-            // 即此处估计H或F，只是为了过滤外点，而不是为了估计R和t的方向？当前帧的相机位姿初值直接用IMU积分来获取
-            // need_PnP = false;
+            // 此外，IMU初始化之后，如果这里采用某种方式过滤了匹配点，则允许当前帧后续不再需要进行PnP
+            // 即此处估计H或F，只是为了过滤外点，而不是为了估计R和t的方向。当前帧的相机位姿初值直接用IMU积分来获取
+            // 该变量由用户决定。但最终是否执行PnP还得由此处是否完成匹配点的过滤来决定
+            need_PnP = use_pnp_after_imu_init;
             
-            // 发现用IMU预测的运动所构建的F矩阵很不精确，应该主要是由于加速度计的零偏导致的误差较大
-            if(filter_by_F_from_predict_motion && has_T)
-                EASI_RANSAC_FH = false;
+            // 发现用IMU预测的运动所构建的F矩阵也不是很准确，应该主要是由于加速度计的零偏导致的误差较大，这对于汽车近乎静止的情况下影响较大
+            // todo:如果使用了IMU，预测运动就算位移很小，只要有旋转R，也可以根据地平面的近似参数 和 R 来构造H矩阵，用以筛选近似地面上的跟踪点？
+            // 对于汽车而言，如果R足够大，那么t应该也不会太小
+            if(filter_by_F_from_predict_motion && (P_cam_motion.norm() >= 0.1))
+                ESTI_RANSAC_FH = false;
             else
             {
                 // 就算没有位移，仍可以估计H矩阵
-                EASI_RANSAC_FH = true;   
+                ESTI_RANSAC_FH = true;   
             }
         }
         else
-            EASI_RANSAC_FH = true;
+            ESTI_RANSAC_FH = true;
     }
     
     vector<uchar> status_fea_F, status_fea_H;
@@ -11706,176 +18035,362 @@ void FeatureTracker::rejectWithFV2(bool init_succ_IMU, const set<int> &pts_for_F
     // 其实如果IMU的标定结果 和 LBA优化有bias的结果都比较好，则这里直接使用IMU的积分来进行筛选也可以
     if(filter_fea)
     {
-        Mat F_tmp, H_tmp;
+        Mat F_tmp, E_tmp, H_tmp;
         Matrix3d H_cam_inv;
 
         float score_F = 0.0, score_H = 0.0;
         vector<Point2f> inliers_prev_F, inliers_cur_F, inliers_prev_H, inliers_cur_H;
         
-        cout << "num_track_for_F: " << num_track_for_F << endl;
+        cout << "num_track_for_E_H: " << num_track_for_F << endl;
 
-        if(EASI_RANSAC_FH)
+        bool est_E = false;
+        bool est_F = false;
+        bool est_H = false;
+
+        if(ESTI_RANSAC_FH)
         {
-            bool est_F = true;
-            bool est_H = true;
+            // 如果明确已知预测的位移太小，则不估计F或E矩阵？
+            if((frame_cnt > 1 && has_T) || (frame_cnt == 1))
+            {
+                // cout << "Start estimate fundamental matrix with fea matching!" << endl;
+                
+                // 使用5点法来估计F矩阵！五点法是将等式转化为等价的三元三次多项式（10个约束等式），构造对应的矩阵等式，发现该等式满足某个特殊约束，最后通过求解某矩阵的特征值分解来求得E矩阵
+                // https://zhuanlan.zhihu.com/p/549057360
+                if(Use_5_pts)
+                {
+                    // 注意，估计E矩阵时给定的点应该是在归一化平面上！这里给的是像素点坐标，同时给了K矩阵，函数内会自动转化为归一化坐标
+                    E_tmp = cv::findEssentialMat(prev_pts_for_FH, cur_pts_for_FH, K_cv, RANSAC, 0.99, F_THRESHOLD, 300, status_fea_F);
 
-            // cout << "Start estimate fundamental matrix with fea matching!" << endl;
-            // cv::FM_RANSAC方法至少需要15对匹配点
-            if(num_track_for_F >= 18)
-                F_tmp = cv::findFundamentalMat(prev_pts_for_FH, cur_pts_for_FH, cv::FM_RANSAC, F_THRESHOLD, 0.99, status_fea_F);
-            else if(num_track_for_F >= 8)
-                // 基于七点法的最小二乘
-                F_tmp = cv::findFundamentalMat(prev_pts_for_FH, cur_pts_for_FH, 4, F_THRESHOLD, 0.99, status_fea_F);
-            else 
-                est_F = false;
+                    est_F = false;
+
+                    est_E = true;
+                }
+                else
+                {
+                    est_E = false;
+
+                    est_F = true;
+
+                    // 八点法的cv::FM_RANSAC方法至少需要15对匹配点
+                    // 八点法是构建线型方程，其误差一般较大。点数较少时更不应该采用八点法，因为此时内点比例较低
+                    if(num_track_for_F >= 18)
+                        F_tmp = cv::findFundamentalMat(prev_pts_for_FH, cur_pts_for_FH, cv::FM_RANSAC, F_THRESHOLD, 0.99, status_fea_F);
+                    else if(num_track_for_F >= 8)
+                        // 基于七点法的最小二乘
+                        F_tmp = cv::findFundamentalMat(prev_pts_for_FH, cur_pts_for_FH, 4, F_THRESHOLD, 0.99, status_fea_F);
+                    else
+                        est_F = false;
+                }
+            }
             
             // cout << "Start estimate homography matrix with fea matching!" << endl;
-            if(num_track_for_F >= 12)
+            bool cal_H = true;
+            if(cal_H)
             {
-                // H_tmp = cv::findHomography(prev_pts_for_FH, cur_pts_for_FH, RANSAC, 3.0, status_fea_H, 250, 0.99);
-                H_tmp = cv::findHomography(prev_pts_for_FH, cur_pts_for_FH, LMEDS, 3.0, status_fea_H, 250, 0.99);
-            }
-            else
-            {
-                // H_tmp = cv::findHomography(prev_pts_for_FH, cur_pts_for_FH, 0, F_THRESHOLD, status_fea_H, 250, 0.99);
-                H_tmp = cv::findHomography(prev_pts_for_FH, cur_pts_for_FH, 0, 3.0, status_fea_H, 250, 0.99);
+                if(num_track_for_F >= 12)
+                {
+                    // 一定能找到满足要求的解吗？不一定，甚至说大部分情况下都找不到满足的解（因为很难有场景是绝大部分的点都在地面上）！
+                    H_tmp = cv::findHomography(prev_pts_for_FH, cur_pts_for_FH, RANSAC, H_THRESHOLD, status_fea_H, 300, 0.99);
+                    // H_tmp = cv::findHomography(prev_pts_for_FH, cur_pts_for_FH, LMEDS, H_THRESHOLD, status_fea_H, 300, 0.99);
+
+                    est_H = true;
+                }
+                else
+                {
+                    H_tmp = cv::findHomography(prev_pts_for_FH, cur_pts_for_FH, 0, H_THRESHOLD, status_fea_H, 300, 0.99);
+
+                    est_H = true;
+                }
             }
             
-            if(est_F || est_H)
+            if((est_E || est_F) || est_H)
             {
-                for(int i = 0; i < num_track_for_F; ++i)
+                // 如果参与F/E/H估计的内点数和内点比例太少，则放弃该估计
+                for(auto iter: status_fea_F)
                 {
-                    int id = pt_id_for_F[i];
+                    if(iter > 0) ++num_inliers_F;
+                }
 
-                    if(est_F)
+                if(num_inliers_F < 0.70 * num_track_for_F || ((est_F && num_inliers_F < 8) || (est_E && num_inliers_F < 6)))
+                {
+                    est_E = false;
+                    est_F = false;
+                }
+                
+                for(auto iter: status_fea_H)
+                {
+                    if(iter > 0) ++num_inliers_H;
+                }
+
+                if(num_inliers_H <= 0.55 * num_track_for_F || num_inliers_H < 6)
+                {
+                    est_H = false;
+                }
+
+                if(est_E || est_F || est_H)
+                {
+                    vector<int> F_inlier_l_id, H_inlier_l_id;
+
+                    for(int i = 0; i < num_track_for_F; ++i)
                     {
-                        if(status_fea_F[i] == 0)
+                        int id = pt_id_for_F[i];
+                        
+                        if(est_E || est_F)
                         {
-                            if(id <= 0)
+                            if(status_fea_F[i] == 0)
                             {
-                                // id = -1 * id;
-                                // status_sift[id] = 0;
-                                
-                                // 注意，参与F或H估计的静态点中，部分是属于上一帧的静态物体，这部分跟踪外点不能被删除！
-                                // 此外，这部分物体跟踪点不在id_bg_track_sift或id_bg_track_FAST中！
-                                invalid_pt_id_F.push_back(id);
-                                --valid_sift_F;
+                                if(id <= 0)
+                                {
+                                    // 注意，参与F或H估计的静态点中，部分是属于上一帧的静态物体，这部分跟踪外点不能被删除！
+                                    // 此外，这部分物体跟踪点不在id_bg_track_sift或id_bg_track_FAST中！
+
+                                    // id = -1 * id;
+                                    // status_sift[id] = 0;
+                                    
+                                    invalid_pt_id_F.push_back(id);
+                                    --valid_sift_F;
+                                }
+                                else
+                                {
+                                    // id -= 1;
+                                    // status_FAST[id] = 0;
+
+                                    invalid_pt_id_F.push_back(id);
+                                    --valid_FAST_F;
+                                }
                             }
                             else
                             {
-                                // id -= 1;
-                                // status_FAST[id] = 0;
+                                inliers_prev_F.push_back(prev_pts_for_FH[i]);
+                                inliers_cur_F.push_back(cur_pts_for_FH[i]);
 
-                                invalid_pt_id_F.push_back(id);
-                                --valid_FAST_F;
+                                F_inlier_l_id.push_back(i);
                             }
+                        }
+                        
+                        if(est_H)
+                        {
+                            if(status_fea_H[i] == 0)
+                            {
+                                if(id <= 0)
+                                {
+                                    invalid_pt_id_H.push_back(id);
+
+                                    --valid_sift_H;
+                                }
+                                else
+                                {
+                                    invalid_pt_id_H.push_back(id);
+
+                                    --valid_FAST_H;
+                                }
+                            }
+                            else
+                            {
+                                ++num_inliers_H;
+                                inliers_prev_H.push_back(prev_pts_for_FH[i]);
+                                inliers_cur_H.push_back(cur_pts_for_FH[i]);  
+
+                                H_inlier_l_id.push_back(i);
+                            }
+                        }
+                    }
+                    
+                    vector<uchar> is_inlier;
+                    
+                    if(est_E || est_F)
+                    {
+                        if(est_F)
+                        {
+                            Mat_F = F_tmp.clone();
+                            cv2eigen(Mat_F, F_cam_by_cal_FE);
                         }
                         else
                         {
-                            ++num_inliers_F;
-                            inliers_prev_F.push_back(prev_pts_for_FH[i]);
-                            inliers_cur_F.push_back(cur_pts_for_FH[i]);
+                            Mat_F = E_tmp.clone();
+                            Matrix3d F_eigen;
+                            cv2eigen(Mat_F, F_eigen);
+                            // 从E转换为F，用以验证极线约束
+                            // 矩阵乘法会是in-place操作吗？
+                            F_cam_by_cal_FE = K_trans_inv * F_eigen * K_inv;
+                        }
+                        
+                        // Mat_F的数据类型为double
+                        // auto type = Mat_F.type();
+                        // cout << "type of element in t is " << type << endl;
+
+                        // 计算已有内点的分数
+                        // is_inlier中是否会再次有外点？其实上面计算出的F矩阵不一定有效，因为有可能相机无位移，这里还是要用跟踪点来验证该F矩阵是否有效
+                        // 计算双向投影误差
+                        int has_outlier = 0;
+                        
+                        float ratio_out = epipolarConstrain(inliers_prev_F, inliers_cur_F, F_cam_by_cal_FE, is_inlier, Th_score, score_F, has_outlier, F_THRESHOLD*F_THRESHOLD);
+                        
+                        // 如果估计的F的内点中还存在较多的外点
+                        if(ratio_out >= 0.3)
+                        {
+                            has_valid_F = false;
+                            cout << "Invalid matrix E!" << endl;
+                        }
+                        else
+                        {
+                            if(ratio_out > 0)
+                            {
+                                for(int i = 0; i < is_inlier.size(); ++i)
+                                {
+                                     if(is_inlier[i] == 0) --num_inliers_F;
+                                }
+                            }
+
+                            // 如果最终用于估计F矩阵的点集中内点的比例太小
+                            if(num_inliers_F*1.0/num_track_for_F < 0.70 || ((est_F && num_inliers_F < 8) || (est_E && num_inliers_F < 6)))
+                            {
+                                has_valid_F = false;
+                                cout << "Invalid matrix E!" << endl;
+                            }
+                            else
+                            {
+                                for(int i = 0; i < is_inlier.size(); ++i)
+                                {
+                                    int l_id = F_inlier_l_id[i];
+                                    int id = pt_id_for_F[l_id];
+                                    // 如果是内点中的外点
+                                    if(is_inlier[i] == 0)
+                                    {
+                                        status_fea_F[l_id] = 0;
+
+                                        if(id <= 0)
+                                        {
+                                            invalid_pt_id_F.push_back(id);
+
+                                            --valid_sift_F;
+                                        }
+                                        else
+                                        {
+                                            invalid_pt_id_F.push_back(id);
+
+                                            --valid_FAST_F;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        l_id_inliers_F.push_back(id);
+                                    }
+                                }
+
+                                has_valid_F = true;
+                                cal_Mat_F_H = true;
+                                // 其实E和F两者是等价的，因为内参K不会变
+                                // if(est_E)
+                                //     cout << "Find matrix E succeeded!" << endl;
+                                // else
+                                //     cout << "Find matrix F succeeded!" << endl;
+                            }
                         }
                     }
                     
                     if(est_H)
                     {
-                        if(status_fea_H[i] == 0)
+                        // 检查该H矩阵
+                        Mat_H = H_tmp.clone();
+
+                        // auto type = Mat_H.type();
+                        // cout << "type of element in t is " << type << endl;
+
+                        cv2eigen(Mat_H, H_cam);
+                        H_cam_inv = H_cam.inverse();
+                        // 注意，这里记得clear，因为在HomographyConstrain内部不会对其进行清除
+                        if(!is_inlier.empty()) is_inlier.clear();
+                        int has_outlier = 0;
+                        // 计算双向的单应性误差
+                        // todo::对于H矩阵是否也需要根据匹配内点的score来判断该H的有效性？这里Th_score是比上面估计H矩阵所使用的误差阈值要大，则上面给出的内点在这里不应该变成外点
+                        float ratio_outlier = HomographyConstrain(inliers_prev_H, inliers_cur_H, H_cam, H_cam_inv, is_inlier, Th_score, score_H, has_outlier, H_THRESHOLD*H_THRESHOLD);
+
+                        // 在估计的内点中不符合规定的外点比例大于0.35
+                        if(ratio_outlier >= 0.30)
                         {
-                            if(id <= 0)
-                            {
-                                invalid_pt_id_H.push_back(id);
-
-                                --valid_sift_H;
-                            }
-                            else
-                            {
-                                invalid_pt_id_H.push_back(id);
-
-                                --valid_FAST_H;
-                            }
+                            has_valid_H = false;
+                            cout << "Invalid matrix H!" << endl;
                         }
                         else
                         {
-                            ++num_inliers_H;
-                            inliers_prev_H.push_back(prev_pts_for_FH[i]);
-                            inliers_cur_H.push_back(cur_pts_for_FH[i]);  
+                            // 这里的2.0是上面求解H矩阵的设置的误差阈值
+                            // H矩阵的内点就一定满足正反投影的误差要求吗？或者说内点满足正向变换的误差，就一定也满足反向变换的误差吗？
+                            // 不一定，因为给定的匹配点集不一定能找到满足要求的H！
+                            // if(Th_score > H_THRESHOLD*H_THRESHOLD && has_outlier)
+                            // {
+                            //     cout << "Weired! Why there is outlier in inliers?" << endl;
+                            // }
+
+                            if(ratio_outlier > 0)
+                            {
+                                for(int i = 0; i < is_inlier.size(); ++i)
+                                {
+                                    // 如果是内点中的外点
+                                    if(is_inlier[i] == 0) --num_inliers_H;
+                                }
+                            }
+
+                            if(num_inliers_H*1.0/num_track_for_F <= 0.5 || num_inliers_H < 6)
+                            {
+                                has_valid_H = false;
+                                cout << "Invalid matrix H!" << endl;
+                            }
+                            else
+                            {
+                                for(int i = 0; i < is_inlier.size(); ++i)
+                                {
+                                    int l_id = H_inlier_l_id[i];
+                                    int id = pt_id_for_F[l_id];
+                                    // 如果是内点中的外点
+                                    if(is_inlier[i] == 0)
+                                    {
+                                        status_fea_H[l_id] = 0;
+
+                                        if(id <= 0)
+                                        {
+                                            invalid_pt_id_H.push_back(id);
+
+                                            --valid_sift_H;
+                                        }
+                                        else
+                                        {
+                                            invalid_pt_id_H.push_back(id);
+
+                                            --valid_FAST_H;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        l_id_inliers_H.push_back(id);
+                                    }
+                                }
+
+                                has_valid_H = true;
+                                cal_Mat_F_H = true;
+                                // cout << "Find matrix H succeeded!" << endl;
+                            }
                         }
                     }
                 }
             }
-
-            vector<uchar> is_inlier;
-            // 如果内点数太少，则放弃该F估计
-            if(num_inliers_F < 0.5 * num_track_for_F || num_inliers_F < 7)
-            {
-                has_valid_F = false;
-            }
-            else
-            {
-                Mat_F = F_tmp.clone();
-                
-                // Mat_F的数据类型为double
-                // auto type = Mat_F.type();
-                // cout << "type of element in t is " << type << endl;
-
-                cv2eigen(Mat_F, F_cam);
-                // 计算内点的分数
-                // 是否会再次有外点？其实上面计算出的F矩阵不一定有效，因为有可能相机无位移，这里还是要用跟踪点来验证该F矩阵是否有效
-                // todo:是否要计算双向投影误差？
-                bool valid = epipolarConstrain(inliers_prev_F, inliers_cur_F, F_cam, is_inlier, Th_score, score_F);
-                if(!valid)
-                {
-                    has_valid_F = false;
-                    cout << "Invalid matrix F! Camere maybe has no translation!" << endl;
-                }
-                else
-                {
-                    has_valid_F = true;
-                    cal_Mat_F_H = true;
-                    cout << "Find matrix F succeeded!" << endl;
-                }
-            }
-
-            // 检查该H矩阵
-            if(num_inliers_H <= 0.5 * num_track_for_F || num_inliers_H < 6)
-            {
-                has_valid_H = false;
-            }
-            else
-            {
-                Mat_H = H_tmp.clone();
-
-                // auto type = Mat_H.type();
-                // cout << "type of element in t is " << type << endl;
-
-                cv2eigen(Mat_H, H_cam);
-                H_cam_inv = H_cam.inverse();
-                // 注意，这里记得clear，因为在HomographyConstrain内部不会对其进行清除
-                if(!is_inlier.empty()) is_inlier.clear();
-                // todo::对于H矩阵是否需要根据匹配内点的score来判断该H的有效性？
-                HomographyConstrain(inliers_prev_H, inliers_cur_H, H_cam, H_cam_inv, is_inlier, Th_score, score_H);
-
-                has_valid_H = true;
-                cal_Mat_F_H = true;
-                cout << "Find matrix H succeeded!" << endl;
-            }
         }
         else
         {
+            // 只有当相机的预测运动有较大的位移，才会考虑用预测的运动值来构建F矩阵
+            // if(!Check_flow_with_pred_motion || (small_p))
             {
-                // 只有使用IMU并初始化成功后，且相机有位移，才会考虑有预测的运动值来构建F矩阵
                 Matrix3d t_up;
                 t_up << 0.0, -P_cam_motion(2), P_cam_motion(1), P_cam_motion(2), 0.0, -P_cam_motion(0), -P_cam_motion(1), P_cam_motion(0), 0.0;
                 // 本质矩阵到关键矩阵
                 F_cam = K_trans_inv * t_up * R_cam_motion * K_inv;
                 has_valid_F = true;
             }
-            
-            // todo:如果使用了IMU，当前帧就算没有位移，只要有旋转R，也可以根据地平面的近似参数 和 R 来构造H矩阵，用以筛选近似地面上的跟踪点？
-
         }
         
+        // 如果E和H同时估计成功，则需要决定优先选择哪个结果
+        bool priority_H = false;
+
         // 如果估计了H或F矩阵
         if(has_valid_F || has_valid_H)
         {
@@ -11888,16 +18403,19 @@ void FeatureTracker::rejectWithFV2(bool init_succ_IMU, const set<int> &pts_for_F
                 // 寻找没有参与F和H矩阵估计的剩余背景跟踪点
                 for(auto pt: id_bg_track_sift)
                 {
+                    // 在id_bg_track_sift中是否会有无效的背景跟踪点？可能会有，这取决于之前对id_bg_track_sift的操作
                     if(status_sift[pt] == 0) 
                     {
                         // 去掉这部分无效的背景点
                         --num_track_sift;
                         --valid_sift_F;
                         --valid_sift_H;
+                        
+                        --total_static_track;
                         continue;
                     }
 
-                    if(EASI_RANSAC_FH)
+                    if(ESTI_RANSAC_FH)
                     {
                         if(pt_id_in_sift.find(pt) == pt_id_in_sift.end())
                         {
@@ -11915,64 +18433,61 @@ void FeatureTracker::rejectWithFV2(bool init_succ_IMU, const set<int> &pts_for_F
                 }
 
                 int num_pt = cur_pts_match.size();
-                bool valid;
 
                 if(has_valid_F && num_pt > 0)
                 {
                     is_inlier_F.resize(num_pt, 0);
-                    valid = epipolarConstrain(prev_pts_match, cur_pts_match, F_cam, is_inlier_F, Th_score, score_F);
-                    if(valid)
-                    {
-                        for(int i = 0; i < num_pt; ++i)
-                        {
-                            if(is_inlier_F[i] == 0) 
-                            {
-                                int id = temp_pt_id[i];
-                                // status_sift[id] = 0;
+                    int has_outlier = 0;
 
-                                invalid_pt_id_F.push_back(-id);
-                                --valid_sift_F;
-                                
-                                // --valid_match_sift;
-                            }
-                        }
-                    }
+                    float ratio_out;
+                    // 如果是直接用运动预测值构建F矩阵，则适当加大误差阈值？
+                    if(ESTI_RANSAC_FH)
+                        ratio_out = epipolarConstrain(prev_pts_match, cur_pts_match, F_cam_by_cal_FE, is_inlier_F, Th_score, score_F, has_outlier, F_THRESHOLD*F_THRESHOLD);
                     else
+                        ratio_out = epipolarConstrain(prev_pts_match, cur_pts_match, F_cam, is_inlier_F, 3.0*3.0, score_F, has_outlier, 3.0*3.0);
+
+                    // 剩下的背景跟踪点由于匹配精度较低，所以可能出现较多不满足所估计F矩阵的点，因此它们的外点比例不能用于判断所估计F矩阵是否有效的依据!
+                    for(int i = 0; i < num_pt; ++i)
                     {
-                        has_valid_F = false;
+                        int id = temp_pt_id[i];
+                        if(is_inlier_F[i] == 0) 
+                        {
+                            invalid_pt_id_F.push_back(-id);
+                            --valid_sift_F;
+                        }
+                        else
+                        {
+                            l_id_inliers_F.push_back(-id);
+                        }
                     }
                 }
                 
                 if(has_valid_H && num_pt > 0)
                 {
                     is_inlier_H.resize(num_pt,0);
+                    int has_outlier = 0;
                     // 使用估计的H矩阵对剩下的跟踪点进行过滤
                     // 使用H矩阵，会留下平面上的绝大部分点，以及深度值足够大（相对于位移绝对值，即两个匹配点形成的视差足够大）的点，但对于近处的非平面上的点会直接排除（是否要保留这些点呢？）
                     // 这里还是要暂时用H来排除一些外点并保留尽可能多该平面上的跟踪点，以便之后有足够多的有深度值的跟踪内点来恢复t的尺度值
                     // 如果还要保留这些近处的非平面点，则需要后续估计出带尺度的t之后，形成F矩阵并用极线约束来检验这些点。但是这些近处的点真的有必要保留吗？下一帧还会被跟踪到吗？
-                    valid = HomographyConstrain(prev_pts_match, cur_pts_match, H_cam, H_cam_inv, is_inlier_H, Th_score, score_H);
+                    float ratio_out = HomographyConstrain(prev_pts_match, cur_pts_match, H_cam, H_cam_inv, is_inlier_H, Th_score, score_H, has_outlier, H_THRESHOLD*H_THRESHOLD);
                     
-                    if(valid)
+                    for(int i = 0; i < num_pt; ++i)
                     {
-                        for(int i = 0; i < num_pt; ++i)
+                        int id = temp_pt_id[i];
+
+                        if(is_inlier_H[i] == 0) 
                         {
-                            if(is_inlier_H[i] == 0) 
-                            {
-                                int id = temp_pt_id[i];
-                                
-                                // 记录这些被排除在平面外的点
-                                invalid_pt_id_H.push_back(-id);
-                                --valid_sift_H;
-                                
-                                // --valid_match_sift;
-                            }
+                            // 记录这些被排除在平面外的点
+                            invalid_pt_id_H.push_back(-id);
+                            --valid_sift_H;
+                        }
+                        else
+                        {
+                            l_id_inliers_H.push_back(-id);
                         }
                     }
-                    // 发现还是没有有效的F矩阵。可以通过极线方程的参数来判断F矩阵是否有效吗？?
-                    else
-                    {
-                        has_valid_H = false;
-                    }
+                    
                 }
             }
 
@@ -11989,10 +18504,12 @@ void FeatureTracker::rejectWithFV2(bool init_succ_IMU, const set<int> &pts_for_F
                         --num_track_FAST;
                         --valid_FAST_F;
                         --valid_FAST_H;
+
+                        --total_static_track;
                         continue;
                     }
 
-                    if(EASI_RANSAC_FH)
+                    if(ESTI_RANSAC_FH)
                     {
                         if(pt_id_in_FAST.find(pt) == pt_id_in_FAST.end())
                         {
@@ -12011,32 +18528,30 @@ void FeatureTracker::rejectWithFV2(bool init_succ_IMU, const set<int> &pts_for_F
 
                 int num_pt = cur_pts_match.size();
                 
-                bool valid;
                 if(has_valid_F && num_pt > 0)
                 {
                     if(!is_inlier_F.empty()) is_inlier_F.clear();
                     is_inlier_F.resize(num_pt, 0);
-                    valid = epipolarConstrain(prev_pts_match, cur_pts_match, F_cam, is_inlier_F, Th_score, score_F);
-                    if(valid)
-                    {
-                        for(int i = 0; i < num_pt; ++i)
-                        {
-                            if(is_inlier_F[i] == 0) 
-                            {
-                                int id = temp_pt_id[i];
-                                // status_FAST[id] = 0;
+                    int has_outlier = 0;
 
-                                --valid_FAST_F;
-                                invalid_pt_id_F.push_back(id+1);
-                                
-                                // --valid_match_FAST;
-                            }
-                        }
-                    }
-                    // 发现还是没有有效的F矩阵。可以通过极线方程的参数来判断F矩阵是否有效吗？?
+                    float ratio_out;
+                    if(ESTI_RANSAC_FH)
+                        ratio_out = epipolarConstrain(prev_pts_match, cur_pts_match, F_cam_by_cal_FE, is_inlier_F, Th_score, score_F, has_outlier, F_THRESHOLD*F_THRESHOLD);
                     else
+                        ratio_out = epipolarConstrain(prev_pts_match, cur_pts_match, F_cam, is_inlier_F, 3.0*3.0, score_F, has_outlier, 3.0*3.0);
+
+                    for(int i = 0; i < num_pt; ++i)
                     {
-                        has_valid_F = false;
+                        int id = temp_pt_id[i];
+                        if(is_inlier_F[i] == 0) 
+                        {
+                            --valid_FAST_F;
+                            invalid_pt_id_F.push_back(id+1);
+                        }
+                        else
+                        {
+                            l_id_inliers_F.push_back(id+1);
+                        }
                     }
                 }
                 
@@ -12044,78 +18559,85 @@ void FeatureTracker::rejectWithFV2(bool init_succ_IMU, const set<int> &pts_for_F
                 {
                     if(!is_inlier_H.empty()) is_inlier_H.clear();
                     is_inlier_H.resize(num_pt, 0);
-                    valid = HomographyConstrain(prev_pts_match, cur_pts_match, H_cam, H_cam_inv, is_inlier_H, Th_score, score_H);
-                    if(valid)
-                    {
-                        for(int i = 0; i < num_pt; ++i)
-                        {
-                            if(is_inlier_H[i] == 0) 
-                            {
-                                int id = temp_pt_id[i];
-                                // status_FAST[id] = 0;
+                    int has_outlier = 0;
+                    float ratio_out = HomographyConstrain(prev_pts_match, cur_pts_match, H_cam, H_cam_inv, is_inlier_H, Th_score, score_H, has_outlier, H_THRESHOLD*H_THRESHOLD);
 
-                                --valid_FAST_H;
-                                invalid_pt_id_H.push_back(id+1);
-                                
-                                // --valid_match_FAST;
-                            }
-                        }
-                    }
-                    else
+                    for(int i = 0; i < num_pt; ++i)
                     {
-                        has_valid_H = false;
+                        int id = temp_pt_id[i];
+
+                        if(is_inlier_H[i] == 0) 
+                        {
+                            --valid_FAST_H;
+                            invalid_pt_id_H.push_back(id+1);
+                        }
+                        else
+                        {
+                            l_id_inliers_H.push_back(id+1);
+                        }
                     }
                 }
             }
             
-            if(EASI_RANSAC_FH)
+            if(ESTI_RANSAC_FH)
             {
-                // 如果F和H矩阵都有估计结果，则查看两者的内点数哪个更多
+                if(has_valid_F)
+                {
+                    // 注意，声明为float，以防计算比例时恒为0！！！
+                    float num_valid = valid_FAST_F+valid_sift_F;
+                    if(((est_F && num_valid >= 12 ) || (est_E && num_valid >= 8)) && num_valid/total_static_track >= 0.67)
+                    {
+                        // if(est_E)
+                        //     cout << "Try to get R and normalized t from matrix E!" << endl;
+                        // else
+                        //     cout << "Try to get R and normalized t from matrix F!" << endl;
+                    }
+                    else
+                    {
+                        cout << "Ratio of inliers of all static tracking by Mat E: " << num_valid/total_static_track << endl;
+                        cout << "Failed to get R and normalized t from matrix F or E!" << endl;
+                        has_valid_F = false;
+                    }
+                }
+                
+                if(has_valid_H)
+                {
+                    float num_valid = valid_FAST_H+valid_sift_H;
+                    if(num_valid >= 8 && num_valid/total_static_track >= 0.55)
+                    {
+                        // cout << "Try to get R and normalized t from matrix H!" << endl;
+                    }
+                    else
+                    {
+                        cout << "Ratio of inliers of all static tracking by Mat H: " << num_valid/total_static_track << endl;
+                        cout << "Failed to get R and normalized t from matrix H!" << endl;
+                        has_valid_H = false;
+                    }
+                }
+                
+                // 如果F和H矩阵都有估计结果，则需要决定优先采用哪个结果
                 if(has_valid_F && has_valid_H)
                 {
                     // todo: 如何决定应该选择哪个结果？？
                     // H矩阵的精度要求需要比F的要低一些。同时，由于重投影误差的阈值的设置强烈依赖于经验和方法的误差难易程度，因此比较两种方法的内点数不太可靠，应该设置误差阈值较大，比较两者的总误差大小
                     
-                    // if(score_H > 2.0/3 * score_F)
-                    if(score_H > 2.0/3 * score_F && (valid_FAST_H+valid_sift_H) >= 0.75*(valid_FAST_F+valid_sift_F) && valid_FAST_H+valid_sift_H > 10)
+                    // if(score_H > 2.0/2 * score_F)
+                    if(0 && score_H > 3.0/4 * score_F && (valid_FAST_H+valid_sift_H) >= 2.0/3*(valid_FAST_F+valid_sift_F) && valid_FAST_H+valid_sift_H >= 7)
                     // if((valid_FAST_H+valid_sift_H) > 0.9*(valid_FAST_F+valid_sift_F))
                     // if(score_H > 0.9 * score_F || (valid_FAST_H+valid_sift_H) >= 1.0*(valid_FAST_F+valid_sift_F))
                     {
-                        has_valid_F = false;
-                        cout << "Try to get R and normalized t from matrix H!" << endl;
-                    }
-                    else
-                    {
-                        has_valid_H = false;
-                        cout << "Try to get R and normalized t from matrix F!" << endl;
+                        // 这里暂时不否定使用F的可能性，这种一刀切式的判断条件无法保证从H分解得到的R和t就一定好。
+                        // has_valid_F = false;
+                        // cout << "Try to get R and normalized t from matrix H!" << endl;
+
+                        priority_H = true;
                     }
                 }
-                else if(!has_valid_F && !has_valid_H)
+
+                if(!has_valid_F && !has_valid_H)
                 {
-                    cout << "Failed to get R and normalized t from matrix F or H!" << endl;
+                    cout << "Failed to get R and normalized t from matrix E or H!" << endl;
                     cal_Mat_F_H = false;
-                }
-                else if(has_valid_F)
-                {
-                    if(valid_FAST_F+valid_sift_F >= 8)
-                        cout << "Try to get R and normalized t from matrix F!" << endl;
-                    else
-                    {
-                        cout << "Failed to get R and normalized t from matrix F or H!" << endl;
-                        has_valid_F = false;
-                        cal_Mat_F_H = false;
-                    }
-                }
-                else
-                {
-                    if(valid_FAST_H+valid_sift_H >= 8)
-                        cout << "Try to get R and normalized t from matrix H!" << endl;
-                    else
-                    {
-                        cout << "Failed to get R and normalized t from matrix F or H!" << endl;
-                        has_valid_H = false;
-                        cal_Mat_F_H = false;
-                    }
                 }
             }
             else
@@ -12123,26 +18645,9 @@ void FeatureTracker::rejectWithFV2(bool init_succ_IMU, const set<int> &pts_for_F
                 cout << "Succeed filter bg tracked fea using matrix F from predicted camera motion!" << endl;
             }
         }
-    }
-    else
-    {
-        has_valid_F = false;
-        has_valid_H = false;
-        fea_filtered = false;
-    }
-
-    // todo
-    // bool filter_3D_2D = false;
-    // 根据预测的运动对3D-2D匹配进行滤除
-    // if(filter_3D_2D && (has_motion_pred_first_two_frame || frame_cnt > 1))
-    // {
-
-    // }
-
-    if(filter_fea)
-    {
+        
         // 如果是通过IMU预测的运动构建的F矩阵过滤了匹配点
-        if(!EASI_RANSAC_FH)
+        if(!ESTI_RANSAC_FH)
         {
             if(has_valid_F)
             {
@@ -12173,337 +18678,301 @@ void FeatureTracker::rejectWithFV2(bool init_succ_IMU, const set<int> &pts_for_F
         else if(cal_Mat_F_H)
         {
             // 是否要保留近处的非平面点
-            bool reserve_non_planar_pt = true;
+            int reserve_non_planar_pt = Res_non_planar_pt;
             
-            if(!need_PnP) reserve_non_planar_pt = false;
-
-            if(has_valid_F)
+            // 如果后续不再进行相机位姿的PnP估计，则这里不保留不满足H的近处高点
+            if(!need_PnP) reserve_non_planar_pt = 0;
+            
+            // 如果有H，则只有在没有F估计或者H比F优先级高时，才优先尝试通过H分解来得到R和t
+            // todo: 也可以选择先尝试分解E矩阵，然后再尝试分解H矩阵，毕竟纯平面点的情况不多见，如果出现了，则此时E大概率是无效的，
+            if(has_valid_H && (!has_valid_F || priority_H))
+            // if(has_valid_H && !fea_filtered)
             {
-                // 分解得到 R 和 t的方向
-                // Mat R_E_1, R_E_2, t_E;
-                // 自己写分解E求解（R,t)时还需要三角化特征点以选择唯一正确的一组解。
-                // DecomposeE(Mat_F, R_E_1, R_E_2, t_E);
+                // todo: 是否 要在这里通过三角化测量来检验R/t备选时 将三角化失败的点即入valid_sift_H和valid_sift_F中？
+                Decomp_check_RT_from_H(Mat_H, status_fea_H, prev_pts_for_FH, cur_pts_for_FH, delta_angle, l_id_inliers_H, has_valid_H, invalid_pt_id_H, reserve_non_planar_pt);
 
-                Point2d pp(SHIFT_X,SHIFT_Y);
-                Matrix3d Mat_E = K_trans * F_cam * K;
-                Mat E, R_E, t_E;
-                eigen2cv(Mat_E,E);
-                // 输入recoverPose的mask需要是Mat类型，单通道的数据。复制数据，而不仅仅是复制数据的指针
-                Mat mat_temp = Mat(status_fea_F, true);
-                
-                Mat mat_status = mat_temp.reshape(1,status_fea_F.size());
-
-                // // 此函数从E分解得到R和t时 会得到四组可能的解（R，t），其中t是尺度归一化的（这相当于固定了整个场景的尺度），
-                // // 并利用给定的2d-2d匹配点对，使用三角化来恢复给定尺度下的点深度值，只有正确的一对(R,t)才会使得所有3D点的深度值为正。
-                int num_inliers = recoverPose(E, prev_pts_for_FH, cur_pts_for_FH, R_E, t_E, FOCAL_LENGTH_X, pp, mat_status);
-                
-                if(num_inliers > 0.5*num_inliers_F)
+                if(has_valid_H)
                 {
-                    cv2eigen(R_E,R_from_E);
+                    valid_match_sift = valid_sift_H;
+                    valid_match_FAST = valid_FAST_H;
+
+                    fea_filtered = true;
                     
-                    Quaterniond delta_Q(R_from_E);
-                    double delta_ang = fabs(acos(delta_Q.w()) * 2.0 / 3.1416 * 180.0);
-
-                    // 前后2帧之间汽车的旋转角不应该太大吧？0.1s的时间，最大应该是多少度？如果真的是快速转弯的话，视觉跟踪应该很难完成？
-                    // 注意只有系统第3帧开始才会有相机运动的预测值
-                    if (frame_cnt > 1 && (delta_ang > 3.2 && delta_ang > 2.5 * delta_angle))
-                    {
-                        cout << "Wrong estimate of rotation from matrix F!" << endl;
-                        cout << "predicted delta_angle: " << delta_angle << ", delta_angle from matrix F: " << delta_ang << endl;
-                        has_valid_F = false;
-                        fea_filtered = false;
-                    }
-                    else if(frame_cnt == 1 && delta_ang >= 3.2)
-                    {
-                        // 1s内转弯大于25度认为不可能
-                        cout << "Unbelievable estimate of rotation from matrix F in between the first two frames!" << endl;
-                        cout << "delta_angle from matrix F: " << delta_ang << endl;
-                        has_valid_F = false;
-                        fea_filtered = false;
-                    }
-                    else
-                    {
-                        cv2eigen(t_E,t_from_E);
-                        cout << "Succeed in getting R and t direction with F matrix!" << endl;
-
-                        // 删除F排除的跟踪外点
-                        for(auto id: invalid_pt_id_F)
-                        {
-                            if(id <= 0)
-                            {
-                                // 只删除纯背景跟踪点中的外点
-                                if(obj_cls_id_sift[(-id)].first == 0)
-                                    status_sift[(-id)] = 0;
-                            }
-                            else
-                            {
-                                // 只删除纯背景跟踪点中的外点
-                                if(obj_cls_id_FAST[(id-1)].first == 0)
-                                    status_FAST[(id-1)] = 0;
-                            }
-                        }
-
-                        valid_match_sift = valid_sift_F;
-                        valid_match_FAST = valid_FAST_F;
-
-                        fea_filtered = true;
-
-                        // 如果当前帧是IMU初始化之后，则后续可能不需要PnP,则这里只排除跟踪外点，后续不单独恢复估计的位移的尺度
-                        // 这种情况下后续是否需要PnP取决于变量fea_filtered
-                        if(!need_PnP) has_valid_F = false;
-                    }
+                    cout << "Succeed got R and t direction with H matrix!" << endl;
                 }
                 else
                 {
-                    cout << "Failed to get R and t direction with F matrix!" << endl;
-                    has_valid_F = false;
                     fea_filtered = false;
                 }
             }
-            else
+
+            // 如果不是优先估计H 或者 H估计无效或者分解无效，则尝试分解E矩阵
+            if(!fea_filtered)
             {
-                vector<Mat> R_H, t_H, p_normal_H;
-                Mat K_Mat, R_H_valid, t_H_valid;
-                eigen2cv(K, K_Mat);
-                decomposeHomographyMat(Mat_H, K_Mat, R_H, t_H, p_normal_H);
-
-                // 需要对得到的多个R和t进行检验
-                // int num_cand = R_H.size();
-                // cout << "Got " << num_cand << " candidate R and t" << endl;
-                
-                // t的格式为3*1的Mat，元素形式为6，即CV_64F，即double形单通道
-                // auto SIZE = t_H[0].size();
-                // cout << "row of t is " << SIZE.height << " col of t is " << SIZE.width << endl;
-                // auto type = t_H[0].type();
-                // cout << "type of element in t is " << type << endl;
-                
-                // int k = 0;
-                // for(auto &iter: t_H)
-                // {
-                //     cout << "No." << k++ << " translation is " << iter << endl;
-                // }
-                
-                vector<int> status_RT;
-
-                // 这个函数一般会返回一个或2个解。但是也有可能没找到任何有效解，因为这个函数要求给定的“所有”检验点在三角化后“均有”正的深度值，但是实际上可能有少数的点会不符合要求（通常是这些点的视差太小，甚至小于匹配误差）
-                // 因此，采用将每个点逐一进行检验的策略，这样可以统计对于每个候选解其有效点的比例，最后选择比例最高的解
-                // filterHomographyDecompByVisibleRefpoints(R_H, p_normal_H, prev_pts_for_F, cur_pts_for_F, status_RT, status_fea_H);
-                
-                vector<Point2f> prev_Pt, cur_Pt;
-                vector<float> valid_solu_ratio;
-                // vector<uchar> status(1,1);
-                int num_pt_check = 0;
-                int num_cand_solu = R_H.size();
-                
-                if(num_cand_solu > 0)
+                if(has_valid_F)
                 {
-                    vector<int> num_valid_pt_for_solu(num_cand_solu,0);
-                    for(int i = 0; i < num_track_for_F; ++i)
-                    {
-                        if(status_fea_H[i] == 0) continue;
-                        prev_Pt.clear();
-                        cur_Pt.clear();
-                        status_RT.clear();
-                        ++num_pt_check;
-                        prev_Pt.push_back(prev_pts_for_FH[i]);
-                        cur_Pt.push_back(cur_pts_for_FH[i]);
-                        // todo:这里是否需要开启多线程进行验证？
-                        filterHomographyDecompByVisibleRefpoints(R_H, p_normal_H, prev_Pt, cur_Pt, status_RT);
-                        for(auto &id:status_RT)
-                        {
-                            num_valid_pt_for_solu[id] += 1;
-                        }
-                    }
-                    
-                    status_RT.clear();
-                    
-                    if(num_pt_check > 0)
-                    {
-                        map<float,int,greater<float>> ratio_valid;
-                        float ratio;
-                        for(int i = 0; i < num_cand_solu; ++i)
-                        {
-                            ratio = num_valid_pt_for_solu[i]*1.0/num_pt_check;
-                            if(ratio > 0)
-                                ratio_valid[ratio] = i;
-                        }
+                    // 分解得到 R 和 t的方向
+                    // Mat R_E_1, R_E_2, t_E;
+                    // 自己写分解E求解（R,t)时还需要三角化特征点以选择唯一正确的一组解。
+                    // DecomposeE(Mat_F, R_E_1, R_E_2, t_E);
 
-                        // for(auto &iter: ratio_valid)
-                        // {
-                        //     cout << "ratio of valid check pt for No." << iter.second << " solution is: " << iter.first << endl;
-                        // }
+                    Mat E, R_E, t_E;
+                    Point2d pp(SHIFT_X,SHIFT_Y);
+                    Matrix3d Mat_E = K_trans * F_cam_by_cal_FE * K;
+                    eigen2cv(Mat_E,E);
+                    // 输入recoverPose的mask需要是Mat类型，单通道的数据。复制数据，而不仅仅是复制数据的指针
+                    Mat mat_temp = Mat(status_fea_F, true);
+                    Mat mat_status = mat_temp.reshape(1,status_fea_F.size());
+
+                    // 此函数从E分解得到R和t时 会得到四组可能的解（R，t），其中t是尺度归一化的（这相当于固定了整个场景的尺度），
+                    // 并利用给定的2d-2d匹配点对，使用三角化来恢复给定尺度下的点深度值，只有正确的一对(R,t)才会使得所有3D点的深度值为正。
+                    // 注意，这里用来验证的点 只使用那些直接估计F矩阵的匹配质量较好的点中的内点，而不包含后续验证的那些跟踪点
+                    int num_inliers = recoverPose(E, prev_pts_for_FH, cur_pts_for_FH, R_E, t_E, FOCAL_LENGTH_X, pp, mat_status);
+                    
+                    cv2eigen(R_E,R_from_E);
+                    Quaterniond delta_Q(R_from_E);
+                    double delta_ang = fabs(acos(delta_Q.w()) * 2.0 / 3.1416 * 180.0);
+                    cout << "predicted delta_angle: " << delta_angle << ", delta_angle from matrix E: " << delta_ang << endl;
+                    
+                    // 原本的内点中三角化后符合要求的点占原本内点的比例。或者按照三角化成功的点数（因为三角化时容易数值不稳定？）
+                    // 0.67
+                    // if(num_inliers >= 0.45*num_inliers_F)
+                    if(num_inliers >= 7)
+                    {
+                        float alpha = 2.5;
+                        if(frame_cnt > 1) 
+                        {
+                            if(delta_angle < 0.10)
+                                alpha = 6.0;
+                            else if(delta_angle < 0.15)
+                                alpha = 4.5;
+                            else if(delta_angle < 0.25)
+                                alpha = 3.0;
+                            else if(delta_angle < 0.35)
+                                alpha = 3.5;
+                            else if (delta_angle < 0.65)
+                                alpha = 3.0;
+                        }
                         
-                        int count = 0;
-                        for(auto &iter: ratio_valid)
+                        // 前后2帧之间汽车的旋转角绝对值不应该太大吧？0.1s的时间，最大应该是多少度？如果真的是快速转弯的话，视觉跟踪应该很难完成？这里设置1s内转弯不超过40度
+                        // 另外，估计角度值和预测角度值之间的比例不应该太大。注意只有系统第3帧开始才会有相机运动的预测值。
+                        // 但是用预测的运动值来约束估计值是否可靠？如果汽车是刚刚从直线变为转弯呢，这样前后2帧的旋转角之比会很大？认为不超过2.5-3倍！
+                        // 因此在用比例来约束之前，还要限制预测值的最小值
+                        // if (frame_cnt > 1 && ((delta_angle > 0.08 && delta_ang > alpha * delta_angle) || (delta_angle > 0.6 && delta_ang < 0.33 * delta_angle) || delta_ang >= 5.5))
+                        if (frame_cnt > 1 && ((delta_ang > alpha * delta_angle) || (delta_angle > 0.5 && delta_ang < 1.0/3.5 * delta_angle) || delta_ang >= 5.5))
                         {
-                            float ratio_thres = 0.4;
-                            if(iter.first >= ratio_thres)
-                            {
-                                status_RT.push_back(iter.second);
-                                valid_solu_ratio.push_back(iter.first);
-                                // cout << "z component of translation is " << t_H[iter.second].at<double>(2,0) << endl;
-                            }
-                            ++count;
-                        }
-                    }
-                }
-
-                if(status_RT.empty())
-                {
-                    // cout << "num of valid solution: " << status_RT.size() << endl;
-                    // assert(false && "Weired! There are no valid solution after decomposition of H!");
-
-                    has_valid_H = false;
-                    fea_filtered = false;
-                }
-                else
-                {
-                    int valid_id = -1;
-                    bool has_valid = false;
-                    if(status_RT.size() > 1)
-                    {
-                        bool has_best = false, has_second_best = false;
-                        float best_ratio, second_best_ratio;
-                        for(int j = 0; j < status_RT.size(); ++j)
-                        {
-                            int id = status_RT[j];
-                            // todo: 假设汽车是往前走的，至少静止，不会是倒退
-                            if(t_H[id].at<double>(2,0) > 0) continue;
-                            
-                            if(!has_best) 
-                            {
-                                valid_id = id;
-                                has_best = true;
-                                best_ratio = valid_solu_ratio[j];
-                                has_valid = true;
-                            }
-                            else
-                            {
-                                has_second_best = true;
-                                second_best_ratio = valid_solu_ratio[j];
-                                break;
-                            }
-                        }
-
-                        // todo:是否需要比较第一和第二好结果的内点比例？
-                        if(has_valid)
-                        {
-                            if(has_best && has_second_best)
-                            {
-                                // 在ORB-SLAM2中，不仅要比较第一高分和第二高分的比例，还要内点的平均视差大于最小阈值，成功三角化的点（三维坐标没有哪个值是inf或nan）数大于最小阈值，且最高分的结果的内点比例大于最小阈值（0.9）
-                                // 上面我们是借助opencv的函数对每个点进行三角化，无法统计每个点的视差角，因此内点中无法包含那些较远而导致三角化深度为负的点，会导致正确解的内点数减少
-                                if(second_best_ratio > 0.75*best_ratio)
-                                {
-                                    cout << "inliers ratio of best sloution: " << best_ratio << endl;
-                                    cout << "inliers ratio of second best sloution: " << second_best_ratio << endl;
-                                    has_valid = false;
-                                //     assert(false && "Best and second best solution has little difference!");
-                                }
-                            }
-                        }
-                    }
-                    else
-                    {
-                        int id = status_RT[0];
-                        if(t_H[id].at<double>(2,0) < 0)
-                        {
-                            valid_id = id;
-                            has_valid = true;
-                        }
-                    }
-                    
-                    if(has_valid)
-                    {
-                        R_H_valid = R_H[valid_id].clone();
-                        
-                        cv2eigen(R_H_valid,R_from_E);
-                        Quaterniond delta_Q(R_from_E);
-                        double delta_ang = fabs(acos(delta_Q.w()) * 2.0 / 3.1416 * 180.0);
-
-                        // 前后2帧之间汽车的旋转角不应该太大吧？0.1s的时间，最大应该是多少度？如果真的是快速转弯的话，视觉跟踪应该很难完成？
-                        if (frame_cnt > 1 && (delta_ang >= 3.2 && delta_ang > 2.5 * delta_angle))
-                        {
-                            cout << "Wrong estimate of rotation from matrix H!" << endl;
-                            cout << "predicted delta_angle: " << delta_angle << ", delta_angle from matrix H: " << delta_ang << endl;
-                            has_valid_H = false;
+                            cout << "Wrong estimate of rotation from matrix E!" << endl;
+                            has_valid_F = false;
                             fea_filtered = false;
                         }
-                        else if(frame_cnt == 1 && delta_ang > 3.2)
+                        else if(frame_cnt == 1 && delta_ang >= 4.0)
                         {
-                            // 1s内转弯大于20度认为是不可能的
-                            cout << "Unbelievable estimate of rotation from matrix H in between the first two frames!" << endl;
-                            cout << "delta_angle from matrix H: " << delta_ang << endl;
-                            has_valid_H = false;
+                            // 初始帧就在大转弯？还是有可能的！！
+                            cout << "Unbelievable estimate of rotation from matrix E in between the first two frames!" << endl;
+                            cout << "delta_angle from matrix E: " << delta_ang << endl;
+                            has_valid_F = false;
                             fea_filtered = false;
                         }
                         else
                         {
-                            valid_match_sift = valid_sift_H;
-                            valid_match_FAST = valid_FAST_H;
-
-                            t_H_valid = t_H[valid_id].clone();
-                            cv2eigen(t_H_valid,t_from_E);
-
-                            for(auto id: invalid_pt_id_H)
+                            cv2eigen(t_E,t_from_E);
+                            float norm_of_t = t_from_E.norm();
+                            // todo: 当相机的位移太小时，估计出来的t很可能是不准确的，如何处理，直接放弃吗？是否意味着R也是不准确的？
+                            if(0 && norm_of_t < 1)
                             {
-                                if(id <= 0)
+                                cout << "norm of estimated normalized t: " << norm_of_t << endl;
+
+                                has_valid_F = false;
+                                fea_filtered = false;
+                            }
+                            else
+                            {
+                                bool valid_reproj = true;
+                                set<int> outliers;
+                                // todo: 使用来自H估计的 R_motion 和 来自运动预测的 P_motion 来计算所有内点的重投影误差，如果小于误差阈值的点的比例小于阈值，则认为该估计不太可靠！
+                                if(num_total_3D_2D_fea > 0)
                                 {
-                                    if(!reserve_non_planar_pt)
+                                    int num_total_3D2D = 0;
+                                    float ratio_inliers_reproj = 0, Th_err_near = 2.0, Th_err_far = 2.0;
+
+                                    if((frame_cnt <= 1 || delta_angle >= 1.0) && delta_ang >= 1.2)
                                     {
-                                        // 只删除纯背景跟踪点中的外点
-                                        if(obj_cls_id_sift[(-id)].first == 0)
-                                            status_sift[(-id)] = 0;
+                                        // if(delta_angle > 2.2 && delta_ang > 2.2)
+                                        if(delta_ang > 2.0)
+                                        {
+                                            Th_err_far = 3.0;
+                                            Th_err_near = 3.0;
+                                        }
+                                        else
+                                        {
+                                            Th_err_far = 2.5;
+                                            Th_err_near = 2.5;
+                                        }
+                                    }
+                                    else if(frame_cnt > 1 && P_cam_motion.norm() >= 1.1)
+                                    {
+                                        Th_err_near = 3.0;
+                                        if(delta_angle >= 0.7 && delta_ang >= 1.0) Th_err_far = 2.5;
+                                    }
+                                    
+                                    float ave_err_reproj = cal_ave_reproj_err(R_from_E, P_cam_motion, l_id_inliers_F, num_total_3D2D, ratio_inliers_reproj, outliers, Th_err_near, Th_err_far);
+                                    
+                                    // 参与评估的3D-2D点数不能太少，否则意义不大
+                                    if(num_total_3D2D < 4) 
+                                    {
+                                        // todo:当点数有2-3个且全部无效时，也认为该R估计不准确？
+                                        if(num_total_3D2D >= 2 && ratio_inliers_reproj == 0.0)
+                                        {
+                                            valid_reproj = false;
+                                            has_valid_F = false;
+                                        }
                                     }
                                     else
                                     {
-                                        // 其中部分跟踪点是静态物体的跟踪点，而这些物体跟踪点中有一部分可能是新的跟踪点，还未在地图中
-                                        reserve_bg_track_pt_id.insert(ids_sift[(-id)]);
+                                        if(ratio_inliers_reproj <= 0.4)
+                                        {
+                                            valid_reproj = false;
+                                            has_valid_F = false;
+                                        }
+                                    }
+                                    
+                                    if(!valid_reproj)
+                                    {
+                                        cout << "Given E can't pass reproj check! Total 3D-2D of E: " << num_total_3D2D << ", ratio of inlier: " << ratio_inliers_reproj << ", ave_err: " << ave_err_reproj << endl;
                                     }
                                 }
-                                else
+                                
+                                if(valid_reproj)
                                 {
-                                    if(!reserve_non_planar_pt)
+                                    cout << "Succeed in getting R and t direction with E matrix!" << endl;
+                                    
+                                    if(!outliers.empty())
                                     {
-                                        // 只删除纯背景跟踪点中的外点
-                                        if(obj_cls_id_FAST[(id-1)].first == 0)
-                                            status_FAST[(id-1)] = 0;
+                                        for(auto &iter:outliers)
+                                        {
+                                            invalid_pt_id_F.push_back(iter);
+                                        }
                                     }
-                                    else
+
+                                    delta_angle_from_FH = delta_ang;
+
+                                    // 删除F排除的跟踪外点
+                                    for(auto id: invalid_pt_id_F)
                                     {
-                                        reserve_bg_track_pt_id.insert(ids_FAST[(id-1)]);
+                                        if(id <= 0)
+                                        {
+                                            // 只删除纯背景跟踪点中的外点
+                                            if(obj_cls_id_sift[(-id)].first == 0)
+                                            {
+                                                status_sift[(-id)] = 0;
+                                                --num_track_sift_bg;
+                                                if(track_cnt_sift[(-id)] > 2) --num_old_track_fea;
+                                            }
+                                        }
+                                        else
+                                        {
+                                            // 只删除纯背景跟踪点中的外点
+                                            if(obj_cls_id_FAST[(id-1)].first == 0)
+                                            {
+                                                status_FAST[(id-1)] = 0;
+                                                --num_track_FAST_bg;
+                                                if(track_cnt_FAST[(id-1)] > 2) --num_old_track_fea;
+                                            }
+                                        }
                                     }
+                                    
+                                    valid_match_sift = valid_sift_F;
+                                    valid_match_FAST = valid_FAST_F;
+
+                                    fea_filtered = true;
                                 }
                             }
-
-                            fea_filtered = true;
-
-                            if(!need_PnP) has_valid_H = false;
-
-                            cout << "Succeed got R and t direction with H matrix!" << endl;
                         }
                     }
                     else
                     {
-                        cout << "Failed to get R and t direction with H matrix!" << endl;
-                        has_valid_H = false;
+                        cout << "num of inliers form E: " << num_inliers_F << ", num of inliers from recovery RT: " << num_inliers << endl;
+                        cout << "Failed to get R and t direction with E matrix!" << endl;
+                        has_valid_F = false;
                         fea_filtered = false;
+                    }
+                }
 
-                        // assert(false && "Weired! There are no valid solution of t after decomposition of H!");
+                // 如果通过分解E获取R或t失败
+                if(!fea_filtered)
+                {
+                    // 上面不一定优先尝试分解H矩阵，如果没有，则这里进行尝试
+                    if(has_valid_H)
+                    {
+                        Decomp_check_RT_from_H(Mat_H, status_fea_H, prev_pts_for_FH, cur_pts_for_FH, delta_angle, l_id_inliers_H, has_valid_H, invalid_pt_id_H, reserve_non_planar_pt);
+
+                        if(has_valid_H)
+                        {
+                            valid_match_sift = valid_sift_H;
+                            valid_match_FAST = valid_FAST_H;
+
+                            fea_filtered = true;
+
+                            cout << "Succeed got R and t direction with H matrix!" << endl;
+                        }
+                        else
+                        {
+                            fea_filtered = false;
+                        }
                     }
                 }
             }
+            else
+            {
+                has_valid_F = false;
+            }
+
             // cout << "translation direction is " << t_from_E.transpose() << endl;
 
+            // 如果最终完成分解E或H得到R和t
             if(!fea_filtered)
                 cal_Mat_F_H = false;
+            
         }
+        else
+        {
+            fea_filtered = false;
+            cal_Mat_F_H = false;
+        }
+    }
+    else
+    {
+        has_valid_F = false;
+        has_valid_H = false;
+        fea_filtered = false;
     }
 
     // 暂时不再这里删除prev_sift中的跟踪丢失点
     // reduce_invalid_fea(true);
-
+    
     if(fea_filtered)
     {
+        if(cal_Mat_F_H)
+        {
+            // 如果当前帧是IMU初始化之后，则后续可能不需要PnP,则这里只排除跟踪外点，后续不单独恢复估计的位移的尺度
+            // 这种情况下后续判断是否有F/H估计则取决于变量fea_filtered和has_valid_F或has_valid_H
+            // if(!need_PnP) cal_Mat_F_H = false;
+            if(USE_IMU && IMU_init_succ) cal_Mat_F_H = false;
+            
+            // 如果完成了F/H的估计，则认为旋转运动R的估计 比 基于恒速模型的估计 更精确（尤其是前后帧旋转值变化大时），则用此值更新两帧间的位移P（因为它会受到预测的当前帧位姿的影响）
+            // 实验证明F/H估计的R并非总是准确，然而一旦不准确其对预测位移的影响会相当大，这会极大地恶化后续PnP和LBA！
+            if(0 && frame_cnt > 1 && (has_valid_F || has_valid_H))
+            {
+                Matrix3d delta_R = R_from_E.transpose();
+                // 使用预测相机坐标系下的两帧运动，重构世界坐标下的相机旋转运动，它会影响预测的当前帧相机全局位姿
+                R_cam_motion_w = prev_cam_R * delta_R * prev_cam_R.transpose();
+                Vector3d P_2 = R_cam_motion_w * prev_cam_P + P_cam_motion_w;
+                Matrix3d R_2 = prev_cam_R * delta_R;
+                P_cam_motion = R_2.transpose() * (prev_cam_P - P_2);
+                cout << "Updated norm of predicted P_cam_motion after estimating F/H: " << P_cam_motion.norm() << endl;
+            }
+        }
+
         printf("FM ransac for sift: %d -> %lu: %f\n", num_track_sift, valid_match_sift, (1.0 * valid_match_sift) / num_track_sift);
         
         // 删除无效的FAST跟踪点不在这里进行
@@ -12512,6 +18981,403 @@ void FeatureTracker::rejectWithFV2(bool init_succ_IMU, const set<int> &pts_for_F
     }
     
     printf("FM ransac costs: %fms\n", t_f.toc());
+}
+
+// 分解H得到R和t，并验证其中的可行解
+void FeatureTracker::Decomp_check_RT_from_H(const Mat &Mat_H, const vector<uchar> &status_fea_H, vector<Point2f> &prev_pts, vector<Point2f> &cur_pts, float pred_delta_angle,
+                                            const vector<int> &l_id_all_inliers_H, bool &has_valid_H, vector<int> &invalid_pt_id_H, const bool reserve_non_planar_pt)
+{
+    vector<Mat> R_H, t_H, p_normal_H;
+    Mat K_Mat, R_H_valid, t_H_valid;
+    eigen2cv(K, K_Mat);
+    decomposeHomographyMat(Mat_H, K_Mat, R_H, t_H, p_normal_H);
+
+    // 需要对得到的多个R和t进行检验
+    // int num_cand = R_H.size();
+    // cout << "Got " << num_cand << " candidate R and t" << endl;
+    
+    // t的格式为3*1的Mat，元素形式为6，即CV_64F，即double形单通道
+    // auto SIZE = t_H[0].size();
+    // cout << "row of t is " << SIZE.height << " col of t is " << SIZE.width << endl;
+    // auto type = t_H[0].type();
+    // cout << "type of element in t is " << type << endl;
+    
+    // int k = 0;
+    // for(auto &iter: t_H)
+    // {
+    //     cout << "No." << k++ << " translation is " << iter << endl;
+    // }
+    
+    vector<int> status_RT;
+
+    // 这个函数一般会返回一个或2个解。但是也有可能没找到任何有效解，因为这个函数要求给定的“所有”检验点在三角化后“均有”正的深度值，但是实际上可能有少数的点会不符合要求（通常是这些点的视差太小，甚至小于匹配误差）
+    // 因此，采用将每个点逐一进行检验的策略，这样可以统计对于每个候选解其有效点的比例，最后选择比例最高的解
+    // filterHomographyDecompByVisibleRefpoints(R_H, p_normal_H, prev_pts_for_F, cur_pts_for_F, status_RT, status_fea_H);
+    
+    vector<Point2f> prev_Pt, cur_Pt;
+    vector<float> valid_solu_ratio;
+    // vector<uchar> status(1,1);
+    int num_pt_check = 0;
+    int num_cand_solu = R_H.size();
+    
+    if(num_cand_solu > 0)
+    {
+        int num_track_for_H = status_fea_H.size();
+        vector<int> num_valid_pt_for_solu(num_cand_solu,0);
+        for(int i = 0; i < num_track_for_H; ++i)
+        {
+            if(status_fea_H[i] == 0) continue;
+            prev_Pt.clear();
+            cur_Pt.clear();
+            status_RT.clear();
+            ++num_pt_check;
+            prev_Pt.push_back(prev_pts[i]);
+            cur_Pt.push_back(cur_pts[i]);
+            // todo:这里是否需要开启多线程进行验证？
+            // 三角化失败的点不一定是H矩阵的外点，可能是点太远导致光流太小，这种情况下的分解不稳定？
+            filterHomographyDecompByVisibleRefpoints(R_H, p_normal_H, prev_Pt, cur_Pt, status_RT);
+            for(auto &id:status_RT)
+            {
+                num_valid_pt_for_solu[id] += 1;
+            }
+        }
+        
+        status_RT.clear();
+        
+        if(num_pt_check > 0)
+        {
+            map<float,int,greater<float>> ratio_valid;
+            float ratio;
+            for(int i = 0; i < num_cand_solu; ++i)
+            {
+                ratio = num_valid_pt_for_solu[i]*1.0/num_pt_check;
+                if(ratio > 0)
+                    ratio_valid[ratio] = i;
+            }
+
+            // for(auto &iter: ratio_valid)
+            // {
+            //     cout << "ratio of valid check pt for No." << iter.second << " solution is: " << iter.first << endl;
+            // }
+            
+            int count = 0;
+            float ratio_thres = 0.66;
+            for(auto &iter: ratio_valid)
+            {
+                // 三角化成功的点占内点的比例，0.66是否太低？
+                if(iter.first >= ratio_thres)
+                {
+                    status_RT.push_back(iter.second);
+                    valid_solu_ratio.push_back(iter.first);
+                    // cout << "z component of translation is " << t_H[iter.second].at<double>(2,0) << endl;
+                }
+                ++count;
+            }
+        }
+        else
+        {
+            has_valid_H = false;
+        }
+    }
+
+    if(status_RT.empty())
+    {
+        // cout << "num of valid solution: " << status_RT.size() << endl;
+        // assert(false && "Weired! There are no valid solution after decomposition of H!");
+        
+        has_valid_H = false;
+    }
+    else
+    {
+        int valid_id = -1;
+        bool has_valid = false;
+        if(status_RT.size() > 1)
+        {
+            bool has_best = false, has_second_best = false;
+            float best_ratio, second_best_ratio;
+            for(int j = 0; j < status_RT.size(); ++j)
+            {
+                int id = status_RT[j];
+                // todo: 假设汽车是往前走的，至少静止，不会是倒退。
+                if(t_H[id].at<double>(2,0) > 0) continue;
+                
+                if(!has_best) 
+                {
+                    valid_id = id;
+                    has_best = true;
+                    best_ratio = valid_solu_ratio[j];
+                    has_valid = true;
+                }
+                else
+                {
+                    has_second_best = true;
+                    second_best_ratio = valid_solu_ratio[j];
+                    break;
+                }
+            }
+
+            // todo:是否需要比较第一和第二好结果的内点比例？
+            if(has_valid)
+            {
+                // 在ORB-SLAM2中，不仅要比较第一高分和第二高分的比例，还要内点的平均视差大于最小阈值，成功三角化的点（三维坐标没有哪个值是inf或nan）数大于最小阈值，且最高分的结果的内点比例大于最小阈值（0.9）
+                // 上面我们是借助opencv的函数对每个点进行三角化，无法统计每个点的视差角，因此内点中无法包含那些较远而导致三角化深度为负的点，会导致正确解的内点数减少
+                if(best_ratio < 0.75)
+                {
+                    cout << "inliers ratio of best sloution is too low: " << best_ratio << endl;
+                    has_valid = false;
+                }
+                else if(has_best && has_second_best)
+                {
+                    // 如果最高分数为1，则认为解是可行的；否则，需要和第二高的解拉开差距
+                    if(best_ratio < 1.0 && second_best_ratio >= 0.80*best_ratio)
+                    {
+                        cout << "inliers ratio of best sloution: " << best_ratio << endl;
+                        cout << "inliers ratio of second best sloution: " << second_best_ratio << endl;
+                        has_valid = false;
+                        // assert(false && "Best and second best solution has little difference!");
+                    }
+                }
+            }
+        }
+        else
+        {
+            int id = status_RT[0];
+            // 即使没有位移只有旋转，也可以估计H矩阵
+            if(t_H[id].at<double>(2,0) <= 0)
+            {
+                valid_id = id;
+                has_valid = true;
+            }
+        }
+        
+        if(has_valid)
+        {
+            R_H_valid = R_H[valid_id].clone();
+            
+            cv2eigen(R_H_valid,R_from_E);
+            Quaterniond delta_Q(R_from_E);
+            double delta_ang = fabs(acos(delta_Q.w()) * 2.0 / 3.1416 * 180.0);
+            cout << "predicted delta_angle: " << pred_delta_angle << ", delta_angle from matrix H: " << delta_ang << endl;
+            
+            float alpha = 2.5;
+            if(frame_cnt > 1) 
+            {
+                if(pred_delta_angle < 0.10)
+                    alpha = 6.0;
+                else if(pred_delta_angle < 0.15)
+                    alpha = 4.5;
+                else if(pred_delta_angle < 0.25)
+                    alpha = 3.0;
+                else if(pred_delta_angle < 0.35)
+                    alpha = 3.5;
+                else if (pred_delta_angle < 0.65)
+                    alpha = 3.0;
+            }
+            
+            // 前后2帧之间汽车的旋转角不应该太大吧？0.1s的时间，最大应该是多少度？如果真的是快速转弯的话，视觉跟踪应该很难完成？某一瞬间(0.1s)的转角可能很大，但是不会持续长时间（1s）
+            // 且求解的R和预测的R之间不应该相差超过2.0-3倍？
+            // if(frame_cnt > 1 && ((pred_delta_angle > 0.08 && delta_ang > alpha * pred_delta_angle) || (pred_delta_angle > 0.5 && delta_ang < 1.0/alpha * pred_delta_angle) || delta_ang >= 5.5))
+            if(frame_cnt > 1 && ((delta_ang > alpha * pred_delta_angle) || (pred_delta_angle > 0.5 && delta_ang < 1.0/3.5 * pred_delta_angle) || delta_ang >= 5.5))
+            {
+                cout << "Wrong estimate of rotation from matrix H!" << endl;
+                // exit(-1);
+                has_valid_H = false;
+            }
+            else if(frame_cnt == 1 && delta_ang >= 4.0)
+            {
+                // 其实也有可能一开始就是急转弯！！
+                cout << "Unbelievable estimate of rotation from matrix H in between the first two frames!" << endl;
+                cout << "delta_angle from matrix H: " << delta_ang << endl;
+                has_valid_H = false;
+            }
+            else
+            {
+                t_H_valid = t_H[valid_id].clone();
+                cv2eigen(t_H_valid,t_from_E);
+                
+                float norm_of_t = t_from_E.norm();
+                // todo:当相机的位移太小时，估计出来的t很可能是不准确的，如何处理，直接放弃吗？是否意味着R也是不准确的？
+                if(0 && norm_of_t < 1)
+                {
+                    cout << "norm of estimated normalized t: " << norm_of_t << endl;
+                    
+                    has_valid_H = false;
+                }
+                else
+                {
+                    bool valid_reproj = true;
+                    set<int> outliers;
+                    // todo: 使用来自H估计的 R_motion 和 来自运动预测的 P_motion 来计算所有内点的重投影误差，如果小于误差阈值的点的比例小于阈值，则认为该估计不太可靠！
+                    if(num_total_3D_2D_fea > 0)
+                    {
+                        int num_total_3D2D = 0;
+                        float ratio_inliers_reproj = 0, Th_err_near = 2.0, Th_err_far = 2.0;
+
+                        if((frame_cnt == 1 || pred_delta_angle >= 1.0) && delta_ang >= 1.2)
+                        {
+                            if(delta_ang > 2.0)
+                            {
+                                Th_err_far = 3.0;
+                                Th_err_near = 3.0;
+                            }
+                            else
+                            {
+                                Th_err_far = 2.5;
+                                Th_err_near = 2.5;
+                            }
+                        }
+                        else if(frame_cnt > 1 && P_cam_motion.norm() >= 1.1)
+                        {
+                            Th_err_near = 3.0;
+                            if(pred_delta_angle >= 0.7 && delta_ang >= 1.0)  Th_err_far = 2.5;
+                        }
+                        
+                        float ave_err_reproj = cal_ave_reproj_err(R_from_E, P_cam_motion, l_id_all_inliers_H, num_total_3D2D, ratio_inliers_reproj, outliers, Th_err_near, Th_err_far);
+                        
+                        // 参与评估的3D-2D点数不能太少，否则意义不大
+                        if(num_total_3D2D < 4) 
+                        {
+                            // todo:当点数有2-3个且全部无效时，也认为该R估计不准确？
+                            if(num_total_3D2D >= 2 && ratio_inliers_reproj == 0.0)
+                            {
+                                valid_reproj = false;
+                                has_valid_H = false;
+                            }
+                        }
+                        else
+                        {
+                            if(ratio_inliers_reproj < 0.45)
+                            {
+                                valid_reproj = false;
+                                has_valid_H = false;
+                            }
+                        }
+
+                        if(!valid_reproj)
+                        {
+                            cout << "Given H can't pass reproj check! Total 3D-2D of H: " << num_total_3D2D << ", ratio of reproj inlier: " << ratio_inliers_reproj << endl;
+                        }
+                    }
+                    
+                    if(valid_reproj)
+                    {
+                        delta_angle_from_FH = delta_ang;
+
+                        for(auto id: invalid_pt_id_H)
+                        {
+                            if(id <= 0)
+                            {
+                                --num_track_sift_bg;
+                                if(!reserve_non_planar_pt)
+                                {
+                                    // 只删除纯背景跟踪点中的外点
+                                    // 注意，不符合H的背景点不一定是错误跟踪点！如果该点是3D-2D点，则用重投影误差决定该点是否为外点，如果误差较大或者不是3D-2D点则放弃该点！
+                                    // 这样可以避免很多有效背景跟踪点被删除
+                                    // 静态物体3D-2D点的重投影误差检验不在这里进行
+                                    if(obj_cls_id_sift[(-id)].first == 0)
+                                    {
+                                        bool succ = false;
+                                        int g_id = ids_sift[(-id)];
+                                        if(prev_un_r_Fea_map.find(g_id) != prev_un_r_Fea_map.end())
+                                        {
+                                            Vec4f &p_un_p = prev_un_Fea_map[g_id];
+                                            Vec4f &p_un_p_r = prev_un_r_Fea_map[g_id];
+                                            float disp_x_un = p_un_p(0) - p_un_p_r(0);
+                                            if(disp_x_un <= 0)
+                                            {
+                                                cout << "Weired! Line 18660" << endl;
+                                                exit(-1);
+                                            }
+                                            float dep = mbf/disp_x_un/FOCAL_LENGTH_X;
+                                            Vector3d pt_3D(p_un_p(0)*dep, p_un_p(1)*dep, dep);
+                                            Point2f &pt_c = cur_sift[(-id)];
+                                            succ = check_3D2D_fea_by_reproj(pt_3D, pt_c, R_from_E, P_cam_motion, 6.0);
+                                        }
+                                        if(!succ) 
+                                        {
+                                            status_sift[(-id)] = 0;
+                                            if(track_cnt_sift[(-id)] > 2) --num_old_track_fea;
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    // 其中部分跟踪点是静态物体的跟踪点，而这些物体跟踪点中有一部分可能是新的跟踪点，还未在地图中
+                                    // todo: 是否要保留不满足H的静态物体点？静态物体3D-2D点后续会专门进行重投影检验
+                                    if(obj_cls_id_sift[(-id)].first == 0)
+                                        reserve_bg_track_pt_id.insert(ids_sift[(-id)]);
+                                }
+                            }
+                            else
+                            {
+                                --num_track_FAST_bg;
+                                if(!reserve_non_planar_pt)
+                                {
+                                    // 只删除纯背景跟踪点中的外点
+                                    if(obj_cls_id_FAST[(id-1)].first == 0)
+                                    {
+                                        bool succ = false;
+                                        int g_id = ids_FAST[(id-1)];
+                                        if(prev_un_r_Fea_map.find(g_id) != prev_un_r_Fea_map.end())
+                                        {
+                                            Vec4f &p_un_p = prev_un_Fea_map[g_id];
+                                            Vec4f &p_un_p_r = prev_un_r_Fea_map[g_id];
+                                            float disp_x_un = p_un_p(0) - p_un_p_r(0);
+                                            if(disp_x_un <= 0)
+                                            {
+                                                cout << "Weired! Line 18700" << endl;
+                                                exit(-1);
+                                            }
+                                            float dep = mbf/disp_x_un/FOCAL_LENGTH_X;
+                                            Vector3d pt_3D(p_un_p(0)*dep, p_un_p(1)*dep, dep);
+                                            Point2f &pt_c = cur_FAST[(id-1)];
+                                            succ = check_3D2D_fea_by_reproj(pt_3D, pt_c, R_from_E, P_cam_motion, 6.0);
+                                        }
+                                        if(!succ) status_FAST[(id-1)] = 0;
+                                    }
+                                }
+                                else
+                                {
+                                    if(obj_cls_id_FAST[(id-1)].first == 0)
+                                        reserve_bg_track_pt_id.insert(ids_FAST[(id-1)]);
+                                }
+                            }
+
+                            if(!outliers.empty())
+                            {
+                                for(auto &iter: outliers)
+                                {
+                                    if(iter > 0)
+                                    {
+                                        if(obj_cls_id_FAST[(iter-1)].first == 0)
+                                        {
+                                            status_FAST[(iter-1)] = 0;
+                                            if(track_cnt_FAST[(iter-1)] > 2) --num_old_track_fea;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        if(obj_cls_id_sift[(-iter)].first == 0)
+                                        {
+                                            status_sift[(-iter)] = 0;
+                                            if(track_cnt_sift[(-iter)] > 2) --num_old_track_fea;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            cout << "Failed to get R and t direction with H matrix!" << endl;
+            has_valid_H = false;
+
+            // assert(false && "Weired! There are no valid solution of t after decomposition of H!");
+        }
+    }
 }
 
 // 读取相机的内参
@@ -12677,7 +19543,7 @@ void FeatureTracker::ptsVelocity(vector<cv::Point2f> &vel_pts, vector<int> &ids_
                                 map<int, cv::Vec4f> &prev_id_un_pts, bool cal_vel, bool cal_map_un, const vector<uchar> &status_pts, bool for_right_pts)
 {
     // 是否要在此函数内形成当前帧的map
-    if (cal_map_un)
+    if(cal_map_un)
     {
         bool has_status = (!status_pts.empty());
         // prev_id_un_pts.clear();
@@ -12706,7 +19572,7 @@ void FeatureTracker::ptsVelocity(vector<cv::Point2f> &vel_pts, vector<int> &ids_
         vel_pts.clear();
         if (!prev_id_un_pts.empty())
         {
-            double dt = cur_time - prev_time;
+            double dt = cur_dt;
             std::map<int, cv::Vec4f>::iterator it;
             for (unsigned int i = 0; i < un_pts.size(); ++i)
             {
@@ -12735,7 +19601,7 @@ void FeatureTracker::ptsVelocity(vector<cv::Point2f> &vel_pts, vector<int> &ids_
                     // vel_pts.push_back(cv::Point2f(v_x, v_y));
                     vel_pts.emplace_back(v_x, v_y);
                 }
-                // 如果当前帧的某特征地图点在上一帧中没有被观测和匹配到，则该点在两帧图像中的速度为0。即当前帧新点
+                // 如果当前帧的某特征地图点在上一帧中没有被观测和匹配到，则该点在两帧图像中的速度为0。
                 else
                     vel_pts.emplace_back(0.0f, 0.0f);
             }
@@ -12884,15 +19750,17 @@ void FeatureTracker::removeOutliers(set<int> &removePtsIds, const vector<int> &r
     }
 }
 
-void FeatureTracker::RemoveOutliers()
+void FeatureTracker::RemoveOutliers(bool show_track)
 {
     cout << "Start remove fea outliers!" << endl;
-
+    
     // statusLeftRIght在物体关联之后还会进行修改，因此下面部分要放在全部reduceVector完成之后
     // ----------------------------------------------------------------------------
     int j = 0;
     // int temp_num_track_FAST = 0;
     // 只用一次遍历，对所有变量统一进行删减操作
+    int num_prev = prev_FAST.size();
+    int rest_num_prev = 0;
     for (int i = 0; i < ids_FAST.size(); ++i)
     {
         if(statusLeftRIght[i] > 0)
@@ -12914,6 +19782,15 @@ void FeatureTracker::RemoveOutliers()
                 right_FAST_velocity[j] = right_FAST_velocity[i];
                 
                 statusLeftRIght[j] = statusLeftRIght[i];
+
+                if(show_track)
+                {
+                    if(i < num_prev)
+                    {
+                        prev_FAST[j] = prev_FAST[i];
+                    }
+                }
+
                 // if (i < num_track_FAST && ids_FAST[i])
                 // {
                 //     prev_FAST_global_obj_id[j] = prev_FAST_global_obj_id[i];
@@ -12923,6 +19800,7 @@ void FeatureTracker::RemoveOutliers()
 
             // if (i < num_track_FAST && ids_FAST[i] <= last_id_track_FAST_cur) ++temp_num_track_FAST;
             ++j;
+            if(show_track && i < num_prev) ++rest_num_prev;
         }
     }
     
@@ -12944,6 +19822,14 @@ void FeatureTracker::RemoveOutliers()
         cur_un_right_FAST.resize(j);
         right_FAST_velocity.resize(j);
         prev_FAST_global_obj_id.resize(j);
+
+        if(show_track)
+        {
+            if(rest_num_prev < num_prev)
+            {
+                prev_FAST.resize(rest_num_prev);
+            }
+        }
     }
     
     // cout << "Succeeded remove FAST outliers!" << endl;
@@ -12952,6 +19838,8 @@ void FeatureTracker::RemoveOutliers()
     // int temp_num_track_sift = 0;
     j = 0;
     // int num_sift_bg_cur_ = num_sift_bg_cur;
+    num_prev = prev_sift.size();
+    rest_num_prev = 0;
     for (int i = 0; i < ids_sift.size(); ++i)
     {
         if (status_sift[i] > 0)
@@ -12974,11 +19862,20 @@ void FeatureTracker::RemoveOutliers()
                 right_sift_velocity[j] = right_sift_velocity[i];
 
                 status_sift[j] = status_sift[i];
+
+                if(show_track)
+                {
+                    if(i < num_prev)
+                    {
+                        prev_sift[j] = prev_sift[i];
+                    }
+                }
             }
             // 这里需要加上id的范围限制，因为有些跟踪点在匹配或者运动估计时被当作外点，可能转而被当作新特征点，但它们在vector中的排序仍然没有改变！
             // if (i < num_track_sift && ids_sift[i] <= last_id_track_fea_cur) ++temp_num_track_sift;
             // if (i < num_track_sift) ++temp_num_track_sift;
             ++j;
+            if(show_track && i < num_prev) ++rest_num_prev;
         }
         else
         {
@@ -13009,10 +19906,268 @@ void FeatureTracker::RemoveOutliers()
         cur_un_right_sift.resize(j);
         right_sift_velocity.resize(j);
         prev_sift_global_obj_id.resize(j);
-    }
 
-    // cout << "Succeeded remove sift outliers!" << endl;
+        if(show_track)
+        {
+            if(rest_num_prev < num_prev)
+            {
+                prev_sift.resize(rest_num_prev);
+            }
+        }
+    }
     
+    // cout << "Succeeded remove sift outliers!" << endl;
+
+    cout << "Susseeded remove fea outliers!" << endl;
+}
+
+void FeatureTracker::show_valid_track(set<int> spec_frame)
+{
+    // draw and show valid tracked fea in prev images!!
+    if(frame_cnt > 0)
+    {
+        if(!SHOW_TRACK)
+        {
+            if(!spec_frame.empty())
+            {
+                if(spec_frame.find(total_frame) == spec_frame.end())
+                    return;
+            }
+            else
+            {
+                cout << "Weired! Line 19795" << endl;
+                exit(-1);
+            }
+        }
+        
+        bool show_stereo_match = true;
+
+        Mat img_for_stereo;
+        if(show_stereo_match)
+            img_for_stereo= prev_color_img_l.clone();
+
+        bool has_F_gt = false;
+        Matrix3d F_cam_gt;
+        int num_inlier_track = 0;
+        int num_track_lnlier_gt_epi = 0;
+        if(use_gt_to_show_match)
+        {
+            if(gt_motion_P.norm() > 0.08)
+            {
+                has_F_gt = true;
+                Matrix3d t_up;
+                t_up << 0.0, -gt_motion_P(2), gt_motion_P(1), gt_motion_P(2), 0.0, -gt_motion_P(0), -gt_motion_P(1), gt_motion_P(0), 0.0;
+                // 本质矩阵到关键矩阵
+                F_cam_gt = K_trans_inv * t_up * gt_motion_R * K_inv;
+            }
+            else
+            {
+                cout << "Camera is nearly static!" << endl;
+            }
+        }
+        
+        for(int i = 0; i < prev_sift.size(); ++i)
+        {
+            // 无效跟踪点或者当前帧新点跳过
+            if(status_sift[i] == 0 || status_sift[i] == 3) continue;
+
+            int gl_id = ids_sift[i];
+            // 暂不显示不在地图中的物体点
+            if(obj_cls_id_sift[i].first != 0) 
+            {
+                if(sta_obj_fea_in_map_cur.find(gl_id) == sta_obj_fea_in_map_cur.end())
+                    continue;
+            }
+            
+            // if(find(reserve_bg_track_pt_id.begin(),reserve_bg_track_pt_id.end(),gl_id) != reserve_bg_track_pt_id.end()) continue;
+
+            Point2f &pt = prev_sift[i];
+            // 实线的圈代表sift。红色的圈代表被跟踪sift点
+            circle(prev_color_img_l, pt, 4, Scalar(0,0,255), 1, 16);
+            Point2f &pt_cur = cur_sift[i];
+            // 蓝色的线
+            line(prev_color_img_l, pt, pt_cur, Scalar(255,0,0), 1, 16);
+
+            if(show_stereo_match)
+            {
+                if(prevRightFeaMap.find(gl_id) != prevRightFeaMap.end())
+                {
+                    // 绿色的圈代表有立体匹配的sift点
+                    // circle(img_for_stereo, pt, 4, Scalar(0,255,0), 1, 16);
+                    circle(img_for_stereo, pt, 4, Scalar(255,0,0), 1, 16);
+                    Point2f &pt_r = prevRightFeaMap[gl_id];
+                    // line(img_for_stereo, pt, pt_r, Scalar(255,0,0), 1, 16);
+                    line(img_for_stereo, pt, pt_r, Scalar(0,0,255), 1, 16);
+                }
+            }
+
+            if(use_gt_to_show_match)
+            {
+                if(has_F_gt)
+                {
+                    ++num_inlier_track;
+                    Vector3d homo_prev_pt(pt.x, pt.y, 1);
+
+                    Vector3d line_epi = F_cam_gt * homo_prev_pt;
+
+                    float den = line_epi(0) * line_epi(0) + line_epi(1) * line_epi(1);
+
+                    if(den == 0) continue;
+
+                    Vector3d homo_cur_pt(pt_cur.x, pt_cur.y, 1);
+
+                    float dot_line_pt = homo_cur_pt.dot(line_epi);
+
+                    // 当前帧匹配点到真值极线的距离的平方
+                    float dsqr = dot_line_pt*dot_line_pt/den;
+
+                    // 如果点到极线的距离大于x个像素，则以光流线的末端(即当前帧跟踪点)为中心画一个虚线圆（半径为距离误差的2倍）
+                    if(dsqr > 1.5 * 1.5)
+                    {
+                        int radi = sqrtf(dsqr) * 2;
+                        
+                        // 黑色线的圈
+                        circle(prev_color_img_l, pt_cur, radi, Scalar(0,0,0), 1, 16);
+                    }
+                    else
+                    {
+                        ++num_track_lnlier_gt_epi;
+                    }
+                }
+            }
+        }
+        
+        for(int i = 0; i < prev_FAST.size(); ++i)
+        {
+            // 新点也暂不展示
+            if(statusLeftRIght[i] == 0 || statusLeftRIght[i] == 3) continue;
+
+            int gl_id = ids_FAST[i];
+            // 暂不显示没加入地图的物体点
+            if(obj_cls_id_FAST[i].first != 0) 
+            {
+                if(sta_obj_fea_in_map_cur.find(gl_id) == sta_obj_fea_in_map_cur.end())
+                    continue;
+            }
+            
+            Point2f &pt = prev_FAST[i];
+            // 虚线的圈代表FAST.
+            // circle(prev_color_img_l, pt, 4, Scalar(255,0,255), 1, 8);
+            circle(prev_color_img_l, pt, 4, Scalar(0,0,255), 1, 16);
+            Point2f &pt_cur = cur_FAST[i];
+            // 线还是保持实线.FAST的线用绿色的
+            // line(prev_color_img_l, pt, pt_cur, Scalar(0,0,255), 1, 16);
+            line(prev_color_img_l, pt, pt_cur, Scalar(255,0,0), 1, 16);
+            
+            if(show_stereo_match)
+            {
+                if(prevRightFeaMap.find(gl_id) != prevRightFeaMap.end())
+                {
+                    // circle(img_for_stereo, pt, 4, Scalar(255,255,0), 1, 8);
+                    circle(img_for_stereo, pt, 4, Scalar(255,0,0), 1, 16);
+                    Point2f &pt_r = prevRightFeaMap[gl_id];
+                    // line(img_for_stereo, pt, pt_r, Scalar(0,0,255), 1, 16);
+                    line(img_for_stereo, pt, pt_r, Scalar(0,0,255), 1, 16);
+                }
+            }
+            
+            if(use_gt_to_show_match)
+            {
+                if(has_F_gt)
+                {
+                    ++num_inlier_track;
+                    Vector3d homo_prev_pt(pt.x, pt.y, 1);
+
+                    Vector3d line_epi = F_cam_gt * homo_prev_pt;
+
+                    float den = line_epi(0) * line_epi(0) + line_epi(1) * line_epi(1);
+
+                    if(den == 0) continue;
+
+                    Vector3d homo_cur_pt(pt_cur.x, pt_cur.y, 1);
+
+                    float dot_line_pt = homo_cur_pt.dot(line_epi);
+
+                    // 当前帧匹配点到真值极线的距离的平方
+                    float dsqr = dot_line_pt*dot_line_pt/den;
+                    
+                    // 如果点到极线的距离大于x个像素，则以光流线的末端(即当前帧跟踪点)为中心画一个虚线圆（半径为距离误差的2倍）
+                    if(dsqr >= 1.5 * 1.5)
+                    {
+                        int radi = sqrtf(dsqr) * 2;
+
+                        // 黑色线的圈
+                        circle(prev_color_img_l, pt_cur, radi, Scalar(0,0,0), 1, 16);
+                    }
+                    else
+                    {
+                        ++num_track_lnlier_gt_epi;
+                    }
+                }
+            }
+        }
+        
+        
+        bool show_track = false;
+        
+        if(!spec_frame.empty())
+        {
+            if(spec_frame.find(total_frame) != spec_frame.end())
+            {
+                line(prev_color_img_l, Point(0, row/2), Point(col, row/2), Scalar(0,0,0), 4);
+                line(prev_color_img_l, Point(col/2, 0), Point(col/2, row), Scalar(0,0,0), 4);
+                show_track = true;
+            }
+        }
+        else
+            show_track = true;
+        
+        if(use_gt_to_show_match && has_F_gt)
+        {
+            cout << "total num of inlier static track in map: " << num_inlier_track << ", total num of fea that satisfy gt_epi (<= 1.5 pix): " << num_track_lnlier_gt_epi << endl;
+        }
+        
+        // 显示光流匹配和极线误差
+        if(show_track)
+        {
+            while(true)
+            {
+                cv::imshow("final all tracked fea in prev left image", prev_color_img_l);
+                // 一直等待用户按下ESC键（ASCI码为27）
+                if(waitKey(0) == 27)
+                {
+                    break;
+                }
+            }
+            
+            // 显示立体匹配
+            if(show_stereo_match)
+            {
+                while(true)
+                {
+                    cv::imshow("final tracked fea with stereo match in prev left image", img_for_stereo);
+                    if(waitKey(0) == 27)
+                    {
+                        break;
+                    }
+                }
+            }
+
+            // while(true)
+            // {
+            //     cv::imshow("mask of obj in cur frame", prev_mask_solid_objs);
+            //     // 一直等待用户按下ESC键（ASCI码为27）
+            //     if(waitKey(0) == 27)
+            //     {
+            //         break;
+            //     }
+            // }
+        }
+    }
+}
+
+void FeatureTracker::renew_var(const Mat &cls_map)
+{
     // 更新prev_un_Fea_map 和 prev_un_r_Fea_map
     // 在这里进行clear而不在ptsVelocity()函数内进行clear，不然第一次调用时写入的数据会被第2次调用所删除！
     prev_un_Fea_map.clear();
@@ -13032,9 +20187,10 @@ void FeatureTracker::RemoveOutliers()
     {
         prevLeftFeaMap[ids_FAST[i]] = cur_FAST[i];
         // 右图像的匹配像素点有需要吗？需要
-        if (statusLeftRIght[i] == 1) 
+        if(statusLeftRIght[i] == 1)
             prevRightFeaMap[ids_FAST[i]] = cur_right_FAST[i];
     }
+
     for (int i = 0; i < ids_sift.size(); ++i)
     {
         prevLeftFeaMap[ids_sift[i]] = cur_sift[i];
@@ -13046,6 +20202,7 @@ void FeatureTracker::RemoveOutliers()
 
     // ------------------------------------------------------------------------------------
     // 将所有的当前帧参数设置为prev
+    if(frame_cnt > 0) prev_dt = cur_dt;
     // prev_prev_time = prev_time;
     prev_time = cur_time;
     prev_img = cur_img.clone();
@@ -13066,6 +20223,9 @@ void FeatureTracker::RemoveOutliers()
     if(!prev_sift_dep.empty()) prev_sift_dep.clear();
     prev_sift_dep = cur_sift_dep;
 
+    // sta_obj_fea_in_map.clear();
+    // sta_obj_fea_in_map = sta_obj_fea_in_map_cur;
+
     last_id_track_fea_prev = last_id_track_fea_cur;
 
     // num_sift_bg_prev = num_sift_bg_cur;
@@ -13080,8 +20240,6 @@ void FeatureTracker::RemoveOutliers()
     // -------------------------------------------------------------------
 
     prev_mask_solid_objs = mask_solid_objs.clone();
-
-    cout << "Susseeded remove fea outliers and build map of fea in prev frame!!" << endl;
 }
 
 void FeatureTracker::clear_var()
@@ -13119,10 +20277,12 @@ void FeatureTracker::clear_var()
     obj_fea_disp_num.clear();
 
     predict_dep_FAST.clear();
-    FAST_new_objs.clear();
+    FAST_pred_by_flow_map.clear();
 
     pts_for_cal_F.clear();
     temp_pts_for_F.clear();
+    NCC_matching_all.clear();
+    ambi_NCC_new_FAST.clear();
 
     // 用不到
     // prev_un_FAST.clear();
@@ -13168,12 +20328,21 @@ void FeatureTracker::clear_var()
 
     reserve_bg_track_pt_id.clear();
 
+    pts_stereo_large_dep.clear();
+
     // 此变量需要在下一帧中使用到，暂不清除
     // sta_obj_fea_in_map.clear();
     
     sta_obj_fea_in_map_cur.clear();
 
     // added_short_track_Fea.clear();
+
+    bg_track_not_for_cal_FH.clear();
+
+    num_fea_3D2D_big_bloc.clear();
+    // num_fea_stereo_big_bloc.clear();
+    num_fea_2D2D_big_bloc.clear();
+    pt_2d_2d_small_bloc.clear();
 
     ave_dep_bg_cur_frame = 0.0;
     num_bg_with_dep = 0;
@@ -13190,10 +20359,18 @@ void FeatureTracker::clear_var()
     num_track_FAST = 0;
     num_track_sift = 0;
 
+    num_track_sift_obj = 0;
+    num_new_sift_obj = 0; 
+    num_track_FAST_obj = 0; 
+    num_new_FAST_obj = 0;
+
     num_long_track_fea_stat = 0;
 
+    ave_flow_len_sta_fea = 0;
     cal_Mat_F_H = false;
     fea_filtered = false;
+    has_valid_F = false;
+    has_valid_H = false;
     appro_num_track_stat_fea = 0;
     use_prev_fea = false;
 
@@ -13204,7 +20381,35 @@ void FeatureTracker::clear_var()
 
     num_up_half = 0;
     
+    wait_done = false;
+    done_select_sift_bg = false;
     // has_motion_pred_first_two_frame = false;
+
+    num_fea_3D2D_big_bloc.clear();
+
+    fea_g_id_dep.clear();
+
+    num_near_3D_2D_fea = 0;
+    num_total_3D_2D_fea = 0;
+
+    for(int i = 0; i < 4; ++i)
+    {
+        num_near_fea[i] = 0; 
+        num_far_fea[i] = 0;
+
+        num_sta_obj_track_per_bloc[i] = 0;
+    }
+
+    g_id_sta_obj_2D2D_high_NCC.clear();
+    g_id_sta_obj_3D2D_high_NCC.clear();
+    g_id_sta_obj_3D2D.clear();
+    cand_g_id_sta_obj_fea.clear();
+    l_id_3D_2D_obj_fea.clear();
+    num_3D_2D_bg_track = 0;
+
+    ave_dep_cur_objs.clear();
+
+    tracked_pts_above_th_dep.clear();
 }
 
 cv::Mat FeatureTracker::getTrackImage()

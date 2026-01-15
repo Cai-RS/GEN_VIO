@@ -99,9 +99,12 @@ void calc_num_unique_value(vector<T> &src, vector<pair<T,int>> &dst)
 
 template<typename T> void cal_centre_and_dist_pts(const vector<T> &pts, const set<int> &outliers, vector<float> &dist_pts, float factor_, bool has_cent, T &cent_pt);
 
-template<typename T> float cal_rubust_norm_stderr_pts_dist(vector<float> &pts_dist, bool need_cal_dist, const vector<T> &pts, float factor_, set<int> &outliers_pts, bool has_cent, T &cent_pt, bool need_normalized = true, bool cal_std_dist = true);
+template<typename T> float cal_rubust_norm_stderr_pts_dist(const vector<float> &pts_dist, bool need_cal_dist, const vector<T> &pts, float factor_, set<int> &outliers_pts, bool has_cent, T &cent_pt, 
+                                                            bool cal_std_dist = true, bool need_normalized = false, bool more_try_find_outlier = false, bool one_dimen_pts = false, bool cout_MAD = false);
 
-void cal_MAD_value(vector<float> pts, float &dist_MAD, float &dist_median);
+void cal_MAD_value(vector<float> pts, float &dist_MAD, float &dist_median, set<int> outliers_pts = set<int>());
+
+void use_MAD_to_filter_dep_outlier(vector<float> &dep_pts, set<int> &outliers, float &cent_dep, bool more_iter = false, bool cout_MAD = false);
 
 class FeatureTracker
 {
@@ -109,71 +112,113 @@ public:
     // EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     FeatureTracker();
     ~FeatureTracker();
-    void trackImage(int frame_count, const cv::Mat &_img, bool &end_flow_post, const cv::Mat &seg_map, bool &end_FAST_track, const cv::Mat &prev_dep_map = cv::Mat(), 
-                    const cv::Mat &flow_map = cv::Mat(), const vector<Vector3d> &Ps = vector<Vector3d>(), const vector<Matrix3d> &Rs = vector<Matrix3d>());
-    
-    void reduce_invalid_fea(bool for_sift);
 
-    void select_sift_V1(int frame_count, const cv::Mat &_img1, const cv::Mat &seg_map_prev, const cv::Mat &seg_map_cur, 
-                    const cv::Mat &map_depth_prev, const cv::Mat &flow_map, bool &end_flow_post, bool inti_succ_IMU = false, bool use_mask_img = false);
-    
-    void select_sift_V2(int frame_count, const cv::Mat &_img1, const cv::Mat &seg_map_prev, const cv::Mat &seg_map_cur, 
-        const cv::Mat &map_depth_prev, const cv::Mat &flow_map, bool &end_flow_post, bool inti_succ_IMU = false, bool use_mask_img = false);
+    bool inBorder(const cv::Point2f &pt);
 
-    void det_new_FAST_objs(const int &frame_count, const int num_solid_obj, const cv::Mat &seg_map, const cv::Mat &cls_map, const cv::Mat &depth_map, bool initial_succ, const bool &marg_old_prev, bool &stereo_match_done, const cv::Mat &_img1 = cv::Mat());
-    // 弃用
-    void assign_FAST_objs(FASTFrame &FAST_frame, FeaObjFrame &TrackObjFeaFrame, FeaObjFrame &NewObjFeaFrame, vector<pair<int,int>> &num_obj_FAST);
-    void assign_fea_objs(int frame_count, const Mat &dep_map, bool &end_flow_post, bool &end_stereo_post, const Mat &_img1, const vector<int> &valid_obj_id, const Mat &obj_id_map, map<int, YoloV8::Box> &bbox_mask);
+    void sorted_sift();
 
     void draw_mask_fea_prev_obj(const double &cur_time);
+
     void setMask(bool initial_succ);
     // 新版的mask设置函数，不考虑是否使用IMU或者是否已经完成初始化
-    void setMask(bool initial_succ, bool use_IMU);
+    void setMask();
 
-    void set_new_fea_in_mask(bool initial_succ);
+    void set_new_fea_in_mask();
+
+    void draw_bg_fea_in_mask_prev(Mat &prev_bg_mask, vector<Point2f> &pts_prev, int start_index = 0, const vector<uchar> &track_status = vector<uchar>());
+
+    void reduce_invalid_fea(bool for_sift);
+
+    int check_ambi_detected_fea(const Mat &_img, const Point2f &fea, const bool is_sift_match = true, const float Th_ambi_min = 0.0, int len_win = 7);
     
-    void sorted_sift();
+    float cal_NCC(const Mat &prev_img, const Mat &cur_img, const Point2f &prev_pt, const Point2f &cur_pt, int len_win);
+
+    float cal_check_by_ambi_NCC(const Mat &prev_img, const Mat &cur_img, const Point2f &prev_pt, const Point2f &cur_pt, int len_win, float &ambi_NCC, 
+                                const bool is_sift_match = true, const float NCC_cen = 0.0, const float Th_ambi_min_max = 0.0);
     
-    void objs_matching_assign(int frame_count, double dt, const cv::Mat &seg_map, const cv::Mat &flow_map, const cv::Mat &depth_map_2, bool initial_succ,  
-                                bool has_pred_motion_objs_cam = true, const vector<Vector3d> &Ps = vector<Vector3d>(), const vector<Matrix3d> &Rs = vector<Matrix3d>());
+    float cal_best_NCC(const Mat &prev_img, const Mat &cur_img, const Point2f &prev_pt, const Point2f &cur_pt, int len_win, float &shift_x, float &shift_y, const bool check_ambi = false, 
+                        const bool is_SIFT = true, const float Th_ambi_min_max = 0.0, const bool is_flow_match = false, const float u_shift_max = 0, const float v_shift_max = 0);
+    
+    void sort_match_by_NCC(const Mat &prev_img, const Mat &cur_img, vector<Point2f> &prev_FAST, vector<Point2f> &cur_FAST, vector<uchar> &status_FAST, 
+                            vector<pair<float,int>> &value_id_FAST, map<int,Vec2f> &shift, map<int,float> &id_ambi_NCC, const int check_ambi = 0, const float Th_ambi_min_max = 0.0);
+    
+    void detect_new_FAST_prev(int num_detect, Mat &mask_bg, vector<Mat> &mask_img_to_draw_invalid_pt, vector<Point2f> &addad_new_FAST_prev, float quality_level = 0.05,
+                                bool sort_by_point_quality = false, bool sort_by_bloc = false, int check_ambi = 1, float Th_ambi_min = 0.0, int radi = 25);
+    
+    int Track_and_Filter_FAST(vector<Point2f> &FAST_prev, vector<Point2f> &FAST_cur, vector<uchar> &status_fea_track, const bool HasPrediction, const cv::Mat &seg_map, const bool add_up = false, 
+                            int num_need_to_save = 0, float thres_high = 0.98, float thres_low = 0.96, const bool has_F_est = false, const float Th_ambi_min_max = 0.0);
+    
+    bool new_FAST_detect_and_track(cv::Mat &base_mask_full_img, float high_th_NCC, float low_th_NCC, int &num_valid_track, const cv::Mat &seg_map, const cv::Mat &flow_map, 
+                                    const vector<int> &min_num_track_need, int max_cnt_try = 3, int total_num_need = 0, const bool has_F_est = false, const float Th_ambi_min_max = 0.0);
+    
+    float find_stereo_match_by_best_NCC(const Point2f &left_pt, Point2f &find_r_pt, float thres_min_NCC = 0.96, float search_range_x = 10.0, bool has_pred = true);
+    
+    int find_stereo_for_tracked_fea(const cv::Mat &prev_dep_map, const vector<int> &near_pt_need_bloc, const vector<int> &total_num_need_bloc, int &num_near_3D_2D, 
+                                        int &num_total_3D_2D, int near_pt_need = 0, int total_num_need = 0, int start_id_FAST = 0, int start_id_SIFT = 0, bool has_est_FH = false);
+    
+    void find_stereo_for_fea_in_cur_frame(bool for_sift, const Mat &seg_map, const Mat &depth_map = cv::Mat(), bool find_stereo_for_bg_fea = false);
+    
+    // Shi-Thomasi点检测和跟踪
+    void trackImage(bool &end_flow_post, const cv::Mat &seg_map_cur, bool &end_FAST_track, const cv::Mat &prev_dep_map = cv::Mat(), 
+                    const cv::Mat &flow_map = cv::Mat(), const vector<Vector3d> &Ps = vector<Vector3d>(), const vector<Matrix3d> &Rs = vector<Matrix3d>());
+    
+    void select_SIFT(bool has_r_img, const cv::Mat &seg_map_prev, const cv::Mat &seg_map_cur, const cv::Mat &map_depth_prev, 
+                        const cv::Mat &flow_map, bool &end_flow_post, bool &done_cam_motion_pred, bool use_mask_img = false);
+    
+    void det_new_FAST_objs(const int num_solid_obj, const cv::Mat &seg_map, const cv::Mat &cls_map, const cv::Mat &depth_map, const bool &marg_old_prev, bool &stereo_match_done);
+    
+    void assign_fea_objs(const Mat &dep_map, bool &end_flow_post, bool &end_stereo_post, const vector<int> &valid_obj_id, const Mat &obj_id_map, map<int, YoloV8::Box> &bbox_mask);
+    
+    void objs_matching_assign(const cv::Mat &seg_map, const cv::Mat &flow_map, const cv::Mat &depth_map_2, bool has_pred_motion_objs_cam = true, 
+                                const vector<Vector3d> &Ps = vector<Vector3d>(), const vector<Matrix3d> &Rs = vector<Matrix3d>());
     
     bool check_match_two_objs(bool use_fea, bool cal_3D_pred_err, map<int, vector<pair<int, Eigen::Matrix<double, 8, 1>>>> &fea_cur_obj, const int id_checked_prev_obj, const int id_checked_cur_obj,
                                 map<int, pair<vector<Vec2f>,vector<Vec2f>>> &match_pts_of_prev_obj, map<int, pair<vector<float>,vector<float>>> &dep_match_pts_of_prev_obj,
                                 vector<vector<int>> &final_assign_id_cur_objs, const cv::Mat &seg_map, const cv::Mat &flow_map, const cv::Mat &depth_map_2, const vector<Vector3d> &Ps, 
                                 const vector<Matrix3d> &Rs, bool has_pred_motion, Vector3d &P_12, Matrix3d &R_12, bool &cur_sta_obj, float &ave_depth, 
-                                map<int,vector<int>> &assign_prve_id, bool direct_erase_pts = false, bool cal_ave_depth_prev_pts = false);
-                                
+                                map<int,vector<int>> &assign_prve_id, bool direct_erase_pts = false, bool cal_ave_dep = true, bool cal_ave_depth_prev_pts = false);                        
+    
     // ave_depth_cur如果想要设置默认值，则前面必须要加const！！即缺省的引用只能用于读，不能写！！因为C ++不允许将临时量（例如参数的默认值）绑定到非const引用！
     bool check_stat_obj(bool use_fea, map<int, vector<pair<int, Eigen::Matrix<double, 8, 1>>>> &fea_cur_obj, 
-                                    const int id_checked_prev_obj, const vector<int> &matched_cur_objs, const Vector3d &P_12,
-                                    const Matrix3d &R_12, float &ave_depth_cur, const cv::Mat &seg_map = cv::Mat(),
-                                    const cv::Mat &flow_map = cv::Mat(), const cv::Mat &depth_map_2 = cv::Mat(), bool direct_erase_pts = true);
-
+                        const int id_checked_prev_obj, const vector<int> &matched_cur_objs, const Vector3d &P_12,
+                        const Matrix3d &R_12, float &ave_depth_cur, const cv::Mat &seg_map = cv::Mat(),
+                        const cv::Mat &flow_map = cv::Mat(), const cv::Mat &depth_map_2 = cv::Mat(), bool direct_erase_pts = true);
+    
     int track_pixels_one_prev_obj(int prev_glob_obj_id, const cv::Mat &seg_map, const cv::Mat &flow_map, const cv::Mat &depth_map, 
                                     map<int, pair<vector<Vec2f>, vector<Vec2f>>> &match_pts, map<int, pair<vector<float>,vector<float>>> &match_pts_depth);
-
-    // const map<int, YoloV8::BoxArray> &bbox_seg
-
+    
     set<int> calcu_2d_3d_pts_dist(vector<float> &dist, bool pixel_pt, vector<Vec2f> &pts1, float &ave_depth_cur, vector<Vec2f> &pts2, bool cal_pts_var = false, 
                                 bool cal_ave_3d_dist = false, const Vector3d &p_obj12 = Vector3d::Zero(), const Matrix3d &r_obj12 = Matrix3d::Identity(), 
-                                const vector<float> &pts_depth_1 = vector<float>(), const vector<float> &pts_depth_2 = vector<float>(), const bool &cal_ave_depth_prev_pts = false);
+                                const vector<float> &pts_depth_1 = vector<float>(), const vector<float> &pts_depth_2 = vector<float>(), const bool &cal_ave_dep = false, const bool &cal_ave_depth_prev_pts = false);
     
-    bool match_score_two_objs(const int id_checked_prev_obj, const vector<int> &id_checked_cur_objs, vector<float> &score_match, const cv::Mat &seg_map, const cv::Mat &flow_map, 
-                                const cv::Mat &depth_map_2, const vector<Vector3d> &Ps, const vector<Matrix3d> &Rs);
-    void Ptspredict_motion(const int &frame_count, const Matrix3d &RCam_motion, const Vector3d &PCam_motion, const Matrix3d &RCam_cur_pred, const Vector3d &PCam_cur_pred, bool pred_for_new_objs = true, bool use_motion = true);
-    void Ptspredict_flow(const cv::Mat &flow_map, const cv::Mat &seg_map);
+    bool match_score_two_objs(const int id_checked_prev_obj, const vector<int> &id_checked_cur_objs, vector<float> &score_match, const cv::Mat &seg_map,  
+                                const cv::Mat &flow_map, const cv::Mat &depth_map_2, const vector<Vector3d> &Ps, const vector<Matrix3d> &Rs);
+    
+    void Ptspredict_motion(bool for_sift, bool pred_for_new_objs = true, bool use_motion = true);
+    
+    void Pts_pred_by_flow_map(const vector<Point2f> &all_pts_prev, const vector<int> &id_pts_select, vector<Point2f> &pts_cur, const cv::Mat &flow_map, const cv::Mat &seg_map);
+
+    void track_pred_for_new_det_prev_fea(const vector<Point2f> &all_pts_prev, vector<Point2f> &pts_cur, const cv::Mat &flow_map, const cv::Mat &seg_map);
+    
     void readIntrinsicParameter(const vector<string> &calib_file);
+
     void showUndistortion(const string &name);
     
     void UpdateCosts(const std::vector<std::vector<float>>& association_mat, SecureMat<float>* costs);
     
-    int check_flow_with_F(const Matrix3d &F_cam, const Point2f &pt1, const Point2f &pt2);
     void DecomposeE(const Mat &E, Mat &R1, Mat &R2, Mat &t);
-    // bool epipolarConstrain(const vector<Point2f> &kp1, const vector<Point2f> &kp2, const Eigen::Matrix3d& Mat_F, vector<uchar> &is_inlier);
-    bool HomographyConstrain(vector<Point2f> &kp1, vector<Point2f> &kp2, const Eigen::Matrix3d& Mat_H, const Eigen::Matrix3d& Mat_H_inv, vector<uchar> &is_inlier, const float &Th_score, float &score, const float &Th_dist = 4.5);
-    void rejectWithFV1(bool for_sift, bool inti_succ_IMU = false, const set<int> &pts_for_F = set<int>());
-    void rejectWithFV2(bool inti_succ_IMU = false, const set<int> &pts_for_F = set<int>());
+    
+    bool check_3D2D_fea_by_reproj(const Vector3d &pt_3D, const Point2f &pt_2D, const Matrix3d &R_motion, const Vector3d &P_motion, const float &Th_err);
+    
+    float cal_ave_reproj_err(const Matrix3d &R_motion, const Vector3d &P_motion, const vector<int> &l_id_all_inliers, int &num_3D_2D, 
+                                float &ratio_inlier_reproj, set<int> &outliers, float Th_err_near_pt = 4.0, float Th_err_far_pt = 2.5, bool pt_2D_is_pixel = true);
+    
+    void rejectWithFV1(bool for_sift, const set<int> &pts_for_F = set<int>());
+    void rejectWithFV2(const set<int> &pts_for_F);
     // void recover_scale_t();
+    
+    void Decomp_check_RT_from_H(const Mat &Mat_H, const vector<uchar> &status_fea_H, vector<Point2f> &prev_pts, vector<Point2f> &cur_pts, float pred_delta_angle, 
+                                const vector<int> &l_id_all_inliers_H, bool &has_valid_H, vector<int> &invalid_pt_id_H, const bool reserve_non_planar_pt);
     
     // vector<cv::Point2f> undistortedPts(const vector<cv::Point2f> &pts, camodocal::CameraPtr cam);
     void undistortedPts(const vector<cv::Point2f> &pts, vector<cv::Point2f> &un_pts, camodocal::CameraPtr cam, const vector<uchar> &status_pts = vector<uchar>(), bool for_rigth_pts = false);
@@ -185,32 +230,76 @@ public:
     void ptsVelocity(vector<cv::Point2f> &vel_pts, vector<int> &ids, vector<cv::Point2f> &un_pts, map<int, cv::Vec4f> &prev_id_un_pts, 
                         bool cal_vel = true, bool cal_map = true, const vector<uchar> &status_pts = vector<uchar>(), bool for_right_pts = false);
     
-    void showTwoImage(const cv::Mat &img1, const cv::Mat &img2, 
-                      vector<cv::Point2f> pts1, vector<cv::Point2f> pts2);
-    void drawTrack(const cv::Mat &imLeft, const cv::Mat &imRight, 
-                                   vector<int> &curLeftIds,
-                                   vector<cv::Point2f> &curLeftPts, 
-                                   vector<cv::Point2f> &curRightPts,
-                                   map<int, cv::Point2f> &prevLeftPtsMap);
+    void showTwoImage(const cv::Mat &img1, const cv::Mat &img2, vector<cv::Point2f> pts1, vector<cv::Point2f> pts2);
+
+    void drawTrack(const cv::Mat &imLeft, const cv::Mat &imRight, vector<int> &curLeftIds, vector<cv::Point2f> &curLeftPts, 
+                    vector<cv::Point2f> &curRightPts, map<int, cv::Point2f> &prevLeftPtsMap);
+    
     void setPrediction(map<int, Eigen::Vector3d> &predictPts);
+
     double distance(cv::Point2f &pt1, cv::Point2f &pt2);
+
     float cal_dist_img_center_to_flow_line(cv::Point2f &pt1, cv::Point2f &pt2);
+    
     void removeOutliers(set<int> &removePtsIds, const vector<int> &reserve_sift, const vector<int> &reserve_FAST);
-    void RemoveOutliers();
+
+    void RemoveOutliers(bool show_track);
+
+    void show_valid_track(set<int> spec_frame_to_show = set<int>());
+
+    void renew_var(const Mat &cls_map);
+
     void clear_var();
+
     cv::Mat getTrackImage();
     
-    bool inBorder(const cv::Point2f &pt);
-    
+    // 记录各个bloc上初步获取的跟踪点数量
     int num_flow_pt_in_bloc[6][6];
     int num_temp_flow_pt_in_bloc[6][6];
     int num_long_track_FAST_in_bloc[6][6];
     int id_best_track_bloc[6][6];
+
+    int num_new_FAST_detect[6][6];
+    int max_num_track_big_bloc[4];
+    int max_num_track_for_FH_big_bloc[4];
+    int num_3D2D_sta_obj_fea[4], min_num_near_3D2D[4], min_total_num_3D2D[4];
     
-    int total_frame;
+    // 在fea-tracking阶段，近处的静态物体上（符合估计的F/H约束，如果有的话）所有有效的2D-2D跟踪点。其中部分跟踪点在寻得上一帧的立体匹配后，会变成可靠的静态3D-2D跟踪点，可以作为地图点的补充
+    set<int> g_id_sta_obj_2D2D_high_NCC, g_id_sta_obj_3D2D_high_NCC;
+    // 在fea-tracking阶段选择要加入当前帧地图的静态物体3D-2D跟踪点，以及部分通过了检查但没入选的被用静态物体3D2D点（以防部分被选择点后续在objs-matching阶段没被提前确定为当前帧的静态物体）
+    set<int> g_id_sta_obj_3D2D, cand_g_id_sta_obj_fea;
+    vector<int> l_id_3D_2D_obj_fea;
+    int num_3D_2D_bg_track;
+    
+    // 记录在每个大bloc中找到的静态物体跟踪点数目（不超过规定值）及点的局部id
+    int num_sta_obj_track_per_bloc[4];
+    int id_sta_obj_track_per_bloc[4][NUM_FEA_IN_BLOC];
+    set<int> l_id_outliers_sta_obj_fea;
+    
+    Mat mask_appeared_fea_prev[4];
+    Mat mask_for_cover_big_bloc[4];
+    
+    // 用于记录各个小bloc上最终的跟踪点，其中每个bloc的点都按照NCC从大到小排列
+    int id_track_fea_per_bloc[36][NUM_FEA_IN_BLOC];
+    // 每个小bloc中的跟踪点的数量限制
+    vector<int> limit_num_track_per_bloc, pt_2d_2d_small_bloc;
+    
+    // 记录上下左右四个大bloc中最终保留的 在上一帧具有深度值（来自立体匹配或运动更新） 的跟踪点的数量和id，最多不超过NUM_FEA_IN_BIG_BLOC个点
+    int id_fea_3D2D_big_bloc[4][NUM_FEA_IN_BIG_BLOC];
+    vector<int> num_fea_3D2D_big_bloc;
+    // // 记录上下左右四个大bloc中最终保留的 在上一帧具有立体匹配 的跟踪点的数量(这些点被优先用于进行PnP)
+    // vector<int> num_fea_stereo_big_bloc;
+    // // 记录上下左右四个大bloc中最终保留的 在2D-2D跟踪点的数量和id，最多不超过NUM_FEA_IN_BIG_BLOC个点
+    // 预留的内存大一倍，这个量也用于存放临时跟踪点id
+    int id_fea_2D2D_big_bloc[4][2*NUM_FEA_IN_BIG_BLOC];
+    vector<int> num_fea_2D2D_big_bloc;
+    int id_small_bloc_in_big_bloc[4][9];
+    
+    // 记录临时添加的上一帧深度超过阈值（太近或太远）的背景跟踪点
+    set<int> tracked_pts_above_th_dep;
     
     SiftPtr Sift_;
-
+    
     // 根据规定的深度范围，计算出像素的平均立体匹配视差值，可以得到立体匹配中右图像点的初始值
     float ave_disp_obj, ave_disp_bg;
     
@@ -261,37 +350,47 @@ public:
     
     bool check_total_lost_cur_objs;
     
-    int num_sta_objs_found;
     set<int> id_gl_sta_obj;
 
-    int frame_cnt;
+    int frame_cnt, total_frame;
+    double prev_dt, cur_dt;
     int row, col;
     // 左相机坐标系下的右相机视锥体的左侧面的方程，aX+bY+cZ+d=0。将左相机坐标系下估计的点（X，Y，Z）代入方程左边，如果结果小于0，则说明估计的点位于右相机视锥体之外
     double r_cam_3D_plane[4];
     float bg_left_border_left_img, obj_left_border_left_img, bg_right_border_right_img, obj_right_border_right_img;
     
-    cv::Mat imTrack;
+    cv::Mat K_cv;
+    
+    cv::Mat imTrack, Mat_img_for_show;
     cv::Mat tracked_fea_prev_img;
     cv::Mat mask_bg, mask_bg_prev, mask_bg_cur, mask_solid_objs, mask_prev_fea_objs;
     cv::Mat prev_mask_solid_objs;
-
+    cv::Mat mask_bg_fea_prev, mask_up_half_img, mask_low_half_img;
+    cv::Mat prev_img_for_show_fea;
+    
+    bool use_MAD_to_fliter_flow;
     bool use_prev_fea;
     bool copy_mask_bg;
     bool done_select_sift, done_track_FAST;
     bool show_tracked_fea;
     bool has_lost_obj_prev;
-
+    
     //cv::Mat fisheye_mask;
     cv::Mat prev_img, prev_img_r, cur_img, cur_img_r;
-    cv::Mat prev_color_img_l, prev_color_img_r;
+    cv::Mat prev_color_img_l, prev_color_img_r, cur_color_img_l;
     int row_img_prev, col_img_prev;
     
+    bool IMU_init_succ;
     bool USE_TRIANGULATE_TWO_FRAME;
-    bool reject_with_F, EASI_RANSAC_FH, has_valid_F, has_valid_H, fea_filtered, has_motion_pred_first_two_frame;
+    
+    // 是否要在背景跟踪点在当前帧就保留立体匹配
+    bool add_stereo_for_bg_fea_cur_frame;
+    bool reject_with_F, need_cal_FH, before_cal_FH, ESTI_RANSAC_FH, has_valid_F, has_valid_H, fea_filtered, has_motion_pred_first_two_frame;
+    set<int> bg_track_not_for_cal_FH;
     set<int> reserve_bg_track_pt_id;
     bool only_use_track_sift_for_F;
     bool FAST_pred_motion, sift_pred_motion, cal_pred_for_sift_track;
-    bool add_new_FAST_from_sift, add_new_sift_in_next_frame;
+    bool add_new_fea_in_next_frame, add_new_FAST_from_sift, done_select_sift_bg, wait_done;
     // 上一帧和当前帧中的特征点（像素坐标）
     std::vector<cv::Point2f> prev_FAST, cur_FAST, cur_right_FAST, prev_sift, cur_sift, cur_right_sift;
     std::vector<int> FAST_no_stereo_bg, sift_no_stereo_bg;
@@ -326,7 +425,10 @@ public:
     int num_bg_with_dep, num_bg_sift_with_dep;
     int id_new_track_sift;
     std::map<int,Vec<float,8>> new_sift_stereo_prev;
-    std::vector<int> FAST_new_objs;
+    std::vector<int> FAST_pred_by_flow_map;
+    std::vector<float> ambi_NCC_new_FAST;
+    map<int,float> id_ambi_NCC_new_sift;
+    
     // vector<cv::Point2f> predict_FAST_debug;
     // 记录当前帧所有FAST或sift点是否要保留。
     // status_FAST为上一帧的FAST点在当前帧的跟踪情况（1为跟踪到，0为否）；后面两个则是当前帧所有特征点（跟踪+新检测）最后是否要保留，1为保留，0为否。
@@ -356,8 +458,16 @@ public:
 
     std::set<int> pts_for_cal_F;
     vector<int> temp_pts_for_F;
+    vector<pair<int,float>> NCC_matching_all;
+    vector<pair<float,int>> pts_stereo_large_dep;
+    float ave_flow_len_sta_fea;
     int num_up_half;
-
+    int num_old_track_FAST, num_old_track_sift;
+    int num_near_3D_2D_fea, num_total_3D_2D_fea;
+    // 在上一帧具有深度值的背景跟踪点的g_id以及是近点(0)或远点(1)
+    std::map<int,uchar> fea_g_id_dep;
+    int num_near_fea[4], num_far_fea[4];
+    
     std::vector<camodocal::CameraPtr> m_camera;
     double prev_prev_time, prev_time, cur_time;
     bool stereo_cam;
@@ -368,6 +478,7 @@ public:
     bool hasPrediction;
     // 跟踪点集 和 新检测点集 中属于背景点 的个数
     int num_track_sift_bg, num_new_sift_bg, num_track_FAST_bg, num_new_FAST_bg;
+    int num_track_sift_obj, num_new_sift_obj, num_track_FAST_obj, num_new_FAST_obj;
     // 跟踪点集中属于静态点（包含了背景和上一帧静态物体）的个数
     int num_track_sift_static, num_track_FAST_static, num_track_fea_static;
     // 当前帧的特征点中属于跟踪自上一帧的个数(指的是最终的有效跟踪点数)和总数
@@ -376,19 +487,29 @@ public:
     int num_sta_FAST_long_track, num_sta_sift_long_track, num_long_track_fea_stat;
     // 各物体的匹配点集中属于特征点的个数。如果需要使用物体上的像素点匹配的话。
     // vector<int> num_fea_objs;
-
+    
+    // 每一帧处理完成后，地图中 保留的连续观测帧数 >=2的点 和 >=3的点（如果滑窗长度允许大于3）
+    set<int> fea_with_more_frames_in_map, fea_with_3_frames_in_map;
+    
     Mat Mat_F, Mat_H;
+    Matrix3d F_cam, F_cam_by_cal_FE, H_cam;
     Matrix3d R_from_E;
     Vector3d t_from_E;
+    bool small_p;
     bool cal_Mat_F_H;
     
     // 每一帧应该至少要保留的在上一帧有深度值的静态跟踪点（背景点和物体点）
-    int num_old_track_fea, num_track_fea_with_dep_prev, num_rest_track, num_rest_track_stereo;
+    int num_old_track_fea, num_track_fea_with_dep_prev;
+    
+    // 上一帧的相机位姿，估计的上一帧与当前帧之间相机的运动（不带W的是表达在当前帧相机坐标系，带w的表达在世界坐标系下）
+    Matrix3d prev_cam_R, R_cam_motion, R_cam_motion_w;
+    Vector3d prev_cam_P, P_cam_motion, P_cam_motion_w;
+    double pred_trans_cam, pred_delta_angle_cam, delta_angle_from_FH;
 
-    // 估计的上一帧与当前帧之间相机的运动，用于构建当前帧相机运动的F矩阵
-    Matrix3d R_cam_motion;
-    Vector3d P_cam_motion;
-
+    // gt motion of cam to show epipolar constraint error
+    Matrix3d gt_motion_R;
+    Vector3d gt_motion_P;
+    
     int appro_num_track_stat_fea;
 
     // openMP中的变量锁
@@ -406,7 +527,9 @@ public:
     // 二维数组在内存中是连续的！
     // map<int, vector<cv::Point3f>> pixel_objs_prev;
     std::map<int, float*> pixel_objs_prev;
-
+    // 当前帧每个被检测（的临时）物体的平均深度，以及上一帧每个保留的全局物体的平均深度
+    map<int,float> ave_dep_cur_objs, ave_dep_prev_objs;
+    
     // 每一帧中每个考虑类别的刚体上采集的像素点数（3维点），每个点都是2维“像素“坐标和深度值紧挨着。
     // 每一行最前面的2个float分别保存该物体的全局类别（一开始为局部id，后面和全局物体关联后就修改为全局cls）和有效的采样点的点数，紧接是NUM_SAMPLED_PIXEL_OBJ个采样点之外（不一定都有效），最后5个元素是bbox的信息（左、右、上、下极限）和特征点的（相机坐标系下的）平均3D点坐标
     // 定义数组大小只能用常量，因此MAX_NUM_OBJS_FRAME和NUM_SAMPLED_PIXEL_OBJ必须是const型变量！

@@ -21,7 +21,7 @@ std::vector<Eigen::Vector3d> TIC;
 Eigen::Vector3d G{0.0, 0.0, 9.8};
 
 // int WINDOW_SIZE;
-
+float Cam_H;
 double BIAS_ACC_THRESHOLD;
 double BIAS_GYR_THRESHOLD;
 double SOLVER_TIME;
@@ -61,10 +61,21 @@ int MAX_CNT;
 
 int MIN_DIST_BG;
 int MIN_DIST_OBJ;
+int REJECT_WITH_F;
 double F_THRESHOLD;
+double H_THRESHOLD;
 double Th_score;
+int Cal_FH_after_IMU_init_succ;
 int SHOW_TRACK;
 int FLOW_BACK;
+
+int sort_by_NCC;
+int Len_edge_win;
+int check_detect_by_ambi_NCC;
+int check_match_by_ambi_NCC;
+int sort_all_sift_FAST;
+int refine_matching_flow;
+int refine_matching_stereo;
 
 float mThDepthBg;
 float mThDepthObj;
@@ -76,7 +87,7 @@ int border_x;
 int border_y;
 
 int MAX_CNT_PTS_BG;
-int MAX_CNT_PTS_OBJ;
+int MIN_CNT_PTS_OBJ;
 int MIN_CNT_PTS_TRACK_BG;
 int MIN_CNT_PTS_TRACK_OBJ;
 int MAX_CNT_PTS_TRACK_BG;
@@ -86,6 +97,10 @@ float AVE_DIST_3D_PTS_THRES;
 bool has_stereo_rectified;
 
 int TH_NUM_FRAME_FOR_LBA;
+int Min_num_old_track_per_frame;
+int Use_LBA_for_puer_V;
+int Th_num_fea_for_LBA_pure_V;
+
 int Thres_num_track_cur;
 
 float Thres_Ambiguity_Flow;
@@ -99,17 +114,47 @@ int PnP_per_frame;
 
 float Min_dist_flow;
 float Th_epipolar_con;
+float Th_homography_con;
+int Check_flow_with_pred_motion;
 
 int Min_num_bg_track_with_dep_prev;
 
 int Limit_num_static_track;
 
-int use_Marg;
+int retain_marg_info;
+
+int Use_5_pts;
+
+int Res_non_planar_pt;
+
+int Use_tria_for_2d2d;
+
+int Cal_cur_dep_by_motion;
+
+int Trust_dep_from_motion;
+
+int Check_dep_with_reproj_err;
+
+int Use_pred_dep_to_find_stereo_mtach;
+
+float Th_dep_sta_obj_fea_to_add;
+
+float Base_max_th_ambi_NCC;
+
+int Min_total_near_3D2D_track;
+int Min_total_3D2D_track;
 
 Eigen::Matrix3d K;
 Eigen::Matrix3d K_trans;
 Eigen::Matrix3d K_inv;
 Eigen::Matrix3d K_trans_inv;
+
+int use_gt_to_show_match;
+
+// post-process (visualization)
+int trans_result_format;
+int evaluate_reslut;
+int plot_line;
 
 // template <typename T>
 // T readParam(ros::NodeHandle &n, std::string name)
@@ -129,22 +174,25 @@ Eigen::Matrix3d K_trans_inv;
 
 void readParameters(std::string config_file)
 {
-    FILE *fh = fopen(config_file.c_str(),"r");
-    if(fh == NULL){
-        // ROS_WARN("config_file dosen't exist; wrong config_file path");
-        // ROS_BREAK();
-        printf("config_file dosen't exist; wrong config_file path\n");
-        abort();
-        return;          
-    }
-    fclose(fh);
-
+    
+    // FILE *fh = fopen(config_file.c_str(),"r");
+    // if(fh == NULL){
+    //     // ROS_WARN("config_file dosen't exist; wrong config_file path");
+    //     // ROS_BREAK();
+    //     printf("config_file dosen't exist; wrong config_file path\n");
+    //     abort();
+    //     return;          
+    // }
+    // fclose(fh);
+    
     cv::FileStorage fsSettings(config_file, cv::FileStorage::READ);
     if(!fsSettings.isOpened())
     {
         std::cerr << "ERROR: Wrong path to settings" << std::endl;
     }
 
+    printf("Start reading param!\n");
+    
     fsSettings["image0_topic"] >> IMAGE0_TOPIC;
     fsSettings["image1_topic"] >> IMAGE1_TOPIC;
 
@@ -180,11 +228,22 @@ void readParameters(std::string config_file)
     // MIN_DIST = fsSettings["min_dist"];
     MIN_DIST_BG = fsSettings["min_dist_bg"];
     MIN_DIST_OBJ = fsSettings["min_dist_obj"];
+    REJECT_WITH_F = fsSettings["reject_with_F"];
     F_THRESHOLD = fsSettings["F_threshold"];
+    H_THRESHOLD = fsSettings["H_threshold"];
     Th_score = fsSettings["th_score"];
+    Cal_FH_after_IMU_init_succ = fsSettings["cal_FH_after_IMU_init_succ"];
     SHOW_TRACK = fsSettings["show_track"];
     FLOW_BACK = fsSettings["flow_back"];
 
+    Len_edge_win = fsSettings["len_edge_win"];
+    sort_by_NCC = fsSettings["sort_by_NCC"];
+    check_detect_by_ambi_NCC = fsSettings["check_detect_by_ambi_NCC"];
+    check_match_by_ambi_NCC = fsSettings["check_match_by_ambi_NCC"];
+    sort_all_sift_FAST = fsSettings["sort_all_sift_FAST"];
+    refine_matching_flow = fsSettings["refine_matching_flow"];
+    refine_matching_stereo = fsSettings["refine_matching_stereo"];
+    
     mThDepthBg = (float)fsSettings["ThDepthBG"];
     mThDepthObj = (float)fsSettings["ThDepthOBJ"];
     mMinDepthPt = (float)fsSettings["MinDepthPt"];
@@ -196,7 +255,7 @@ void readParameters(std::string config_file)
     border_y = (int)fsSettings["Border_height"];
 
     MAX_CNT_PTS_BG = (int)fsSettings["max_cnt_pts_bg"];
-    MAX_CNT_PTS_OBJ = (int)fsSettings["max_cnt_pts_obj"];
+    MIN_CNT_PTS_OBJ = (int)fsSettings["min_cnt_pts_obj"];
     MIN_CNT_PTS_TRACK_BG = (int)fsSettings["min_cnt_pts_track_bg"];
     MIN_CNT_PTS_TRACK_OBJ = (int)fsSettings["min_cnt_pts_track_obj"];
     MAX_CNT_PTS_TRACK_BG = (int)fsSettings["max_cnt_pts_track_bg"];
@@ -221,11 +280,17 @@ void readParameters(std::string config_file)
     
     // WINDOW_SIZE = fsSettings["window_size"];
     TH_NUM_FRAME_FOR_LBA = fsSettings["th_num_frame_for_LBA"];
+    Min_num_old_track_per_frame = fsSettings["min_num_old_track_per_frame"];
+    Use_LBA_for_puer_V = fsSettings["use_LBA_for_puer_V"];
+    Th_num_fea_for_LBA_pure_V = fsSettings["th_num_fea_for_LBA_pure_V"];
+
     Thres_num_track_cur = fsSettings["thres_num_track_cur"];
 
     SOLVER_TIME = fsSettings["max_solver_time"];
     NUM_ITERATIONS = fsSettings["max_num_iterations"];
+    // 像素平面上的帧间点匹配视差的阈值
     MIN_PARALLAX = fsSettings["keyframe_parallax"];
+    // 归一化平面上的帧间点匹配视差的阈值
     MIN_PARALLAX = MIN_PARALLAX / FOCAL_LENGTH_X;
 
     Thres_Ambiguity_Flow = fsSettings["thres_ambiguity_flow"];
@@ -241,11 +306,36 @@ void readParameters(std::string config_file)
 
     Th_epipolar_con = fsSettings["th_epipolar_con"];
 
+    Th_homography_con = fsSettings["th_homography_con"];
+    
+    Check_flow_with_pred_motion = fsSettings["check_flow_with_pred_motion"];
+
     Min_num_bg_track_with_dep_prev = fsSettings["min_num_bg_track_with_dep_prev"];
 
     Limit_num_static_track = fsSettings["limit_num_static_track"];
 
-    use_Marg = fsSettings["use_marg"];
+    retain_marg_info = fsSettings["retain_marg_info"];
+
+    Use_5_pts = fsSettings["use_5_pts"];
+    
+    Res_non_planar_pt = fsSettings["res_non_planar_pt"];
+
+    Use_tria_for_2d2d = fsSettings["use_tria_for_2d2d"];
+
+    Cal_cur_dep_by_motion = fsSettings["cal_cur_dep_by_motion"];
+
+    Trust_dep_from_motion = fsSettings["trust_dep_from_motion"];
+
+    Check_dep_with_reproj_err = fsSettings["check_dep_with_reproj_err"];
+
+    Use_pred_dep_to_find_stereo_mtach = fsSettings["use_pred_dep_to_find_stereo_mtach"];
+
+    Th_dep_sta_obj_fea_to_add = fsSettings["th_dep_sta_obj_fea_to_add"];
+
+    Base_max_th_ambi_NCC = fsSettings["base_max_th_ambi_NCC"];
+
+    Min_total_near_3D2D_track = fsSettings["min_total_near_3D2D_track"];
+    Min_total_3D2D_track = fsSettings["min_total_3D2D_track"];
     
     fsSettings["output_path"] >> OUTPUT_FOLDER;
     VINS_RESULT_PATH = OUTPUT_FOLDER + "/vio.csv";
@@ -302,6 +392,7 @@ void readParameters(std::string config_file)
     }
     
     NUM_OF_CAM = fsSettings["num_of_cam"];
+    Cam_H = fsSettings["cam_H"];
     printf("camera number %d\n", NUM_OF_CAM);
 
     if(NUM_OF_CAM != 1 && NUM_OF_CAM != 2)
@@ -363,6 +454,12 @@ void readParameters(std::string config_file)
     K_inv = K.inverse();
     K_trans = K.transpose();
     K_trans_inv = K_trans.inverse();
+    
+    use_gt_to_show_match = fsSettings["use_gt_to_show_match"];
+
+    trans_result_format = fsSettings["trans_result_format"];
+    evaluate_reslut = fsSettings["evaluate_reslut"];
+    plot_line = fsSettings["plot_line"];
     
     fsSettings.release();
 }
