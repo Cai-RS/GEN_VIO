@@ -159,7 +159,7 @@ target_link_libraries(${PROJECT_NAME}_1_lib opencv_core opencv_imgproc opencv_hi
 target_compile_options(${PROJECT_NAME}_1_lib PRIVATE $<$<COMPILE_LANGUAGE:CXX>: -std=c++17; -Wall; -O0; -Wfatal-errors; -pthread; -Werror=return-type; -g>)
 #target_compile_options(${PROJECT_NAME}_1_lib PRIVATE $<$<COMPILE_LANGUAGE:CXX>: -std=c++17; -Wall; -fstack-protector-all; -Wstack-protector; -O2; -Wfatal-errors; -pthread; -Werror=return-type; -g>)
 
-# 加下来编译需要减收ASAN监测的文件
+# 接下来编译需要进行ASAN监测的文件
 add_library(${PROJECT_NAME}_2_lib SHARED
   src//estimator/parameters.cpp
   src/estimator/estimator.cpp
